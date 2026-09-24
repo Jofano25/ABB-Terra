@@ -1,0 +1,576 @@
+name: Build ABB Terra Provisioner APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate Android project
+        shell: bash
+        run: |
+          set -e
+          mkdir -p app/src/main/java/com/elmecon/abbterra
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'ABBTerraProvisioner'
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.6.1' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.elmecon.abbterra'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.elmecon.abbterra'
+                  minSdk 23
+                  targetSdk 35
+                  versionCode 1
+                  versionName '0.1'
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="ABB Terra Provisioner"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/elmecon/abbterra/MainActivity.java <<'EOF'
+          package com.elmecon.abbterra;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.bluetooth.BluetoothAdapter;
+          import android.bluetooth.BluetoothDevice;
+          import android.bluetooth.BluetoothGatt;
+          import android.bluetooth.BluetoothGattCallback;
+          import android.bluetooth.BluetoothGattCharacteristic;
+          import android.bluetooth.BluetoothGattDescriptor;
+          import android.bluetooth.BluetoothGattService;
+          import android.bluetooth.BluetoothManager;
+          import android.bluetooth.BluetoothProfile;
+          import android.bluetooth.le.BluetoothLeScanner;
+          import android.bluetooth.le.ScanCallback;
+          import android.bluetooth.le.ScanResult;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.content.Context;
+          import android.content.pm.PackageManager;
+          import android.graphics.Typeface;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.text.InputType;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.Button;
+          import android.widget.CheckBox;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.text.SimpleDateFormat;
+          import java.util.Date;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Set;
+
+          public class MainActivity extends Activity {
+              private static final int REQ_PERMISSIONS = 7001;
+              private BluetoothAdapter bluetoothAdapter;
+              private BluetoothLeScanner scanner;
+              private BluetoothGatt currentGatt;
+              private final Set<String> seenAddresses = new HashSet<>();
+              private LinearLayout deviceList;
+              private TextView statusText;
+              private TextView logText;
+              private Button scanButton;
+              private Button stopButton;
+              private EditText wsUrl;
+              private EditText chargerId;
+              private EditText authKey;
+              private CheckBox basicAuth;
+              private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+              private final ScanCallback scanCallback = new ScanCallback() {
+                  @Override
+                  public void onScanResult(int callbackType, ScanResult result) {
+                      BluetoothDevice device = result.getDevice();
+                      String address;
+                      try {
+                          address = device.getAddress();
+                      } catch (SecurityException e) {
+                          appendLog("SCAN permission error: " + e.getMessage());
+                          return;
+                      }
+                      if (address == null || seenAddresses.contains(address)) return;
+                      seenAddresses.add(address);
+
+                      String name = null;
+                      try { name = device.getName(); } catch (SecurityException ignored) { }
+                      final String label = (name == null || name.trim().isEmpty() ? "Unnamed BLE" : name)
+                              + "\n" + address + "   RSSI " + result.getRssi() + " dBm";
+                      runOnUiThread(() -> addDeviceButton(device, label));
+                  }
+
+                  @Override
+                  public void onScanFailed(int errorCode) {
+                      appendLog("BLE scan failed, code=" + errorCode);
+                  }
+              };
+
+              private final BluetoothGattCallback gattCallback = new BluetoothGattCallback() {
+                  @Override
+                  public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
+                      String addr = safeAddress(gatt.getDevice());
+                      appendLog("GATT state: status=" + status + " newState=" + stateName(newState) + " device=" + addr);
+                      if (newState == BluetoothProfile.STATE_CONNECTED) {
+                          setStatus("Connected to " + addr + " — discovering services...");
+                          try {
+                              boolean started = gatt.discoverServices();
+                              appendLog("discoverServices()=" + started);
+                          } catch (SecurityException e) {
+                              appendLog("discoverServices permission error: " + e.getMessage());
+                          }
+                      } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                          setStatus("Disconnected");
+                      }
+                  }
+
+                  @Override
+                  public void onServicesDiscovered(BluetoothGatt gatt, int status) {
+                      appendLog("=== SERVICES DISCOVERED status=" + status + " ===");
+                      List<BluetoothGattService> services = gatt.getServices();
+                      appendLog("Service count: " + services.size());
+                      int si = 0;
+                      for (BluetoothGattService service : services) {
+                          appendLog("SERVICE[" + si++ + "] " + service.getUuid() + " type=" + service.getType());
+                          int ci = 0;
+                          for (BluetoothGattCharacteristic ch : service.getCharacteristics()) {
+                              appendLog("  CHAR[" + ci++ + "] " + ch.getUuid() + " props=" + properties(ch.getProperties()));
+                              int di = 0;
+                              for (BluetoothGattDescriptor d : ch.getDescriptors()) {
+                                  appendLog("    DESC[" + di++ + "] " + d.getUuid());
+                              }
+                          }
+                      }
+                      appendLog("=== END GATT MAP ===");
+                      setStatus("Connected — GATT map captured");
+                  }
+
+                  @Override
+                  public void onCharacteristicRead(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
+                      appendLog("READ " + characteristic.getUuid() + " status=" + status + " value=" + hex(characteristic.getValue()));
+                  }
+
+                  @Override
+                  public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
+                      appendLog("NOTIFY " + characteristic.getUuid() + " value=" + hex(characteristic.getValue()));
+                  }
+              };
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  buildUi();
+                  BluetoothManager manager = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
+                  bluetoothAdapter = manager == null ? null : manager.getAdapter();
+                  if (bluetoothAdapter == null) {
+                      setStatus("Bluetooth not available on this phone");
+                      scanButton.setEnabled(false);
+                      return;
+                  }
+                  requestNeededPermissions();
+                  appendLog("ABB Terra Provisioner v0.1 started");
+                  appendLog("Purpose: BLE discovery / GATT mapping only. OCPP write is locked until ABB protocol is verified.");
+              }
+
+              private void buildUi() {
+                  ScrollView scroll = new ScrollView(this);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(dp(16), dp(14), dp(16), dp(28));
+                  scroll.addView(root, new ScrollView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+                  TextView title = text("ABB TERRA AC PROVISIONER", 22, true);
+                  root.addView(title);
+                  TextView sub = text("v0.1 • Safe BLE/GATT discovery build", 14, false);
+                  sub.setPadding(0, 0, 0, dp(12));
+                  root.addView(sub);
+
+                  statusText = text("Ready", 15, true);
+                  statusText.setPadding(dp(10), dp(10), dp(10), dp(10));
+                  root.addView(statusText, matchWrap());
+
+                  LinearLayout actions = new LinearLayout(this);
+                  actions.setOrientation(LinearLayout.HORIZONTAL);
+                  scanButton = button("SCAN BLE");
+                  stopButton = button("STOP");
+                  actions.addView(scanButton, new LinearLayout.LayoutParams(0, dp(52), 1));
+                  LinearLayout.LayoutParams stopLp = new LinearLayout.LayoutParams(0, dp(52), 1);
+                  stopLp.setMargins(dp(8), 0, 0, 0);
+                  actions.addView(stopButton, stopLp);
+                  root.addView(actions, matchWrap());
+
+                  scanButton.setOnClickListener(v -> startBleScan());
+                  stopButton.setOnClickListener(v -> stopBleScan());
+
+                  TextView devicesTitle = text("Nearby BLE devices — tap one to connect", 16, true);
+                  devicesTitle.setPadding(0, dp(18), 0, dp(8));
+                  root.addView(devicesTitle);
+
+                  deviceList = new LinearLayout(this);
+                  deviceList.setOrientation(LinearLayout.VERTICAL);
+                  root.addView(deviceList, matchWrap());
+
+                  TextView configTitle = text("OCPP provisioning target", 17, true);
+                  configTitle.setPadding(0, dp(20), 0, dp(6));
+                  root.addView(configTitle);
+
+                  wsUrl = input("WebSocket URL (ws:// or wss://)");
+                  chargerId = input("Charge Point Identity / Charger ID");
+                  authKey = input("Authorization Key / Password");
+                  authKey.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+                  basicAuth = new CheckBox(this);
+                  basicAuth.setText("HTTP Basic Authentication");
+                  basicAuth.setChecked(true);
+                  root.addView(wsUrl, matchWrap());
+                  root.addView(chargerId, matchWrap());
+                  root.addView(authKey, matchWrap());
+                  root.addView(basicAuth, matchWrap());
+
+                  Button apply = button("APPLY TO CHARGER — LOCKED IN v0.1");
+                  apply.setEnabled(false);
+                  root.addView(apply, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(54)));
+                  TextView safety = text("Write is intentionally disabled until the ABB BLE command UUIDs, framing and authentication are verified from the test charger.", 12, false);
+                  safety.setPadding(0, dp(6), 0, dp(8));
+                  root.addView(safety);
+
+                  LinearLayout logHeader = new LinearLayout(this);
+                  logHeader.setGravity(Gravity.CENTER_VERTICAL);
+                  TextView logTitle = text("BLE / GATT Debug Log", 17, true);
+                  logHeader.addView(logTitle, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+                  Button copy = button("COPY LOG");
+                  logHeader.addView(copy, new LinearLayout.LayoutParams(dp(110), dp(46)));
+                  root.addView(logHeader, matchWrap());
+
+                  logText = text("", 11, false);
+                  logText.setTypeface(Typeface.MONOSPACE);
+                  logText.setTextIsSelectable(true);
+                  logText.setPadding(dp(10), dp(10), dp(10), dp(10));
+                  root.addView(logText, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(520)));
+                  copy.setOnClickListener(v -> copyLog());
+
+                  setContentView(scroll);
+              }
+
+              private void requestNeededPermissions() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                      requestPermissions(new String[]{Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT}, REQ_PERMISSIONS);
+                  } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                      requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, REQ_PERMISSIONS);
+                  }
+              }
+
+              private boolean permissionsOkay() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                      return checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
+                              && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
+                  }
+                  return Build.VERSION.SDK_INT < Build.VERSION_CODES.M
+                          || checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+              }
+
+              private void startBleScan() {
+                  if (!permissionsOkay()) {
+                      requestNeededPermissions();
+                      toast("Allow Bluetooth/Nearby Devices permission, then tap SCAN BLE again.");
+                      return;
+                  }
+                  if (!bluetoothAdapter.isEnabled()) {
+                      toast("Please turn Bluetooth ON first.");
+                      return;
+                  }
+                  scanner = bluetoothAdapter.getBluetoothLeScanner();
+                  if (scanner == null) {
+                      appendLog("BluetoothLeScanner unavailable");
+                      return;
+                  }
+                  stopBleScan();
+                  seenAddresses.clear();
+                  deviceList.removeAllViews();
+                  setStatus("Scanning BLE devices for 20 seconds...");
+                  appendLog("BLE scan started");
+                  try {
+                      scanner.startScan(scanCallback);
+                      mainHandler.postDelayed(this::stopBleScan, 20000);
+                  } catch (SecurityException e) {
+                      appendLog("startScan permission error: " + e.getMessage());
+                  }
+              }
+
+              private void stopBleScan() {
+                  mainHandler.removeCallbacksAndMessages(null);
+                  if (scanner != null) {
+                      try { scanner.stopScan(scanCallback); } catch (Exception ignored) { }
+                  }
+                  appendLog("BLE scan stopped");
+              }
+
+              private void addDeviceButton(BluetoothDevice device, String label) {
+                  Button b = button(label);
+                  b.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(68));
+                  lp.setMargins(0, 0, 0, dp(6));
+                  deviceList.addView(b, lp);
+                  b.setOnClickListener(v -> connectTo(device));
+              }
+
+              private void connectTo(BluetoothDevice device) {
+                  stopBleScan();
+                  if (!permissionsOkay()) {
+                      requestNeededPermissions();
+                      return;
+                  }
+                  if (currentGatt != null) {
+                      try { currentGatt.close(); } catch (Exception ignored) { }
+                      currentGatt = null;
+                  }
+                  String name = "";
+                  try { name = device.getName(); } catch (SecurityException ignored) { }
+                  String addr = safeAddress(device);
+                  setStatus("Connecting to " + (name == null ? "BLE device" : name) + " " + addr);
+                  appendLog("Connecting: name=" + name + " address=" + addr);
+                  try {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                          currentGatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE);
+                      } else {
+                          currentGatt = device.connectGatt(this, false, gattCallback);
+                      }
+                  } catch (SecurityException e) {
+                      appendLog("connectGatt permission error: " + e.getMessage());
+                  }
+              }
+
+              private String properties(int p) {
+                  StringBuilder s = new StringBuilder();
+                  addProp(s, p, BluetoothGattCharacteristic.PROPERTY_READ, "READ");
+                  addProp(s, p, BluetoothGattCharacteristic.PROPERTY_WRITE, "WRITE");
+                  addProp(s, p, BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE, "WRITE_NR");
+                  addProp(s, p, BluetoothGattCharacteristic.PROPERTY_NOTIFY, "NOTIFY");
+                  addProp(s, p, BluetoothGattCharacteristic.PROPERTY_INDICATE, "INDICATE");
+                  addProp(s, p, BluetoothGattCharacteristic.PROPERTY_BROADCAST, "BROADCAST");
+                  addProp(s, p, BluetoothGattCharacteristic.PROPERTY_SIGNED_WRITE, "SIGNED_WRITE");
+                  return s.length() == 0 ? "NONE(0x" + Integer.toHexString(p) + ")" : s.toString();
+              }
+
+              private void addProp(StringBuilder sb, int props, int mask, String name) {
+                  if ((props & mask) != 0) {
+                      if (sb.length() > 0) sb.append('|');
+                      sb.append(name);
+                  }
+              }
+
+              private String stateName(int state) {
+                  if (state == BluetoothProfile.STATE_CONNECTED) return "CONNECTED";
+                  if (state == BluetoothProfile.STATE_CONNECTING) return "CONNECTING";
+                  if (state == BluetoothProfile.STATE_DISCONNECTED) return "DISCONNECTED";
+                  if (state == BluetoothProfile.STATE_DISCONNECTING) return "DISCONNECTING";
+                  return String.valueOf(state);
+              }
+
+              private String safeAddress(BluetoothDevice d) {
+                  try { return d == null ? "?" : d.getAddress(); } catch (SecurityException e) { return "permission-denied"; }
+              }
+
+              private String hex(byte[] b) {
+                  if (b == null) return "<null>";
+                  StringBuilder s = new StringBuilder();
+                  for (byte x : b) s.append(String.format(Locale.US, "%02X", x));
+                  return s.toString();
+              }
+
+              private void appendLog(String msg) {
+                  final String line = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(new Date()) + "  " + msg + "\n";
+                  runOnUiThread(() -> {
+                      logText.append(line);
+                  });
+              }
+
+              private void setStatus(String s) {
+                  runOnUiThread(() -> statusText.setText(s));
+              }
+
+              private void copyLog() {
+                  ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                  cm.setPrimaryClip(ClipData.newPlainText("ABB Terra BLE log", logText.getText()));
+                  toast("Log copied. Paste it back into ChatGPT.");
+              }
+
+              private TextView text(String value, float sp, boolean bold) {
+                  TextView t = new TextView(this);
+                  t.setText(value);
+                  t.setTextSize(sp);
+                  if (bold) t.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+                  return t;
+              }
+
+              private Button button(String value) {
+                  Button b = new Button(this);
+                  b.setText(value);
+                  b.setAllCaps(false);
+                  return b;
+              }
+
+              private EditText input(String hint) {
+                  EditText e = new EditText(this);
+                  e.setHint(hint);
+                  e.setSingleLine(true);
+                  e.setPadding(dp(10), dp(6), dp(10), dp(6));
+                  return e;
+              }
+
+              private LinearLayout.LayoutParams matchWrap() {
+                  return new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+              }
+
+              private int dp(int v) {
+                  return Math.round(v * getResources().getDisplayMetrics().density);
+              }
+
+              private void toast(String s) {
+                  Toast.makeText(this, s, Toast.LENGTH_LONG).show();
+              }
+
+              @Override
+              protected void onDestroy() {
+                  super.onDestroy();
+                  stopBleScan();
+                  if (currentGatt != null) {
+                      try { currentGatt.close(); } catch (Exception ignored) { }
+                  }
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        shell: bash
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          mkdir -p artifact
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Provisioner-v0.1.apk
+          cd artifact
+          sha256sum ABB-Terra-Provisioner-v0.1.apk | tee ABB-Terra-Provisioner-v0.1.apk.sha256
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ABB-Terra-Provisioner-v0.1
+          path: artifact/*
+          if-no-files-found: error
+          retention-days: 30
