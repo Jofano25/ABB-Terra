@@ -12,24 +12,25 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
 
     steps:
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install Android SDK components
         shell: bash
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          set -e
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          echo "Android SDK: $ANDROID_SDK_ROOT"
+          "$SDKMANAGER" --version
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -42,7 +43,7 @@ jobs:
           set -e
           mkdir -p app/src/main/java/com/elmecon/abbterra
 
-          cat > settings.gradle <<'EOF'
+          cat > settings.gradle <<'EOF2'
           pluginManagement {
               repositories {
                   google()
@@ -59,21 +60,21 @@ jobs:
           }
           rootProject.name = 'ABBTerraProvisioner'
           include ':app'
-          EOF
+          EOF2
 
-          cat > build.gradle <<'EOF'
+          cat > build.gradle <<'EOF2'
           plugins {
               id 'com.android.application' version '8.6.1' apply false
           }
-          EOF
+          EOF2
 
-          cat > gradle.properties <<'EOF'
+          cat > gradle.properties <<'EOF2'
           org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
           android.useAndroidX=false
           android.nonTransitiveRClass=true
-          EOF
+          EOF2
 
-          cat > app/build.gradle <<'EOF'
+          cat > app/build.gradle <<'EOF2'
           plugins {
               id 'com.android.application'
           }
@@ -101,9 +102,9 @@ jobs:
                   targetCompatibility JavaVersion.VERSION_17
               }
           }
-          EOF
+          EOF2
 
-          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          cat > app/src/main/AndroidManifest.xml <<'EOF2'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
@@ -130,9 +131,9 @@ jobs:
                   </activity>
               </application>
           </manifest>
-          EOF
+          EOF2
 
-          cat > app/src/main/java/com/elmecon/abbterra/MainActivity.java <<'EOF'
+          cat > app/src/main/java/com/elmecon/abbterra/MainActivity.java <<'EOF2'
           package com.elmecon.abbterra;
 
           import android.Manifest;
@@ -160,7 +161,6 @@ jobs:
           import android.os.Looper;
           import android.text.InputType;
           import android.view.Gravity;
-          import android.view.View;
           import android.view.ViewGroup;
           import android.widget.Button;
           import android.widget.CheckBox;
@@ -187,12 +187,12 @@ jobs:
               private TextView statusText;
               private TextView logText;
               private Button scanButton;
-              private Button stopButton;
               private EditText wsUrl;
               private EditText chargerId;
               private EditText authKey;
               private CheckBox basicAuth;
               private final Handler mainHandler = new Handler(Looper.getMainLooper());
+              private final Runnable stopScanRunnable = this::stopBleScan;
 
               private final ScanCallback scanCallback = new ScanCallback() {
                   @Override
@@ -275,6 +275,7 @@ jobs:
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
                   buildUi();
+
                   BluetoothManager manager = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
                   bluetoothAdapter = manager == null ? null : manager.getAdapter();
                   if (bluetoothAdapter == null) {
@@ -282,9 +283,11 @@ jobs:
                       scanButton.setEnabled(false);
                       return;
                   }
+
                   requestNeededPermissions();
                   appendLog("ABB Terra Provisioner v0.1 started");
-                  appendLog("Purpose: BLE discovery / GATT mapping only. OCPP write is locked until ABB protocol is verified.");
+                  appendLog("Safe mode: BLE discovery / GATT mapping only.");
+                  appendLog("OCPP write is locked until ABB protocol is verified.");
               }
 
               private void buildUi() {
@@ -296,6 +299,7 @@ jobs:
 
                   TextView title = text("ABB TERRA AC PROVISIONER", 22, true);
                   root.addView(title);
+
                   TextView sub = text("v0.1 • Safe BLE/GATT discovery build", 14, false);
                   sub.setPadding(0, 0, 0, dp(12));
                   root.addView(sub);
@@ -307,7 +311,7 @@ jobs:
                   LinearLayout actions = new LinearLayout(this);
                   actions.setOrientation(LinearLayout.HORIZONTAL);
                   scanButton = button("SCAN BLE");
-                  stopButton = button("STOP");
+                  Button stopButton = button("STOP");
                   actions.addView(scanButton, new LinearLayout.LayoutParams(0, dp(52), 1));
                   LinearLayout.LayoutParams stopLp = new LinearLayout.LayoutParams(0, dp(52), 1);
                   stopLp.setMargins(dp(8), 0, 0, 0);
@@ -336,6 +340,7 @@ jobs:
                   basicAuth = new CheckBox(this);
                   basicAuth.setText("HTTP Basic Authentication");
                   basicAuth.setChecked(true);
+
                   root.addView(wsUrl, matchWrap());
                   root.addView(chargerId, matchWrap());
                   root.addView(authKey, matchWrap());
@@ -344,7 +349,8 @@ jobs:
                   Button apply = button("APPLY TO CHARGER — LOCKED IN v0.1");
                   apply.setEnabled(false);
                   root.addView(apply, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(54)));
-                  TextView safety = text("Write is intentionally disabled until the ABB BLE command UUIDs, framing and authentication are verified from the test charger.", 12, false);
+
+                  TextView safety = text("Write is disabled until ABB BLE UUIDs, command framing and authentication are verified from a test charger.", 12, false);
                   safety.setPadding(0, dp(6), 0, dp(8));
                   root.addView(safety);
 
@@ -393,30 +399,32 @@ jobs:
                       toast("Please turn Bluetooth ON first.");
                       return;
                   }
+
                   scanner = bluetoothAdapter.getBluetoothLeScanner();
                   if (scanner == null) {
                       appendLog("BluetoothLeScanner unavailable");
                       return;
                   }
+
                   stopBleScan();
                   seenAddresses.clear();
                   deviceList.removeAllViews();
                   setStatus("Scanning BLE devices for 20 seconds...");
                   appendLog("BLE scan started");
+
                   try {
                       scanner.startScan(scanCallback);
-                      mainHandler.postDelayed(this::stopBleScan, 20000);
+                      mainHandler.postDelayed(stopScanRunnable, 20000);
                   } catch (SecurityException e) {
                       appendLog("startScan permission error: " + e.getMessage());
                   }
               }
 
               private void stopBleScan() {
-                  mainHandler.removeCallbacksAndMessages(null);
+                  mainHandler.removeCallbacks(stopScanRunnable);
                   if (scanner != null) {
                       try { scanner.stopScan(scanCallback); } catch (Exception ignored) { }
                   }
-                  appendLog("BLE scan stopped");
               }
 
               private void addDeviceButton(BluetoothDevice device, String label) {
@@ -434,15 +442,18 @@ jobs:
                       requestNeededPermissions();
                       return;
                   }
+
                   if (currentGatt != null) {
                       try { currentGatt.close(); } catch (Exception ignored) { }
                       currentGatt = null;
                   }
+
                   String name = "";
                   try { name = device.getName(); } catch (SecurityException ignored) { }
                   String addr = safeAddress(device);
                   setStatus("Connecting to " + (name == null ? "BLE device" : name) + " " + addr);
                   appendLog("Connecting: name=" + name + " address=" + addr);
+
                   try {
                       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                           currentGatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE);
@@ -482,7 +493,8 @@ jobs:
               }
 
               private String safeAddress(BluetoothDevice d) {
-                  try { return d == null ? "?" : d.getAddress(); } catch (SecurityException e) { return "permission-denied"; }
+                  try { return d == null ? "?" : d.getAddress(); }
+                  catch (SecurityException e) { return "permission-denied"; }
               }
 
               private String hex(byte[] b) {
@@ -494,9 +506,7 @@ jobs:
 
               private void appendLog(String msg) {
                   final String line = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(new Date()) + "  " + msg + "\n";
-                  runOnUiThread(() -> {
-                      logText.append(line);
-                  });
+                  runOnUiThread(() -> logText.append(line));
               }
 
               private void setStatus(String s) {
@@ -553,7 +563,7 @@ jobs:
                   }
               }
           }
-          EOF
+          EOF2
 
       - name: Build debug APK
         shell: bash
@@ -562,6 +572,7 @@ jobs:
       - name: Prepare artifact
         shell: bash
         run: |
+          set -e
           mkdir -p artifact
           cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Provisioner-v0.1.apk
           cd artifact
