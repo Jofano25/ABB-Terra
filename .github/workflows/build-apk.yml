@@ -1,4 +1,4 @@
-name: Build ABB Terra Provisioner APK
+name: Build ABB Terra Provisioner FINAL
 
 on:
   workflow_dispatch:
@@ -22,7 +22,7 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Accept licenses and install Android SDK components
+      - name: Install Android SDK components
         shell: bash
         run: |
           set -e
@@ -43,6 +43,7 @@ jobs:
         run: |
           set -e
           mkdir -p app/src/main/java/com/elmecon/abbterra
+          mkdir -p app/src/main/res/xml
 
           cat > settings.gradle <<'EOF'
           pluginManagement {
@@ -88,14 +89,12 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 2
-                  versionName '0.2'
+                  versionCode 100
+                  versionName '1.0-final'
               }
 
               buildTypes {
-                  release {
-                      minifyEnabled false
-                  }
+                  release { minifyEnabled false }
               }
 
               compileOptions {
@@ -105,16 +104,26 @@ jobs:
           }
           EOF
 
+          cat > app/src/main/res/xml/file_paths.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths xmlns:android="http://schemas.android.com/apk/res/android">
+              <cache-path name="cache" path="." />
+          </paths>
+          EOF
+
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
-
               <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
               <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
               <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
               <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+              <queries>
+                  <package android:name="com.abbemobility.terraconfig" />
+              </queries>
 
               <application
                   android:allowBackup="false"
@@ -130,624 +139,498 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.provider"
+                      android:exported="false"
+                      android:grantUriPermissions="true" />
               </application>
           </manifest>
           EOF
+
+          # Remove FileProvider dependency requirement: we use ACTION_CREATE_DOCUMENT for saving
+          python3 - <<'PY'
+          p='app/src/main/AndroidManifest.xml'
+          s=open(p).read()
+          a=s.index('                  <provider')
+          b=s.index('                  </provider>',a)+len('                  </provider>\n')
+          s=s[:a]+s[b:]
+          open(p,'w').write(s)
+          PY
 
           cat > app/src/main/java/com/elmecon/abbterra/MainActivity.java <<'EOF'
           package com.elmecon.abbterra;
 
           import android.Manifest;
           import android.app.Activity;
-          import android.bluetooth.BluetoothAdapter;
-          import android.bluetooth.BluetoothDevice;
-          import android.bluetooth.BluetoothGatt;
-          import android.bluetooth.BluetoothGattCallback;
-          import android.bluetooth.BluetoothGattCharacteristic;
-          import android.bluetooth.BluetoothGattDescriptor;
-          import android.bluetooth.BluetoothGattService;
-          import android.bluetooth.BluetoothManager;
-          import android.bluetooth.BluetoothProfile;
-          import android.bluetooth.le.BluetoothLeScanner;
-          import android.bluetooth.le.ScanCallback;
-          import android.bluetooth.le.ScanResult;
-          import android.content.ClipData;
-          import android.content.ClipboardManager;
-          import android.content.Context;
+          import android.bluetooth.*;
+          import android.bluetooth.le.*;
+          import android.content.*;
           import android.content.pm.PackageManager;
           import android.graphics.Typeface;
-          import android.os.Build;
-          import android.os.Bundle;
-          import android.os.Handler;
-          import android.os.Looper;
+          import android.net.Uri;
+          import android.os.*;
           import android.text.InputType;
-          import android.view.Gravity;
-          import android.view.ViewGroup;
-          import android.widget.Button;
-          import android.widget.CheckBox;
-          import android.widget.EditText;
-          import android.widget.LinearLayout;
-          import android.widget.ScrollView;
-          import android.widget.TextView;
-          import android.widget.Toast;
+          import android.view.*;
+          import android.widget.*;
 
+          import org.json.JSONObject;
+
+          import java.io.OutputStream;
           import java.nio.charset.StandardCharsets;
           import java.text.SimpleDateFormat;
-          import java.util.Date;
-          import java.util.HashSet;
-          import java.util.List;
-          import java.util.Locale;
-          import java.util.Set;
-          import java.util.UUID;
+          import java.util.*;
 
           public class MainActivity extends Activity {
-              private static final int REQ_PERMISSIONS = 7001;
-              private static final UUID UUID_FFF0 = UUID.fromString("0000fff0-0000-1000-8000-00805f9b34fb");
-              private static final UUID UUID_FFF3 = UUID.fromString("0000fff3-0000-1000-8000-00805f9b34fb");
-              private static final UUID UUID_FFF4 = UUID.fromString("0000fff4-0000-1000-8000-00805f9b34fb");
-              private static final UUID UUID_CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
-              private static final UUID UUID_GAP = UUID.fromString("00001800-0000-1000-8000-00805f9b34fb");
-              private static final UUID UUID_DEVICE_NAME = UUID.fromString("00002a00-0000-1000-8000-00805f9b34fb");
+              private static final int REQ_PERMISSIONS=7001, REQ_SAVE_JSON=8001;
+              private static final UUID FFF0=UUID.fromString("0000fff0-0000-1000-8000-00805f9b34fb");
+              private static final UUID FFF3=UUID.fromString("0000fff3-0000-1000-8000-00805f9b34fb");
+              private static final UUID FFF4=UUID.fromString("0000fff4-0000-1000-8000-00805f9b34fb");
+              private static final UUID CCCD=UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
+              private static final UUID GAP=UUID.fromString("00001800-0000-1000-8000-00805f9b34fb");
+              private static final UUID DEVICE_NAME=UUID.fromString("00002a00-0000-1000-8000-00805f9b34fb");
 
-              private BluetoothAdapter bluetoothAdapter;
+              private BluetoothAdapter adapter;
               private BluetoothLeScanner scanner;
-              private BluetoothGatt currentGatt;
-              private BluetoothGattCharacteristic terraTx;
-              private BluetoothGattCharacteristic terraRx;
-              private BluetoothGattCharacteristic deviceNameChar;
-              private boolean terraNotifyEnabled = false;
-              private final Set<String> seenAddresses = new HashSet<>();
+              private BluetoothGatt gatt;
+              private BluetoothGattCharacteristic tx, rx, deviceNameChar;
+              private boolean notifyReady=false;
+              private final Set<String> seen=new HashSet<>();
+              private final Handler handler=new Handler(Looper.getMainLooper());
+
+              private TextView status, link, log;
               private LinearLayout deviceList;
-              private TextView statusText;
-              private TextView linkText;
-              private TextView logText;
-              private Button scanButton;
-              private Button stopButton;
-              private Button verifyButton;
-              private Button disconnectButton;
-              private EditText wsUrl;
-              private EditText chargerId;
-              private EditText authKey;
-              private CheckBox basicAuth;
-              private final Handler mainHandler = new Handler(Looper.getMainLooper());
+              private EditText url, chargerId, authKey, wifiName, maxCurrent;
+              private CheckBox requirePassword;
+              private Spinner schemeSpinner;
+              private Button scanBtn, verifyBtn, disconnectBtn, saveBtn, copyBtn, openTerraBtn;
+              private String pendingJson="";
 
-              private final ScanCallback scanCallback = new ScanCallback() {
-                  @Override
-                  public void onScanResult(int callbackType, ScanResult result) {
-                      BluetoothDevice device = result.getDevice();
-                      String address;
-                      try { address = device.getAddress(); }
-                      catch (SecurityException e) { appendLog("SCAN permission error: " + e.getMessage()); return; }
-                      if (address == null || seenAddresses.contains(address)) return;
-                      seenAddresses.add(address);
-
-                      String name = null;
-                      try { name = device.getName(); } catch (SecurityException ignored) { }
-                      final String finalName = name;
-                      final String label = (name == null || name.trim().isEmpty() ? "Unnamed BLE" : name)
-                              + "\n" + address + "   RSSI " + result.getRssi() + " dBm";
-                      runOnUiThread(() -> addDeviceButton(device, label, finalName));
+              private final ScanCallback scanCb=new ScanCallback() {
+                  @Override public void onScanResult(int callbackType, ScanResult result) {
+                      BluetoothDevice d=result.getDevice();
+                      String addr=safeAddr(d);
+                      if(addr==null || seen.contains(addr)) return;
+                      seen.add(addr);
+                      String n=safeName(d);
+                      if(n==null) n="Unnamed BLE";
+                      final String name=n;
+                      runOnUiThread(() -> addDevice(d,name,addr,result.getRssi()));
                   }
-
                   @Override public void onScanFailed(int errorCode) {
-                      appendLog("BLE scan failed, code=" + errorCode);
-                      setStatus("Scan failed: " + errorCode);
+                      append("SCAN FAILED code="+errorCode);
+                      setStatus("BLE scan failed: "+errorCode);
                   }
               };
 
-              private final BluetoothGattCallback gattCallback = new BluetoothGattCallback() {
-                  @Override
-                  public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
-                      String addr = safeAddress(gatt.getDevice());
-                      appendLog("GATT state: status=" + status + " newState=" + stateName(newState) + " device=" + addr);
-                      if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
-                          currentGatt = gatt;
-                          setStatus("BLE GATT connected to " + addr);
-                          setLink("GATT CONNECTED • preparing Terra channel...");
-                          try {
-                              boolean pr = gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH);
-                              appendLog("requestConnectionPriority(HIGH)=" + pr);
-                          } catch (Exception e) { appendLog("requestConnectionPriority error: " + e.getMessage()); }
-                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                              try {
-                                  boolean mtu = gatt.requestMtu(247);
-                                  appendLog("requestMtu(247)=" + mtu);
-                              } catch (SecurityException e) { appendLog("requestMtu permission error: " + e.getMessage()); }
-                          }
-                          mainHandler.postDelayed(() -> discoverServicesSafe(gatt), 250);
-                      } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                          if (currentGatt == gatt) currentGatt = null;
-                          terraNotifyEnabled = false;
-                          terraTx = null;
-                          terraRx = null;
-                          deviceNameChar = null;
+              private final BluetoothGattCallback cb=new BluetoothGattCallback() {
+                  @Override public void onConnectionStateChange(BluetoothGatt gg,int st,int ns) {
+                      append("GATT state status="+st+" newState="+state(ns)+" device="+safeAddr(gg.getDevice()));
+                      if(st==BluetoothGatt.GATT_SUCCESS && ns==BluetoothProfile.STATE_CONNECTED) {
+                          gatt=gg;
+                          setStatus("BLE connected");
+                          setLink("GATT CONNECTED • preparing FFF3/FFF4");
+                          try { append("requestConnectionPriority(HIGH)="+gg.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)); } catch(Exception ignored){}
+                          try { append("requestMtu(247)="+gg.requestMtu(247)); } catch(Exception ignored){}
+                          handler.postDelayed(() -> {
+                              try { append("discoverServices()="+gg.discoverServices()); }
+                              catch(Exception e){ append("discoverServices error="+e.getMessage()); }
+                          },250);
+                      } else if(ns==BluetoothProfile.STATE_DISCONNECTED) {
+                          clearGattState();
                           setStatus("Disconnected");
                           setLink("NOT CONNECTED");
-                      } else if (status != BluetoothGatt.GATT_SUCCESS) {
-                          setStatus("Connection error GATT status=" + status);
-                          setLink("CONNECTION ERROR");
                       }
                   }
 
-                  @Override
-                  public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
-                      appendLog("MTU changed: mtu=" + mtu + " status=" + status);
+                  @Override public void onMtuChanged(BluetoothGatt gg,int mtu,int st) {
+                      append("MTU changed mtu="+mtu+" status="+st);
                   }
 
-                  @Override
-                  public void onServicesDiscovered(BluetoothGatt gatt, int status) {
-                      appendLog("=== SERVICES DISCOVERED status=" + status + " ===");
-                      List<BluetoothGattService> services = gatt.getServices();
-                      appendLog("Service count: " + services.size());
-                      int si = 0;
-                      for (BluetoothGattService service : services) {
-                          appendLog("SERVICE[" + si++ + "] " + service.getUuid() + " type=" + service.getType());
-                          int ci = 0;
-                          for (BluetoothGattCharacteristic ch : service.getCharacteristics()) {
-                              appendLog("  CHAR[" + ci++ + "] " + ch.getUuid() + " props=" + properties(ch.getProperties()));
-                              int di = 0;
-                              for (BluetoothGattDescriptor d : ch.getDescriptors()) {
-                                  appendLog("    DESC[" + di++ + "] " + d.getUuid());
-                              }
-                          }
-                      }
-                      appendLog("=== END GATT MAP ===");
-
-                      BluetoothGattService terraService = gatt.getService(UUID_FFF0);
-                      if (terraService == null) {
-                          setStatus("Connected, but Terra configuration service FFF0 not found");
-                          setLink("GATT CONNECTED • FFF0 NOT FOUND");
-                          appendLog("ERROR: FFF0 Terra configuration service not found");
-                          return;
-                      }
-
-                      terraTx = terraService.getCharacteristic(UUID_FFF3);
-                      terraRx = terraService.getCharacteristic(UUID_FFF4);
-                      BluetoothGattService gap = gatt.getService(UUID_GAP);
-                      if (gap != null) deviceNameChar = gap.getCharacteristic(UUID_DEVICE_NAME);
-
-                      appendLog("Terra FFF0 found");
-                      appendLog("FFF3 TX=" + (terraTx != null));
-                      appendLog("FFF4 RX=" + (terraRx != null));
-
-                      if (terraTx == null || terraRx == null) {
-                          setStatus("Connected, Terra service incomplete");
-                          setLink("GATT CONNECTED • FFF3/FFF4 MISSING");
-                          return;
-                      }
-
-                      enableTerraNotifications(gatt);
+                  @Override public void onServicesDiscovered(BluetoothGatt gg,int st) {
+                      append("SERVICES DISCOVERED status="+st);
+                      BluetoothGattService s=gg.getService(FFF0);
+                      if(s==null){ setLink("CONNECTED • FFF0 NOT FOUND"); append("ERROR FFF0 not found"); return; }
+                      tx=s.getCharacteristic(FFF3);
+                      rx=s.getCharacteristic(FFF4);
+                      BluetoothGattService gap=gg.getService(GAP);
+                      if(gap!=null) deviceNameChar=gap.getCharacteristic(DEVICE_NAME);
+                      append("FFF0 found; FFF3="+(tx!=null)+" FFF4="+(rx!=null));
+                      if(tx==null || rx==null){ setLink("CONNECTED • FFF3/FFF4 MISSING"); return; }
+                      enableNotify(gg);
                   }
 
-                  @Override
-                  public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
-                      appendLog("DESC WRITE " + descriptor.getUuid() + " status=" + status);
-                      if (UUID_CCCD.equals(descriptor.getUuid())) {
-                          if (status == BluetoothGatt.GATT_SUCCESS) {
-                              terraNotifyEnabled = true;
-                              setStatus("Terra BLE channel ready");
-                              setLink("CONNECTED • FFF3 TX + FFF4 NOTIFY READY");
-                              appendLog("SUCCESS: FFF4 notification enabled. BLE transport is ready.");
-                              appendLog("NOTE: Charger beep is normally tied to proprietary application authentication, not plain GATT connection.");
-                              mainHandler.postDelayed(() -> readDeviceNameSafe(gatt), 250);
-                          } else {
-                              terraNotifyEnabled = false;
-                              setStatus("Connected, but FFF4 notify setup failed");
-                              setLink("GATT CONNECTED • FFF4 NOTIFY FAILED");
-                          }
+                  @Override public void onDescriptorWrite(BluetoothGatt gg,BluetoothGattDescriptor d,int st) {
+                      append("DESC WRITE "+d.getUuid()+" status="+st);
+                      if(CCCD.equals(d.getUuid()) && st==BluetoothGatt.GATT_SUCCESS) {
+                          notifyReady=true;
+                          setStatus("Terra BLE transport ready");
+                          setLink("CONNECTED • FFF3 TX + FFF4 NOTIFY READY");
+                          handler.postDelayed(() -> readName(gg),200);
                       }
                   }
 
-                  @Override
-                  public void onCharacteristicRead(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
-                      byte[] value = characteristic.getValue();
-                      appendLog("READ " + characteristic.getUuid() + " status=" + status + " value=" + hex(value));
-                      if (UUID_DEVICE_NAME.equals(characteristic.getUuid()) && status == BluetoothGatt.GATT_SUCCESS && value != null) {
-                          String name = new String(value, StandardCharsets.UTF_8).replace("\u0000", "").trim();
-                          appendLog("Verified BLE device name: " + name);
-                          setLink("CONNECTED • " + name + " • FFF4 READY");
+                  @Override public void onCharacteristicRead(BluetoothGatt gg,BluetoothGattCharacteristic c,int st) {
+                      byte[] v=c.getValue();
+                      append("READ "+c.getUuid()+" status="+st+" value="+hex(v));
+                      if(DEVICE_NAME.equals(c.getUuid()) && st==0 && v!=null) {
+                          String n=new String(v,StandardCharsets.UTF_8).replace("\u0000","").trim();
+                          setLink("CONNECTED • "+n+" • FFF4 READY");
                       }
                   }
 
-                  @Override
-                  public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
-                      appendLog("NOTIFY " + characteristic.getUuid() + " value=" + hex(characteristic.getValue()));
+                  @Override public void onCharacteristicChanged(BluetoothGatt gg,BluetoothGattCharacteristic c) {
+                      append("NOTIFY "+c.getUuid()+" "+hex(c.getValue()));
                   }
 
-                  @Override
-                  public void onReadRemoteRssi(BluetoothGatt gatt, int rssi, int status) {
-                      appendLog("REMOTE RSSI status=" + status + " rssi=" + rssi + " dBm");
-                      if (status == BluetoothGatt.GATT_SUCCESS) {
-                          setStatus("BLE link verified, RSSI " + rssi + " dBm");
-                      }
+                  @Override public void onReadRemoteRssi(BluetoothGatt gg,int rssi,int st) {
+                      append("RSSI status="+st+" rssi="+rssi+" dBm");
+                      if(st==0) setStatus("BLE link verified • "+rssi+" dBm");
                   }
               };
 
-              @Override
-              protected void onCreate(Bundle savedInstanceState) {
-                  super.onCreate(savedInstanceState);
+              @Override protected void onCreate(Bundle b) {
+                  super.onCreate(b);
                   buildUi();
-                  BluetoothManager manager = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
-                  bluetoothAdapter = manager == null ? null : manager.getAdapter();
-                  if (bluetoothAdapter == null) {
-                      setStatus("Bluetooth not available on this phone");
-                      scanButton.setEnabled(false);
-                      return;
-                  }
-                  requestNeededPermissions();
-                  appendLog("ABB Terra Provisioner v0.2 started");
-                  appendLog("Mode: BLE transport verification + Terra FFF3/FFF4 setup. No OCPP write commands are sent.");
+                  BluetoothManager bm=(BluetoothManager)getSystemService(BLUETOOTH_SERVICE);
+                  adapter=bm==null?null:bm.getAdapter();
+                  requestPerms();
+                  append("ABB Terra Provisioner FINAL started");
+                  append("Mode: TACW BLE verification + ABB pre-configuration builder.");
+                  append("Direct encrypted BLE commissioning is intentionally not guessed.");
               }
 
               private void buildUi() {
-                  ScrollView scroll = new ScrollView(this);
-                  LinearLayout root = new LinearLayout(this);
+                  ScrollView sv=new ScrollView(this);
+                  LinearLayout root=new LinearLayout(this);
                   root.setOrientation(LinearLayout.VERTICAL);
-                  root.setPadding(dp(16), dp(14), dp(16), dp(28));
-                  scroll.addView(root, new ScrollView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                  root.setPadding(dp(16),dp(14),dp(16),dp(28));
+                  sv.addView(root,new ScrollView.LayoutParams(-1,-2));
 
-                  TextView title = text("ABB TERRA AC PROVISIONER", 22, true);
-                  root.addView(title);
-                  TextView sub = text("v0.2 • Terra BLE transport verification", 14, false);
-                  sub.setPadding(0, 0, 0, dp(12));
-                  root.addView(sub);
+                  root.addView(txt("ABB TERRA PROVISIONER",23,true));
+                  TextView sub=txt("FINAL • Custom OCPP + Charger ID + AuthKey helper",14,false);
+                  sub.setPadding(0,0,0,dp(12)); root.addView(sub);
 
-                  statusText = text("Ready", 15, true);
-                  statusText.setPadding(dp(10), dp(10), dp(10), dp(10));
-                  root.addView(statusText, matchWrap());
+                  status=txt("Ready",15,true); status.setPadding(dp(10),dp(10),dp(10),dp(8)); root.addView(status);
+                  link=txt("NOT CONNECTED",14,true); link.setPadding(dp(10),0,dp(10),dp(12)); root.addView(link);
 
-                  linkText = text("NOT CONNECTED", 14, true);
-                  linkText.setPadding(dp(10), dp(8), dp(10), dp(12));
-                  root.addView(linkText, matchWrap());
+                  LinearLayout row=new LinearLayout(this);
+                  scanBtn=btn("SCAN BLE"); Button stop=btn("STOP");
+                  row.addView(scanBtn,new LinearLayout.LayoutParams(0,dp(52),1));
+                  LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(0,dp(52),1); lp.setMargins(dp(8),0,0,0);
+                  row.addView(stop,lp); root.addView(row);
+                  scanBtn.setOnClickListener(v->startScan());
+                  stop.setOnClickListener(v->stopScan());
 
-                  LinearLayout actions = new LinearLayout(this);
-                  actions.setOrientation(LinearLayout.HORIZONTAL);
-                  scanButton = button("SCAN BLE");
-                  stopButton = button("STOP SCAN");
-                  actions.addView(scanButton, new LinearLayout.LayoutParams(0, dp(52), 1));
-                  LinearLayout.LayoutParams stopLp = new LinearLayout.LayoutParams(0, dp(52), 1);
-                  stopLp.setMargins(dp(8), 0, 0, 0);
-                  actions.addView(stopButton, stopLp);
-                  root.addView(actions, matchWrap());
-                  scanButton.setOnClickListener(v -> startBleScan());
-                  stopButton.setOnClickListener(v -> stopBleScan());
+                  LinearLayout row2=new LinearLayout(this);
+                  verifyBtn=btn("VERIFY LINK"); disconnectBtn=btn("DISCONNECT");
+                  verifyBtn.setEnabled(false); disconnectBtn.setEnabled(false);
+                  row2.addView(verifyBtn,new LinearLayout.LayoutParams(0,dp(52),1));
+                  LinearLayout.LayoutParams lp2=new LinearLayout.LayoutParams(0,dp(52),1); lp2.setMargins(dp(8),0,0,0);
+                  row2.addView(disconnectBtn,lp2); root.addView(row2);
+                  verifyBtn.setOnClickListener(v->verifyLink());
+                  disconnectBtn.setOnClickListener(v->disconnectGatt());
 
-                  LinearLayout linkActions = new LinearLayout(this);
-                  linkActions.setOrientation(LinearLayout.HORIZONTAL);
-                  verifyButton = button("VERIFY BLE LINK");
-                  disconnectButton = button("DISCONNECT");
-                  verifyButton.setEnabled(false);
-                  disconnectButton.setEnabled(false);
-                  linkActions.addView(verifyButton, new LinearLayout.LayoutParams(0, dp(52), 1));
-                  LinearLayout.LayoutParams discLp = new LinearLayout.LayoutParams(0, dp(52), 1);
-                  discLp.setMargins(dp(8), 0, 0, 0);
-                  linkActions.addView(disconnectButton, discLp);
-                  root.addView(linkActions, matchWrap());
-                  verifyButton.setOnClickListener(v -> verifyBleLink());
-                  disconnectButton.setOnClickListener(v -> disconnectCurrentGatt());
+                  TextView dtitle=txt("Nearby TACW / BLE devices",16,true); dtitle.setPadding(0,dp(16),0,dp(6)); root.addView(dtitle);
+                  deviceList=new LinearLayout(this); deviceList.setOrientation(LinearLayout.VERTICAL); root.addView(deviceList);
 
-                  TextView devicesTitle = text("Nearby BLE devices — tap TACW charger to connect", 16, true);
-                  devicesTitle.setPadding(0, dp(18), 0, dp(8));
-                  root.addView(devicesTitle);
+                  TextView ct=txt("CUSTOM OCPP CONFIGURATION",18,true); ct.setPadding(0,dp(20),0,dp(6)); root.addView(ct);
 
-                  deviceList = new LinearLayout(this);
-                  deviceList.setOrientation(LinearLayout.VERTICAL);
-                  root.addView(deviceList, matchWrap());
+                  chargerId=input("Charger ID / Charge Point Identity");
+                  url=input("Server host/path, contoh: homecharging.pln.co.id/ocpp");
+                  authKey=input("Authorization Key / Password");
+                  authKey.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_VARIATION_PASSWORD);
+                  wifiName=input("WiFi SSID (opsional)");
+                  maxCurrent=input("Maximum current A (default 32)");
+                  maxCurrent.setInputType(InputType.TYPE_CLASS_NUMBER);
+                  maxCurrent.setText("32");
 
-                  TextView configTitle = text("OCPP provisioning target (write remains locked)", 17, true);
-                  configTitle.setPadding(0, dp(20), 0, dp(6));
-                  root.addView(configTitle);
+                  schemeSpinner=new Spinner(this);
+                  ArrayAdapter<String> sp=new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"wss://","ws://"});
+                  schemeSpinner.setAdapter(sp);
 
-                  wsUrl = input("WebSocket URL (ws:// or wss://)");
-                  chargerId = input("Charge Point Identity / Charger ID");
-                  authKey = input("Authorization Key / Password");
-                  authKey.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-                  basicAuth = new CheckBox(this);
-                  basicAuth.setText("HTTP Basic Authentication");
-                  basicAuth.setChecked(true);
-                  root.addView(wsUrl, matchWrap());
-                  root.addView(chargerId, matchWrap());
-                  root.addView(authKey, matchWrap());
-                  root.addView(basicAuth, matchWrap());
+                  requirePassword=new CheckBox(this);
+                  requirePassword.setText("Server requires password / AuthKey");
+                  requirePassword.setChecked(true);
 
-                  Button apply = button("APPLY TO CHARGER — LOCKED IN v0.2");
-                  apply.setEnabled(false);
-                  root.addView(apply, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(54)));
-                  TextView safety = text("v0.2 only verifies the BLE/GATT transport and enables FFF4 notifications. It does not send proprietary authentication or OCPP configuration writes.", 12, false);
-                  safety.setPadding(0, dp(6), 0, dp(8));
-                  root.addView(safety);
+                  root.addView(label("Protocol / transport"));
+                  root.addView(schemeSpinner);
+                  root.addView(chargerId);
+                  root.addView(url);
+                  root.addView(authKey);
+                  root.addView(requirePassword);
+                  root.addView(wifiName);
+                  root.addView(maxCurrent);
 
-                  LinearLayout logHeader = new LinearLayout(this);
-                  logHeader.setGravity(Gravity.CENTER_VERTICAL);
-                  TextView logTitle = text("BLE / GATT Debug Log", 17, true);
-                  logHeader.addView(logTitle, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
-                  Button copy = button("COPY LOG");
-                  logHeader.addView(copy, new LinearLayout.LayoutParams(dp(110), dp(46)));
-                  root.addView(logHeader, matchWrap());
+                  Button preview=btn("PREVIEW ABB JSON");
+                  saveBtn=btn("SAVE PRE-CONFIG JSON");
+                  copyBtn=btn("COPY AUTHKEY");
+                  openTerraBtn=btn("OPEN TERRACONFIG");
+                  root.addView(preview,new LinearLayout.LayoutParams(-1,dp(54)));
+                  root.addView(saveBtn,new LinearLayout.LayoutParams(-1,dp(54)));
+                  root.addView(copyBtn,new LinearLayout.LayoutParams(-1,dp(54)));
+                  root.addView(openTerraBtn,new LinearLayout.LayoutParams(-1,dp(54)));
 
-                  logText = text("", 11, false);
-                  logText.setTypeface(Typeface.MONOSPACE);
-                  logText.setTextIsSelectable(true);
-                  logText.setPadding(dp(10), dp(10), dp(10), dp(10));
-                  root.addView(logText, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(560)));
-                  copy.setOnClickListener(v -> copyLog());
+                  preview.setOnClickListener(v->{
+                      try { pendingJson=makeJson(); append("PROFILE JSON:\n"+pendingJson); toast("JSON generated. See log."); }
+                      catch(Exception e){ toast(e.getMessage()); }
+                  });
+                  saveBtn.setOnClickListener(v->saveJson());
+                  copyBtn.setOnClickListener(v->copyAuth());
+                  openTerraBtn.setOnClickListener(v->openTerraConfig());
 
-                  setContentView(scroll);
+                  TextView note=txt(
+                      "Workflow: isi Charger ID + URL + AuthKey → Save JSON → import pre-configuration di TerraConfig → paste AuthKey saat diminta → Configure charger. " +
+                      "AuthKey tidak dimasukkan ke JSON karena export ABB hanya menyimpan passwordSupport, bukan password plaintext.",12,false);
+                  note.setPadding(0,dp(8),0,dp(14)); root.addView(note);
+
+                  LinearLayout lh=new LinearLayout(this); lh.setGravity(Gravity.CENTER_VERTICAL);
+                  TextView lt=txt("BLE / Provisioning Log",17,true);
+                  Button c=btn("COPY LOG");
+                  lh.addView(lt,new LinearLayout.LayoutParams(0,-2,1));
+                  lh.addView(c,new LinearLayout.LayoutParams(dp(110),dp(46))); root.addView(lh);
+                  log=txt("",11,false); log.setTypeface(Typeface.MONOSPACE); log.setTextIsSelectable(true);
+                  log.setPadding(dp(8),dp(8),dp(8),dp(8)); root.addView(log,new LinearLayout.LayoutParams(-1,dp(520)));
+                  c.setOnClickListener(v->{
+                      ClipboardManager cm=(ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
+                      cm.setPrimaryClip(ClipData.newPlainText("ABB Terra log",log.getText()));
+                      toast("Log copied");
+                  });
+
+                  setContentView(sv);
               }
 
-              private void discoverServicesSafe(BluetoothGatt gatt) {
-                  if (gatt == null) return;
+              private JSONObject baseProfile() throws Exception {
+                  JSONObject root=new JSONObject();
+                  root.put("configuration_version",2);
+
+                  JSONObject connections=new JSONObject();
+                  JSONObject wifi=new JSONObject();
+                  String w=wifiName.getText().toString().trim();
+                  if(!w.isEmpty()) wifi.put("name",w);
+                  connections.put("wifi",wifi);
+                  root.put("connections",connections);
+
+                  JSONObject cs=new JSONObject();
+                  JSONObject ove=new JSONObject(); ove.put("enabled",false); cs.put("ove_r37",ove);
+                  root.put("country_specific",cs);
+
+                  JSONObject em=new JSONObject();
+                  int amps=32;
+                  try { amps=Integer.parseInt(maxCurrent.getText().toString().trim()); } catch(Exception ignored){}
+                  em.put("charger_amperage",amps);
+                  em.put("electrical_grid_network_type","tt_tn");
+                  em.put("max_current",amps);
+                  em.put("phase_connection_order","L1");
+                  root.put("energy_management",em);
+
+                  root.put("external_cards_enabled",false);
+                  root.put("free_vending_enabled",false);
+                  root.put("input_output",new JSONObject());
+
+                  JSONObject loc=new JSONObject();
+                  loc.put("address","");
+                  JSONObject coord=new JSONObject(); coord.put("latitude",-5.0); coord.put("longitude",120.0);
+                  loc.put("coordinates",coord); loc.put("country_code","ID"); loc.put("isPublic",false); loc.put("region_code","");
+                  root.put("location",loc);
+
+                  JSONObject ocpp=new JSONObject();
+                  ocpp.put("charger_identity",chargerId.getText().toString().trim());
+
+                  JSONObject server=new JSONObject();
+                  server.put("certificate","");
+                  server.put("certificateNumber","0");
+                  server.put("id","");
+                  server.put("name","");
+                  server.put("passwordSupport",requirePassword.isChecked()?1:0);
+                  server.put("protocol_type","OCPP");
+                  server.put("protocol_version","ocpp1.6j");
+                  String scheme=(String)schemeSpinner.getSelectedItem();
+                  server.put("server_type",scheme);
+                  server.put("type","custom");
+                  String u=url.getText().toString().trim();
+                  if(u.startsWith("ws://")) u=u.substring(5);
+                  if(u.startsWith("wss://")) u=u.substring(6);
+                  server.put("url",scheme+u);
+                  ocpp.put("server",server);
+                  root.put("ocpp",ocpp);
+
+                  JSONObject protocol=new JSONObject();
+                  protocol.put("charger_protocol","bc");
+                  protocol.put("15118_duty_cycle_mode",0);
+                  root.put("protocol",protocol);
+
+                  JSONObject schedule=new JSONObject();
+                  schedule.put("editable",true);
+                  schedule.put("plan",new org.json.JSONArray());
+                  schedule.put("randomized_delay",0);
+                  schedule.put("randomized_delay_mode",2);
+                  root.put("schedule",schedule);
+                  return root;
+              }
+
+              private String makeJson() throws Exception {
+                  String id=chargerId.getText().toString().trim();
+                  String u=url.getText().toString().trim();
+                  if(id.isEmpty()) throw new Exception("Charger ID wajib diisi.");
+                  if(u.isEmpty()) throw new Exception("OCPP URL wajib diisi.");
+                  if(requirePassword.isChecked() && authKey.getText().toString().isEmpty())
+                      throw new Exception("AuthKey/password wajib diisi jika password diaktifkan.");
+                  return baseProfile().toString();
+              }
+
+              private void saveJson() {
                   try {
-                      boolean started = gatt.discoverServices();
-                      appendLog("discoverServices()=" + started);
-                  } catch (SecurityException e) {
-                      appendLog("discoverServices permission error: " + e.getMessage());
+                      pendingJson=makeJson();
+                      Intent i=new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                      i.addCategory(Intent.CATEGORY_OPENABLE);
+                      i.setType("application/json");
+                      i.putExtra(Intent.EXTRA_TITLE,"ABB-Terra-Custom-OCPP.json");
+                      startActivityForResult(i,REQ_SAVE_JSON);
+                  } catch(Exception e){ toast(e.getMessage()); }
+              }
+
+              @Override protected void onActivityResult(int req,int res,Intent data) {
+                  super.onActivityResult(req,res,data);
+                  if(req==REQ_SAVE_JSON && res==RESULT_OK && data!=null && data.getData()!=null) {
+                      try(OutputStream os=getContentResolver().openOutputStream(data.getData())) {
+                          os.write(pendingJson.getBytes(StandardCharsets.UTF_8));
+                          os.flush();
+                          append("Saved ABB pre-configuration JSON: "+data.getData());
+                          toast("JSON saved. Import it from TerraConfig Pre-configuration.");
+                      } catch(Exception e){ append("Save JSON error: "+e); toast("Save failed: "+e.getMessage()); }
                   }
               }
 
-              private void enableTerraNotifications(BluetoothGatt gatt) {
-                  if (terraRx == null) return;
-                  try {
-                      boolean local = gatt.setCharacteristicNotification(terraRx, true);
-                      appendLog("setCharacteristicNotification(FFF4,true)=" + local);
-                      BluetoothGattDescriptor cccd = terraRx.getDescriptor(UUID_CCCD);
-                      if (cccd == null) {
-                          setStatus("Connected, FFF4 CCCD descriptor missing");
-                          setLink("GATT CONNECTED • NO CCCD");
-                          return;
-                      }
-                      int result;
-                      if (Build.VERSION.SDK_INT >= 33) {
-                          result = gatt.writeDescriptor(cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-                          appendLog("writeDescriptor(FFF4 CCCD) result=" + result);
-                      } else {
-                          cccd.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-                          boolean ok = gatt.writeDescriptor(cccd);
-                          appendLog("writeDescriptor(FFF4 CCCD)=" + ok);
-                      }
-                  } catch (SecurityException e) {
-                      appendLog("enableTerraNotifications permission error: " + e.getMessage());
-                  }
+              private void copyAuth() {
+                  String k=authKey.getText().toString();
+                  if(k.isEmpty()){ toast("AuthKey masih kosong"); return; }
+                  ClipboardManager cm=(ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
+                  cm.setPrimaryClip(ClipData.newPlainText("ABB Terra AuthKey",k));
+                  toast("AuthKey copied");
               }
 
-              private void readDeviceNameSafe(BluetoothGatt gatt) {
-                  if (deviceNameChar == null || gatt == null) {
-                      appendLog("Device Name characteristic not available; link is still valid if FFF4 is enabled.");
-                      return;
-                  }
-                  try {
-                      boolean ok = gatt.readCharacteristic(deviceNameChar);
-                      appendLog("readCharacteristic(DeviceName)=" + ok);
-                  } catch (SecurityException e) {
-                      appendLog("read DeviceName permission error: " + e.getMessage());
-                  }
+              private void openTerraConfig() {
+                  Intent launch=getPackageManager().getLaunchIntentForPackage("com.abbemobility.terraconfig");
+                  if(launch==null){ toast("TerraConfig tidak ditemukan di HP."); return; }
+                  startActivity(launch);
               }
 
-              private void verifyBleLink() {
-                  BluetoothGatt gatt = currentGatt;
-                  if (gatt == null) {
-                      toast("No charger connected.");
-                      return;
-                  }
-                  appendLog("Manual BLE link verification requested");
-                  setStatus("Verifying BLE link...");
-                  try {
-                      boolean ok = gatt.readRemoteRssi();
-                      appendLog("readRemoteRssi()=" + ok);
-                  } catch (SecurityException e) {
-                      appendLog("readRemoteRssi permission error: " + e.getMessage());
-                  }
-                  mainHandler.postDelayed(() -> readDeviceNameSafe(gatt), 350);
-                  if (terraNotifyEnabled) setLink("CONNECTED • FFF4 READY");
+              private void startScan() {
+                  if(adapter==null){ toast("Bluetooth tidak tersedia"); return; }
+                  if(!permOk()){ requestPerms(); return; }
+                  if(!adapter.isEnabled()){ toast("Aktifkan Bluetooth"); return; }
+                  scanner=adapter.getBluetoothLeScanner();
+                  if(scanner==null){ toast("BLE scanner tidak tersedia"); return; }
+                  stopScan(); seen.clear(); deviceList.removeAllViews();
+                  setStatus("Scanning BLE 20 detik...");
+                  try { scanner.startScan(scanCb); append("BLE scan started"); handler.postDelayed(this::stopScan,20000); }
+                  catch(Exception e){ append("startScan error="+e.getMessage()); }
               }
 
-              private void requestNeededPermissions() {
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                      requestPermissions(new String[]{Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT}, REQ_PERMISSIONS);
-                  } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                      requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, REQ_PERMISSIONS);
-                  }
+              private void stopScan() {
+                  if(scanner!=null) try { scanner.stopScan(scanCb); } catch(Exception ignored){}
               }
 
-              private boolean permissionsOkay() {
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                      return checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
-                              && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
-                  }
-                  return Build.VERSION.SDK_INT < Build.VERSION_CODES.M
-                          || checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+              private void addDevice(BluetoothDevice d,String name,String addr,int rssi) {
+                  if(!name.toUpperCase(Locale.US).startsWith("TACW")) return;
+                  Button b=btn(name+"\n"+addr+"   RSSI "+rssi+" dBm");
+                  b.setGravity(Gravity.START|Gravity.CENTER_VERTICAL);
+                  LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,dp(68)); p.setMargins(0,0,0,dp(6));
+                  deviceList.addView(b,p);
+                  b.setOnClickListener(v->connect(d));
               }
 
-              private void startBleScan() {
-                  if (!permissionsOkay()) {
-                      requestNeededPermissions();
-                      toast("Allow Bluetooth/Nearby Devices permission, then tap SCAN BLE again.");
-                      return;
-                  }
-                  if (!bluetoothAdapter.isEnabled()) {
-                      toast("Please turn Bluetooth ON first.");
-                      return;
-                  }
-                  scanner = bluetoothAdapter.getBluetoothLeScanner();
-                  if (scanner == null) {
-                      appendLog("BluetoothLeScanner unavailable");
-                      return;
-                  }
-                  stopBleScan();
-                  seenAddresses.clear();
-                  deviceList.removeAllViews();
-                  setStatus("Scanning BLE devices for 20 seconds...");
-                  setLink("SCANNING");
-                  appendLog("BLE scan started");
-                  try {
-                      scanner.startScan(scanCallback);
-                      mainHandler.postDelayed(this::stopBleScan, 20000);
-                  } catch (SecurityException e) {
-                      appendLog("startScan permission error: " + e.getMessage());
-                  }
-              }
-
-              private void stopBleScan() {
-                  if (scanner != null) {
-                      try { scanner.stopScan(scanCallback); } catch (Exception ignored) { }
-                  }
-              }
-
-              private void addDeviceButton(BluetoothDevice device, String label, String name) {
-                  Button b = button(label);
-                  b.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
-                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(68));
-                  lp.setMargins(0, 0, 0, dp(6));
-                  deviceList.addView(b, lp);
-                  b.setOnClickListener(v -> connectTo(device, name));
-              }
-
-              private void connectTo(BluetoothDevice device, String name) {
-                  stopBleScan();
-                  if (!permissionsOkay()) {
-                      requestNeededPermissions();
-                      return;
-                  }
-                  disconnectCurrentGatt();
-                  String addr = safeAddress(device);
-                  setStatus("Connecting to " + (name == null ? "BLE device" : name) + " " + addr);
+              private void connect(BluetoothDevice d) {
+                  stopScan(); disconnectGatt();
+                  setStatus("Connecting "+safeName(d));
                   setLink("CONNECTING...");
-                  appendLog("Connecting: name=" + name + " address=" + addr);
+                  append("Connecting "+safeName(d)+" "+safeAddr(d));
                   try {
-                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                          currentGatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE);
-                      } else {
-                          currentGatt = device.connectGatt(this, false, gattCallback);
-                      }
-                  } catch (SecurityException e) {
-                      appendLog("connectGatt permission error: " + e.getMessage());
-                  }
+                      gatt=Build.VERSION.SDK_INT>=23 ? d.connectGatt(this,false,cb,BluetoothDevice.TRANSPORT_LE)
+                                                    : d.connectGatt(this,false,cb);
+                  } catch(Exception e){ append("connectGatt error="+e.getMessage()); }
               }
 
-              private void disconnectCurrentGatt() {
-                  BluetoothGatt gatt = currentGatt;
-                  currentGatt = null;
-                  terraNotifyEnabled = false;
-                  terraTx = null;
-                  terraRx = null;
-                  deviceNameChar = null;
-                  runOnUiThread(() -> {
-                      verifyButton.setEnabled(false);
-                      disconnectButton.setEnabled(false);
-                  });
-                  if (gatt != null) {
-                      try { gatt.disconnect(); } catch (Exception ignored) { }
-                      try { gatt.close(); } catch (Exception ignored) { }
-                      appendLog("Previous/current GATT closed");
-                  }
+              private void enableNotify(BluetoothGatt gg) {
+                  try {
+                      append("setCharacteristicNotification="+gg.setCharacteristicNotification(rx,true));
+                      BluetoothGattDescriptor d=rx.getDescriptor(CCCD);
+                      if(d==null){ append("CCCD missing"); return; }
+                      if(Build.VERSION.SDK_INT>=33) append("writeDescriptor="+gg.writeDescriptor(d,BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE));
+                      else { d.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE); append("writeDescriptor="+gg.writeDescriptor(d)); }
+                  } catch(Exception e){ append("notify setup error="+e.getMessage()); }
               }
 
-              private String properties(int p) {
-                  StringBuilder s = new StringBuilder();
-                  addProp(s, p, BluetoothGattCharacteristic.PROPERTY_READ, "READ");
-                  addProp(s, p, BluetoothGattCharacteristic.PROPERTY_WRITE, "WRITE");
-                  addProp(s, p, BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE, "WRITE_NR");
-                  addProp(s, p, BluetoothGattCharacteristic.PROPERTY_NOTIFY, "NOTIFY");
-                  addProp(s, p, BluetoothGattCharacteristic.PROPERTY_INDICATE, "INDICATE");
-                  addProp(s, p, BluetoothGattCharacteristic.PROPERTY_BROADCAST, "BROADCAST");
-                  addProp(s, p, BluetoothGattCharacteristic.PROPERTY_SIGNED_WRITE, "SIGNED_WRITE");
-                  return s.length() == 0 ? "NONE(0x" + Integer.toHexString(p) + ")" : s.toString();
+              private void readName(BluetoothGatt gg) {
+                  if(deviceNameChar==null) return;
+                  try { append("read DeviceName="+gg.readCharacteristic(deviceNameChar)); } catch(Exception ignored){}
               }
 
-              private void addProp(StringBuilder sb, int props, int mask, String name) {
-                  if ((props & mask) != 0) {
-                      if (sb.length() > 0) sb.append('|');
-                      sb.append(name);
-                  }
+              private void verifyLink() {
+                  if(gatt==null){ toast("Belum terhubung"); return; }
+                  try { append("readRemoteRssi="+gatt.readRemoteRssi()); } catch(Exception ignored){}
+                  handler.postDelayed(() -> readName(gatt),300);
               }
 
-              private String stateName(int state) {
-                  if (state == BluetoothProfile.STATE_CONNECTED) return "CONNECTED";
-                  if (state == BluetoothProfile.STATE_CONNECTING) return "CONNECTING";
-                  if (state == BluetoothProfile.STATE_DISCONNECTED) return "DISCONNECTED";
-                  if (state == BluetoothProfile.STATE_DISCONNECTING) return "DISCONNECTING";
-                  return String.valueOf(state);
+              private void disconnectGatt() {
+                  BluetoothGatt gg=gatt; gatt=null; clearGattState();
+                  if(gg!=null){ try{gg.disconnect();}catch(Exception ignored){} try{gg.close();}catch(Exception ignored){} }
               }
 
-              private String safeAddress(BluetoothDevice d) {
-                  try { return d == null ? "?" : d.getAddress(); }
-                  catch (SecurityException e) { return "permission-denied"; }
+              private void clearGattState() {
+                  notifyReady=false; tx=null; rx=null; deviceNameChar=null;
+                  runOnUiThread(() -> { verifyBtn.setEnabled(gatt!=null); disconnectBtn.setEnabled(gatt!=null); });
               }
 
-              private String hex(byte[] b) {
-                  if (b == null) return "<null>";
-                  StringBuilder s = new StringBuilder();
-                  for (byte x : b) s.append(String.format(Locale.US, "%02X", x));
-                  return s.toString();
+              private void requestPerms() {
+                  if(Build.VERSION.SDK_INT>=31)
+                      requestPermissions(new String[]{Manifest.permission.BLUETOOTH_SCAN,Manifest.permission.BLUETOOTH_CONNECT},REQ_PERMISSIONS);
+                  else if(Build.VERSION.SDK_INT>=23)
+                      requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION},REQ_PERMISSIONS);
               }
 
-              private void appendLog(String msg) {
-                  final String line = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(new Date()) + "  " + msg + "\n";
-                  runOnUiThread(() -> {
-                      if (logText != null) logText.append(line);
-                  });
+              private boolean permOk() {
+                  if(Build.VERSION.SDK_INT>=31)
+                      return checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN)==PackageManager.PERMISSION_GRANTED &&
+                             checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)==PackageManager.PERMISSION_GRANTED;
+                  return Build.VERSION.SDK_INT<23 || checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)==PackageManager.PERMISSION_GRANTED;
               }
 
               private void setStatus(String s) {
                   runOnUiThread(() -> {
-                      statusText.setText(s);
-                      boolean connected = currentGatt != null;
-                      verifyButton.setEnabled(connected);
-                      disconnectButton.setEnabled(connected);
+                      status.setText(s);
+                      boolean c=gatt!=null;
+                      verifyBtn.setEnabled(c); disconnectBtn.setEnabled(c);
                   });
               }
+              private void setLink(String s){ runOnUiThread(() -> link.setText(s)); }
 
-              private void setLink(String s) {
-                  runOnUiThread(() -> linkText.setText(s));
+              private void append(String s) {
+                  String l=new SimpleDateFormat("HH:mm:ss.SSS",Locale.US).format(new Date())+"  "+s+"\n";
+                  runOnUiThread(() -> { if(log!=null) log.append(l); });
               }
 
-              private void copyLog() {
-                  ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-                  cm.setPrimaryClip(ClipData.newPlainText("ABB Terra BLE log", logText.getText()));
-                  toast("Log copied. Paste it back into ChatGPT.");
+              private String safeName(BluetoothDevice d){ try{return d==null?null:d.getName();}catch(Exception e){return null;} }
+              private String safeAddr(BluetoothDevice d){ try{return d==null?null:d.getAddress();}catch(Exception e){return null;} }
+              private String state(int s){
+                  if(s==BluetoothProfile.STATE_CONNECTED)return "CONNECTED";
+                  if(s==BluetoothProfile.STATE_CONNECTING)return "CONNECTING";
+                  if(s==BluetoothProfile.STATE_DISCONNECTED)return "DISCONNECTED";
+                  if(s==BluetoothProfile.STATE_DISCONNECTING)return "DISCONNECTING";
+                  return String.valueOf(s);
               }
+              private String hex(byte[] b){ if(b==null)return "<null>"; StringBuilder s=new StringBuilder(); for(byte x:b)s.append(String.format(Locale.US,"%02X",x)); return s.toString(); }
 
-              private TextView text(String value, float sp, boolean bold) {
-                  TextView t = new TextView(this);
-                  t.setText(value);
-                  t.setTextSize(sp);
-                  if (bold) t.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-                  return t;
-              }
+              private TextView label(String s){ TextView t=txt(s,13,true); t.setPadding(0,dp(8),0,0); return t; }
+              private TextView txt(String s,float sz,boolean bold){ TextView t=new TextView(this); t.setText(s); t.setTextSize(sz); if(bold)t.setTypeface(Typeface.DEFAULT,Typeface.BOLD); return t; }
+              private Button btn(String s){ Button b=new Button(this); b.setText(s); b.setAllCaps(false); return b; }
+              private EditText input(String h){ EditText e=new EditText(this); e.setHint(h); e.setSingleLine(true); e.setPadding(dp(10),dp(6),dp(10),dp(6)); return e; }
+              private int dp(int v){ return Math.round(v*getResources().getDisplayMetrics().density); }
+              private void toast(String s){ Toast.makeText(this,s,Toast.LENGTH_LONG).show(); }
 
-              private Button button(String value) {
-                  Button b = new Button(this);
-                  b.setText(value);
-                  b.setAllCaps(false);
-                  return b;
-              }
-
-              private EditText input(String hint) {
-                  EditText e = new EditText(this);
-                  e.setHint(hint);
-                  e.setSingleLine(true);
-                  e.setPadding(dp(10), dp(6), dp(10), dp(6));
-                  return e;
-              }
-
-              private LinearLayout.LayoutParams matchWrap() {
-                  return new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-              }
-
-              private int dp(int v) {
-                  return Math.round(v * getResources().getDisplayMetrics().density);
-              }
-
-              private void toast(String s) {
-                  Toast.makeText(this, s, Toast.LENGTH_LONG).show();
-              }
-
-              @Override
-              protected void onDestroy() {
-                  super.onDestroy();
-                  stopBleScan();
-                  disconnectCurrentGatt();
-              }
+              @Override protected void onDestroy(){ super.onDestroy(); stopScan(); disconnectGatt(); }
           }
           EOF
 
@@ -759,14 +642,14 @@ jobs:
         shell: bash
         run: |
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Provisioner-v0.2.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Provisioner-FINAL.apk
           cd artifact
-          sha256sum ABB-Terra-Provisioner-v0.2.apk | tee ABB-Terra-Provisioner-v0.2.apk.sha256
+          sha256sum ABB-Terra-Provisioner-FINAL.apk | tee ABB-Terra-Provisioner-FINAL.apk.sha256
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ABB-Terra-Provisioner-v0.2
+          name: ABB-Terra-Provisioner-FINAL
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
