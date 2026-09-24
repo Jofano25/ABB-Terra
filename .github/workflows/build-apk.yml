@@ -1,4 +1,4 @@
-name: Build ABB Terra Provisioner FINAL
+name: Build ABB Terra Provisioner FINAL FIXED
 
 on:
   workflow_dispatch:
@@ -104,12 +104,6 @@ jobs:
           }
           EOF
 
-          cat > app/src/main/res/xml/file_paths.xml <<'EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <paths xmlns:android="http://schemas.android.com/apk/res/android">
-              <cache-path name="cache" path="." />
-          </paths>
-          EOF
 
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
@@ -140,24 +134,9 @@ jobs:
                       </intent-filter>
                   </activity>
 
-                  <provider
-                      android:name="androidx.core.content.FileProvider"
-                      android:authorities="${applicationId}.provider"
-                      android:exported="false"
-                      android:grantUriPermissions="true" />
               </application>
           </manifest>
           EOF
-
-          # Remove FileProvider dependency requirement: we use ACTION_CREATE_DOCUMENT for saving
-          python3 - <<'PY'
-          p='app/src/main/AndroidManifest.xml'
-          s=open(p).read()
-          a=s.index('                  <provider')
-          b=s.index('                  </provider>',a)+len('                  </provider>\n')
-          s=s[:a]+s[b:]
-          open(p,'w').write(s)
-          PY
 
           cat > app/src/main/java/com/elmecon/abbterra/MainActivity.java <<'EOF'
           package com.elmecon.abbterra;
