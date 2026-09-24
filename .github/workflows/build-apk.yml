@@ -1,4 +1,4 @@
-name: Build ABB Terra Direct Provisioner
+name: Build ABB Terra PIN Direct Provisioner
 
 on:
   workflow_dispatch:
@@ -79,8 +79,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 200
-                  versionName '2.0-direct'
+                  versionCode 210
+                  versionName '2.1-pin-direct'
               }
 
               buildTypes {
@@ -109,7 +109,7 @@ jobs:
               <application
                   android:allowBackup="false"
                   android:usesCleartextTraffic="false"
-                  android:label="ABB Terra Direct"
+                  android:label="ABB Terra PIN Direct"
                   android:supportsRtl="true"
                   android:theme="@android:style/Theme.Material.NoActionBar">
                   <activity
@@ -140,6 +140,7 @@ jobs:
           import android.net.Uri;
           import android.os.*;
           import android.text.InputType;
+          import android.text.InputFilter;
           import android.view.*;
           import android.widget.*;
 
@@ -175,9 +176,6 @@ jobs:
 
               private static final String API = "https://abb-installer.chargedot.com";
               // Public mobile-client credentials embedded in the official mobile application.
-              private static final String CLIENT_ID = "3710400e-1c02-4175-84ea-40a227c0dcf6";
-              private static final String CLIENT_SECRET = "f1a6d022-8a8e-453c-862e-ba0d3c5b4521";
-
               private final Handler main = new Handler(Looper.getMainLooper());
               private final SecureRandom rng = new SecureRandom();
 
@@ -196,7 +194,6 @@ jobs:
               private byte[] sessionToken = new byte[8];
               private byte[] clientNonce;
               private int userId = 0;
-              private String accessToken = "";
 
               private final ByteArrayOutputStream rxBuffer = new ByteArrayOutputStream();
               private final ArrayDeque<byte[]> txChunks = new ArrayDeque<>();
@@ -206,7 +203,7 @@ jobs:
 
               private TextView statusTitle, statusDetail, selectedDevice, logText;
               private LinearLayout deviceList, progressBox;
-              private EditText email, abbPassword, chargerPin, fwInput;
+              private EditText chargerPin, fwInput;
               private EditText chargePointId, serverUrl, authKey;
               private CheckBox requiresPassword;
               private Button scanBtn, authBtn, saveBtn, verifyBtn, disconnectBtn;
@@ -296,7 +293,7 @@ jobs:
                       if (CCCD.equals(d.getUuid()) && st == BluetoothGatt.GATT_SUCCESS) {
                           transportReady = true;
                           progress("Bluetooth", true, "FFF3 / FFF4 ready");
-                          setStatus("Charger connected", deviceNumber.isEmpty() ? "Secure authentication required." : deviceNumber);
+                          setStatus("Bluetooth connected", deviceNumber.isEmpty() ? "Enter 8-char PIN to authenticate." : deviceNumber + " • waiting for PIN/auth");
                           updateButtons();
                           if (credentialsReady()) main.postDelayed(() -> authenticateCharger(), 250);
                       }
@@ -327,7 +324,7 @@ jobs:
                   requestPerms();
 
                   appendLog("ABB Terra Direct Provisioner 2.0 started");
-                  appendLog("Direct mode: secure BLE + OCPP configuration. TerraConfig handoff disabled.");
+                  appendLog("Direct mode: PIN-only secure BLE + OCPP configuration. No ABB account required.");
               }
 
               private void buildUi() {
@@ -377,18 +374,14 @@ jobs:
                   root.addView(deviceList);
 
                   LinearLayout access = card(CARD);
-                  access.addView(section("SECURE ACCESS", ACCENT));
-                  email = input("ABB installer email", WHITE, MUTED);
-                  abbPassword = input("ABB installer password", WHITE, MUTED);
-                  abbPassword.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-                  chargerPin = input("Charger PIN", WHITE, MUTED);
-                  chargerPin.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+                  access.addView(section("CHARGER ACCESS", ACCENT));
+                  chargerPin = input("8-character charger PIN", WHITE, MUTED);
+                  chargerPin.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+                  chargerPin.setFilters(new InputFilter[]{new InputFilter.LengthFilter(8)});
                   fwInput = input("Firmware version (auto; isi manual jika diperlukan)", WHITE, MUTED);
-                  access.addView(labeled("ABB Account", email, MUTED));
-                  access.addView(labeled("ABB Password", abbPassword, MUTED));
-                  access.addView(labeled("Charger PIN", chargerPin, MUTED));
+                  access.addView(labeled("Charger PIN (visible, max 8 chars)", chargerPin, MUTED));
                   access.addView(labeled("Firmware", fwInput, MUTED));
-                  authBtn = button("AUTHENTICATE CHARGER", ACCENT, Color.rgb(5,33,38));
+                  authBtn = button("CONNECT + AUTHENTICATE", ACCENT, Color.rgb(5,33,38));
                   LinearLayout.LayoutParams abp = new LinearLayout.LayoutParams(-1,dp(54)); abp.setMargins(0,dp(10),0,0);
                   access.addView(authBtn, abp);
                   root.addView(access, cardLp());
@@ -570,15 +563,13 @@ jobs:
               }
 
               private boolean credentialsReady() {
-                  return !email.getText().toString().trim().isEmpty()
-                          && !abbPassword.getText().toString().isEmpty()
-                          && !chargerPin.getText().toString().trim().isEmpty()
+                  return chargerPin.getText().toString().trim().length() == 8
                           && !deviceNumber.isEmpty();
               }
 
               private void authenticateCharger() {
                   if (!transportReady) { toast("Connect charger first."); return; }
-                  if (!credentialsReady()) { toast("Fill ABB Account, password and Charger PIN."); return; }
+                  if (!credentialsReady()) { toast("Charger PIN harus tepat 8 karakter."); return; }
 
                   authenticated = false;
                   updateButtons();
@@ -588,7 +579,7 @@ jobs:
 
                   new Thread(() -> {
                       try {
-                          cloudAuthorize();
+                          pinOnlyAuthorize();
                           runOnUiThread(() -> {
                               progress("Secure session", true, "Cipher authorized");
                               String fw = fwInput.getText().toString().trim();
@@ -610,75 +601,78 @@ jobs:
                   }).start();
               }
 
-              private void cloudAuthorize() throws Exception {
-                  String mail = email.getText().toString().trim();
-                  String pass = abbPassword.getText().toString();
+              private void pinOnlyAuthorize() throws Exception {
                   String pin = chargerPin.getText().toString().trim();
-
-                  String form = "grant_type=password"
-                          + "&client_id=" + enc(CLIENT_ID)
-                          + "&client_secret=" + enc(CLIENT_SECRET)
-                          + "&username=" + enc(mail)
-                          + "&password=" + enc(pass);
-
-                  JSONObject login = new JSONObject(http("POST", API + "/api/oauth/token",
-                          "application/x-www-form-urlencoded", form, null));
-                  accessToken = findString(login,"access_token");
-                  if (accessToken.isEmpty()) throw new Exception("No access_token returned.");
-
-                  try {
-                      Object meObj = parseJsonAny(http("GET", API + "/api/v2/users/me", null, null, accessToken));
-                      Integer uid = findInt(meObj,"id");
-                      if (uid != null) userId = uid;
-                  } catch(Exception e) {
-                      appendLog("users/me warning: " + safeError(e));
-                  }
+                  if (pin.length() != 8) throw new Exception("PIN charger harus 8 karakter.");
 
                   JSONObject req = new JSONObject();
                   req.put("deviceNumber", deviceNumber);
                   req.put("pinCode", pin);
 
-                  Object cipherResp;
-                  try {
-                      cipherResp = parseJsonAny(http("POST", API + "/api/v2/devices/check-pincode",
-                              "application/json", req.toString(), accessToken));
-                  } catch(Exception first) {
-                      appendLog("check-pincode failed; trying device cipher endpoint.");
-                      JSONObject pinReq = new JSONObject();
-                      pinReq.put("pinCode",pin);
-                      cipherResp = parseJsonAny(http("POST",
-                              API + "/api/v2/devices/" + URLEncoder.encode(deviceNumber,"UTF-8") + "/cipher",
-                              "application/json", pinReq.toString(), accessToken));
+                  Object cipherResp = null;
+                  Exception last = null;
+
+                  // TerraConfig contains a dedicated PIN-check endpoint. Try it first without
+                  // an ABB user login so the installer only needs the charger PIN.
+                  String[] endpoints = new String[] {
+                          API + "/api/v2/devices/check-pincode",
+                          API + "/api/v2/devices/" + URLEncoder.encode(deviceNumber,"UTF-8") + "/cipher"
+                  };
+
+                  for (String ep : endpoints) {
+                      try {
+                          cipherResp = parseJsonAny(http("POST", ep, "application/json", req.toString(), null));
+                          String k = findString(cipherResp,"secretKey");
+                          String i = findString(cipherResp,"info");
+                          if (!k.isEmpty() && !i.isEmpty()) break;
+                      } catch(Exception e) {
+                          last=e;
+                          appendLog("PIN authorization endpoint failed: " + safeError(e));
+                          cipherResp=null;
+                      }
                   }
+
+                  // Some backend revisions expose the cipher as GET on the deviceNumber route.
+                  if (cipherResp == null) {
+                      try {
+                          String ep = API + "/api/v2/devices/" + URLEncoder.encode(deviceNumber,"UTF-8")
+                                  + "/cipher?pinCode=" + URLEncoder.encode(pin,"UTF-8");
+                          cipherResp = parseJsonAny(http("GET", ep, null, null, null));
+                      } catch(Exception e) {
+                          last=e;
+                          appendLog("PIN cipher GET failed: " + safeError(e));
+                      }
+                  }
+
+                  if (cipherResp == null)
+                      throw new Exception(last == null ? "PIN authorization failed." : safeError(last));
 
                   String keyHex = findString(cipherResp,"secretKey");
                   String infoHex = findString(cipherResp,"info");
                   if (keyHex.isEmpty() || infoHex.isEmpty())
-                      throw new Exception("Cipher response missing secretKey/info.");
+                      throw new Exception("PIN accepted response did not include cipher secretKey/info.");
+
                   encryptionKey = unhex(keyHex);
                   cipherInfo = unhex(infoHex);
                   if (encryptionKey.length != 16 || cipherInfo.length != 16)
                       throw new Exception("Invalid cipher length key=" + encryptionKey.length + " info=" + cipherInfo.length);
 
-                  Integer uid2 = findInt(cipherResp,"userId");
-                  if (uid2 != null) userId = uid2;
-                  if (userId <= 0) throw new Exception("ABB user ID not available.");
+                  Integer uid = findInt(cipherResp,"userId");
+                  // TerraConfig secure response may return a userId. If it does not, 0 is used
+                  // as the installer/session identifier and the charger decides acceptance.
+                  userId = uid == null ? 0 : uid;
 
                   String fw = findString(cipherResp,"softVersion");
                   if (fw.isEmpty()) fw = findString(cipherResp,"firmwareVersion");
                   if (!fw.isEmpty()) firmwareVersion = normalizeFw(fw);
 
-                  // Best-effort lookup of firmware from device metadata.
-                  if (firmwareVersion.isEmpty()) {
-                      try {
-                          Object devices = parseJsonAny(http("GET", API + "/api/v2/devices", null, null, accessToken));
-                          JSONObject dev = findObjectByDeviceNumber(devices, deviceNumber);
-                          if (dev != null) {
-                              String x = findString(dev,"softVersion");
-                              if (!x.isEmpty()) firmwareVersion = normalizeFw(x);
-                          }
-                      } catch(Exception e) { appendLog("Firmware lookup warning: " + safeError(e)); }
-                  }
+                  String manualFw = fwInput.getText().toString().trim();
+                  if (!manualFw.isEmpty()) firmwareVersion = normalizeFw(manualFw);
+
+                  if (firmwareVersion.isEmpty())
+                      throw new Exception("Firmware version belum diketahui. Isi firmware charger pada field Firmware.");
+
+                  appendLog("PIN-only secure material ready. firmware=" + firmwareVersion);
               }
 
               private void startHandshake1() {
@@ -1253,14 +1247,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Provisioner.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-PIN-Direct-Provisioner.apk
           cd artifact
-          sha256sum ABB-Terra-Direct-Provisioner.apk | tee ABB-Terra-Direct-Provisioner.apk.sha256
+          sha256sum ABB-Terra-PIN-Direct-Provisioner.apk | tee ABB-Terra-PIN-Direct-Provisioner.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ABB-Terra-Direct-Provisioner
+          name: ABB-Terra-PIN-Direct-Provisioner
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
