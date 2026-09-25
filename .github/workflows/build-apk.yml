@@ -1,4 +1,4 @@
-name: Build ABB Terra PIN Direct Provisioner
+name: Build ABB Terra Direct Secure
 
 on:
   workflow_dispatch:
@@ -52,7 +52,7 @@ jobs:
               repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
               repositories { google(); mavenCentral() }
           }
-          rootProject.name = 'ABBTerraDirect'
+          rootProject.name = 'ABBTerraDirectSecure'
           include ':app'
           EOF
 
@@ -79,8 +79,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 210
-                  versionName '2.1-pin-direct'
+                  versionCode 300
+                  versionName '3.0-direct-secure'
               }
 
               buildTypes {
@@ -98,7 +98,6 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
-
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
               <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
@@ -109,7 +108,7 @@ jobs:
               <application
                   android:allowBackup="false"
                   android:usesCleartextTraffic="false"
-                  android:label="ABB Terra PIN Direct"
+                  android:label="ABB Terra Direct"
                   android:supportsRtl="true"
                   android:theme="@android:style/Theme.Material.NoActionBar">
                   <activity
@@ -137,10 +136,12 @@ jobs:
           import android.graphics.Color;
           import android.graphics.Typeface;
           import android.graphics.drawable.GradientDrawable;
-          import android.net.Uri;
           import android.os.*;
-          import android.text.InputType;
+          import android.security.keystore.KeyGenParameterSpec;
+          import android.security.keystore.KeyProperties;
           import android.text.InputFilter;
+          import android.text.InputType;
+          import android.util.Base64;
           import android.view.*;
           import android.widget.*;
 
@@ -151,33 +152,42 @@ jobs:
           import java.net.HttpURLConnection;
           import java.net.URL;
           import java.net.URLEncoder;
-          import java.nio.ByteBuffer;
-          import java.nio.ByteOrder;
           import java.nio.charset.StandardCharsets;
+          import java.security.KeyStore;
           import java.security.SecureRandom;
           import java.text.SimpleDateFormat;
           import java.util.*;
+
           import javax.crypto.Cipher;
+          import javax.crypto.KeyGenerator;
+          import javax.crypto.SecretKey;
           import javax.crypto.spec.GCMParameterSpec;
           import javax.crypto.spec.SecretKeySpec;
 
           public class MainActivity extends Activity {
-              // ABB Terra AC BLE service
               private static final UUID FFF0 = UUID.fromString("0000fff0-0000-1000-8000-00805f9b34fb");
               private static final UUID FFF3 = UUID.fromString("0000fff3-0000-1000-8000-00805f9b34fb");
               private static final UUID FFF4 = UUID.fromString("0000fff4-0000-1000-8000-00805f9b34fb");
               private static final UUID CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
 
-              private static final int REQ_PERMS = 7101;
+              private static final int REQ_PERMS = 7201;
               private static final int CMD_AUTH = 0xFE;
+              private static final int CMD_SYNC_TIME = 0xB0;
               private static final int CMD_SYSINFO = 0xB1;
               private static final int CMD_OCPP = 0xD6;
               private static final int CMD_OCPP_STATUS = 0xD8;
 
               private static final String API = "https://abb-installer.chargedot.com";
-              // Public mobile-client credentials embedded in the official mobile application.
+              // Official TerraConfig 3.5.0 mobile OAuth client constants.
+              private static final String CLIENT_ID = "3710400e-1c02-4175-84ea-40a227c0dcf6";
+              private static final String CLIENT_SECRET = "f1a6d022-8a8e-453c-862e-ba0d3c5b4521";
+              private static final String KEY_ALIAS = "abb_terra_direct_token_v1";
+              private static final String PREFS = "abb_terra_direct_secure";
+
               private final Handler main = new Handler(Looper.getMainLooper());
               private final SecureRandom rng = new SecureRandom();
+              private final Set<String> seen = new HashSet<>();
+              private final Map<String,String> firmwareByAddress = new HashMap<>();
 
               private BluetoothAdapter adapter;
               private BluetoothLeScanner scanner;
@@ -186,38 +196,46 @@ jobs:
               private int mtu = 158;
               private boolean transportReady = false;
               private boolean authenticated = false;
+              private boolean encryptedMode = false;
               private String deviceNumber = "";
+              private String deviceAddress = "";
               private String firmwareVersion = "";
+              private int userId = 0;
 
               private byte[] encryptionKey;
               private byte[] cipherInfo;
               private byte[] sessionToken = new byte[8];
               private byte[] clientNonce;
-              private int userId = 0;
 
               private final ByteArrayOutputStream rxBuffer = new ByteArrayOutputStream();
               private final ArrayDeque<byte[]> txChunks = new ArrayDeque<>();
               private boolean txBusy = false;
               private int waitingCmd = -1;
               private PacketCallback waitingCallback;
+              private Runnable responseTimeout;
 
-              private TextView statusTitle, statusDetail, selectedDevice, logText;
-              private LinearLayout deviceList, progressBox;
-              private EditText chargerPin, fwInput;
-              private EditText chargePointId, serverUrl, authKey;
+              private SharedPreferences prefs;
+
+              private TextView statusTitle, statusDetail, selectedDevice, logText, adminStatus;
+              private LinearLayout deviceList, progressBox, adminFields;
+              private EditText chargerPin, chargePointId, serverUrl, authKey, adminEmail, adminPassword;
               private CheckBox requiresPassword;
-              private Button scanBtn, authBtn, saveBtn, verifyBtn, disconnectBtn;
-              private final Set<String> seen = new HashSet<>();
+              private Button scanBtn, authBtn, saveBtn, verifyBtn, disconnectBtn, adminToggle, adminLogin, adminClear;
 
               interface PacketCallback { void onPacket(Packet p); }
 
               static class Packet {
                   int cmd;
                   int code;
-                  byte[] body;
                   byte[] payload;
                   byte[] token;
+                  boolean encrypted;
                   String error;
+              }
+
+              static class HttpError extends Exception {
+                  final int code;
+                  HttpError(int code, String msg) { super(msg); this.code = code; }
               }
 
               private final ScanCallback scanCallback = new ScanCallback() {
@@ -225,58 +243,63 @@ jobs:
                       BluetoothDevice d = result.getDevice();
                       String addr = safeAddress(d);
                       if (addr == null || seen.contains(addr)) return;
-                      String n = safeName(d);
-                      if (n == null || !n.toUpperCase(Locale.US).startsWith("TACW")) return;
+                      String name = safeName(d);
+                      if (name == null || !name.toUpperCase(Locale.US).startsWith("TACW")) return;
+
                       seen.add(addr);
-                      String raw = result.getScanRecord() == null ? "" : hex(result.getScanRecord().getBytes());
-                      final String name = n;
-                      appendLog("SCAN " + name + " RSSI=" + result.getRssi() + " raw=" + raw);
-                      runOnUiThread(() -> addDevice(d, name, addr, result.getRssi()));
+                      byte[] raw = result.getScanRecord() == null ? null : result.getScanRecord().getBytes();
+                      String fw = firmwareFromScanRecord(raw);
+                      firmwareByAddress.put(addr, fw);
+                      appendLog("SCAN " + name + " RSSI=" + result.getRssi()
+                              + (fw.isEmpty() ? "" : " fw=" + fw));
+                      runOnUiThread(() -> addDevice(d, name, addr, result.getRssi(), fw));
                   }
+
                   @Override public void onScanFailed(int errorCode) {
                       failStatus("BLE scan failed", "Code " + errorCode);
                   }
               };
 
               private final BluetoothGattCallback gattCallback = new BluetoothGattCallback() {
-                  @Override public void onConnectionStateChange(BluetoothGatt gg, int st, int ns) {
-                      appendLog("GATT state status=" + st + " state=" + ns);
-                      if (st == BluetoothGatt.GATT_SUCCESS && ns == BluetoothProfile.STATE_CONNECTED) {
+                  @Override public void onConnectionStateChange(BluetoothGatt gg, int status, int newState) {
+                      appendLog("GATT state status=" + status + " state=" + newState);
+                      if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
                           gatt = gg;
                           progress("Bluetooth", true, "GATT connected");
                           setStatus("Bluetooth connected", "Opening Terra configuration channel...");
-                          try { gg.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH); } catch (Exception ignored) {}
-                          try { gg.requestMtu(247); } catch (Exception ignored) {}
+                          try { gg.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH); } catch(Exception ignored) {}
+                          try { gg.requestMtu(247); } catch(Exception ignored) {}
                           main.postDelayed(() -> {
-                              try { gg.discoverServices(); } catch (Exception e) { failStatus("Service discovery failed", e.getMessage()); }
+                              try { gg.discoverServices(); }
+                              catch(Exception e) { failStatus("Service discovery failed", safeError(e)); }
                           }, 250);
-                      } else if (ns == BluetoothProfile.STATE_DISCONNECTED) {
-                          transportReady = false;
-                          authenticated = false;
+                      } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                          clearSession();
                           progress("Bluetooth", false, "Disconnected");
                           progress("Secure session", false, "Not authenticated");
-                          setStatus("Disconnected", "Scan and connect to charger.");
+                          setStatus("Disconnected", "Scan and select charger.");
                           updateButtons();
                       }
                   }
 
-                  @Override public void onMtuChanged(BluetoothGatt gg, int newMtu, int st) {
-                      if (st == BluetoothGatt.GATT_SUCCESS) mtu = newMtu;
-                      appendLog("MTU=" + newMtu + " status=" + st);
+                  @Override public void onMtuChanged(BluetoothGatt gg, int newMtu, int status) {
+                      if (status == BluetoothGatt.GATT_SUCCESS) mtu = newMtu;
+                      appendLog("MTU=" + newMtu + " status=" + status);
                   }
 
-                  @Override public void onServicesDiscovered(BluetoothGatt gg, int st) {
-                      BluetoothGattService s = gg.getService(FFF0);
-                      if (s == null) { failStatus("Terra BLE service not found", "FFF0 missing"); return; }
-                      tx = s.getCharacteristic(FFF3);
-                      rx = s.getCharacteristic(FFF4);
+                  @Override public void onServicesDiscovered(BluetoothGatt gg, int status) {
+                      BluetoothGattService service = gg.getService(FFF0);
+                      if (service == null) { failStatus("Terra BLE service not found", "FFF0 missing"); return; }
+                      tx = service.getCharacteristic(FFF3);
+                      rx = service.getCharacteristic(FFF4);
                       if (tx == null || rx == null) { failStatus("Terra BLE channel incomplete", "FFF3/FFF4 missing"); return; }
 
                       try {
-                          boolean local = gg.setCharacteristicNotification(rx, true);
-                          appendLog("Enable FFF4 local notify=" + local);
+                          boolean ok = gg.setCharacteristicNotification(rx, true);
+                          appendLog("FFF4 local notify=" + ok);
                           BluetoothGattDescriptor d = rx.getDescriptor(CCCD);
                           if (d == null) { failStatus("Notification unavailable", "FFF4 CCCD missing"); return; }
+
                           if (Build.VERSION.SDK_INT >= 33) {
                               int r = gg.writeDescriptor(d, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
                               appendLog("CCCD write result=" + r);
@@ -284,55 +307,65 @@ jobs:
                               d.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
                               appendLog("CCCD write=" + gg.writeDescriptor(d));
                           }
-                      } catch (Exception e) {
-                          failStatus("FFF4 notification failed", e.getMessage());
+                      } catch(Exception e) {
+                          failStatus("FFF4 notification failed", safeError(e));
                       }
                   }
 
-                  @Override public void onDescriptorWrite(BluetoothGatt gg, BluetoothGattDescriptor d, int st) {
-                      if (CCCD.equals(d.getUuid()) && st == BluetoothGatt.GATT_SUCCESS) {
+                  @Override public void onDescriptorWrite(BluetoothGatt gg, BluetoothGattDescriptor descriptor, int status) {
+                      if (CCCD.equals(descriptor.getUuid()) && status == BluetoothGatt.GATT_SUCCESS) {
                           transportReady = true;
                           progress("Bluetooth", true, "FFF3 / FFF4 ready");
-                          setStatus("Bluetooth connected", deviceNumber.isEmpty() ? "Enter 8-char PIN to authenticate." : deviceNumber + " • waiting for PIN/auth");
+                          setStatus("Charger connected", deviceNumber
+                                  + (firmwareVersion.isEmpty() ? "" : " • FW " + firmwareVersion)
+                                  + " • enter PIN");
                           updateButtons();
-                          if (credentialsReady()) main.postDelayed(() -> authenticateCharger(), 250);
+
+                          if (chargerPin.getText().toString().trim().length() == 8 && hasSavedAuthorization()) {
+                              main.postDelayed(this::autoAuthenticate, 250);
+                          }
                       }
                   }
 
-                  @Override public void onCharacteristicWrite(BluetoothGatt gg, BluetoothGattCharacteristic c, int st) {
+                  private void autoAuthenticate() { authenticateCharger(); }
+
+                  @Override public void onCharacteristicWrite(BluetoothGatt gg, BluetoothGattCharacteristic characteristic, int status) {
                       txBusy = false;
-                      if (st != BluetoothGatt.GATT_SUCCESS) {
-                          failStatus("BLE write failed", "GATT status " + st);
+                      if (status != BluetoothGatt.GATT_SUCCESS) {
                           txChunks.clear();
+                          failStatus("BLE write failed", "GATT status " + status);
                           return;
                       }
                       sendNextChunk();
                   }
 
-                  @Override public void onCharacteristicChanged(BluetoothGatt gg, BluetoothGattCharacteristic c) {
-                      onRx(c.getValue());
+                  @Override public void onCharacteristicChanged(BluetoothGatt gg, BluetoothGattCharacteristic characteristic) {
+                      onRx(characteristic.getValue());
                   }
               };
 
-              @Override protected void onCreate(Bundle state) {
-                  super.onCreate(state);
-                  getWindow().setStatusBarColor(Color.rgb(7,18,30));
+              @Override protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+                  getWindow().setStatusBarColor(Color.rgb(6,16,28));
                   buildUi();
 
                   BluetoothManager bm = (BluetoothManager)getSystemService(BLUETOOTH_SERVICE);
                   adapter = bm == null ? null : bm.getAdapter();
                   requestPerms();
 
-                  appendLog("ABB Terra Direct Provisioner 2.0 started");
-                  appendLog("Direct mode: PIN-only secure BLE + OCPP configuration. No ABB account required.");
+                  updateAdminState();
+                  appendLog("ABB Terra Direct Secure 3.0 started");
+                  appendLog("Daily operation: PIN + direct BLE. ABB account is only used once to create a saved authorization token.");
               }
 
               private void buildUi() {
-                  final int BG = Color.rgb(7,18,30);
-                  final int CARD = Color.rgb(14,31,48);
-                  final int ACCENT = Color.rgb(42,213,196);
-                  final int MUTED = Color.rgb(151,171,188);
-                  final int WHITE = Color.rgb(239,247,252);
+                  final int BG = Color.rgb(6,16,28);
+                  final int CARD = Color.rgb(13,30,47);
+                  final int ACCENT = Color.rgb(44,220,199);
+                  final int MUTED = Color.rgb(153,177,194);
+                  final int WHITE = Color.rgb(239,248,252);
+                  final int SECONDARY = Color.rgb(43,67,86);
 
                   ScrollView sv = new ScrollView(this);
                   sv.setBackgroundColor(BG);
@@ -341,31 +374,31 @@ jobs:
                   root.setPadding(dp(16), dp(18), dp(16), dp(30));
                   sv.addView(root, new ScrollView.LayoutParams(-1,-2));
 
-                  TextView title = text("ABB TERRA", 26, true, WHITE);
-                  root.addView(title);
-                  TextView sub = text("DIRECT PROVISIONER", 13, true, ACCENT);
+                  root.addView(text("ABB TERRA", 27, true, WHITE));
+                  TextView sub = text("DIRECT COMMISSIONING", 13, true, ACCENT);
                   sub.setLetterSpacing(.18f);
-                  sub.setPadding(0,0,0,dp(16));
+                  sub.setPadding(0,0,0,dp(14));
                   root.addView(sub);
 
                   LinearLayout statusCard = card(CARD);
-                  statusTitle = text("READY", 18, true, WHITE);
+                  statusTitle = text("READY", 19, true, WHITE);
                   statusDetail = text("Scan a Terra AC charger to begin.", 13, false, MUTED);
                   selectedDevice = text("No charger selected", 13, true, ACCENT);
+                  selectedDevice.setPadding(0,dp(10),0,0);
                   statusCard.addView(statusTitle);
                   statusCard.addView(statusDetail);
-                  selectedDevice.setPadding(0,dp(10),0,0);
                   statusCard.addView(selectedDevice);
                   root.addView(statusCard, cardLp());
 
-                  LinearLayout scanRow = new LinearLayout(this);
-                  scanRow.setOrientation(LinearLayout.HORIZONTAL);
-                  scanBtn = button("SCAN CHARGER", ACCENT, Color.rgb(5,33,38));
-                  disconnectBtn = button("DISCONNECT", Color.rgb(72,91,108), WHITE);
-                  scanRow.addView(scanBtn, new LinearLayout.LayoutParams(0,dp(52),1));
-                  LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(0,dp(52),1); dlp.setMargins(dp(8),0,0,0);
-                  scanRow.addView(disconnectBtn, dlp);
-                  root.addView(scanRow);
+                  LinearLayout buttons = new LinearLayout(this);
+                  buttons.setOrientation(LinearLayout.HORIZONTAL);
+                  scanBtn = button("SCAN CHARGER", ACCENT, Color.rgb(4,35,38));
+                  disconnectBtn = button("DISCONNECT", SECONDARY, WHITE);
+                  buttons.addView(scanBtn, new LinearLayout.LayoutParams(0,dp(52),1));
+                  LinearLayout.LayoutParams dl = new LinearLayout.LayoutParams(0,dp(52),1);
+                  dl.setMargins(dp(8),0,0,0);
+                  buttons.addView(disconnectBtn, dl);
+                  root.addView(buttons);
                   scanBtn.setOnClickListener(v -> startScan());
                   disconnectBtn.setOnClickListener(v -> disconnect());
 
@@ -375,66 +408,104 @@ jobs:
 
                   LinearLayout access = card(CARD);
                   access.addView(section("CHARGER ACCESS", ACCENT));
-                  chargerPin = input("8-character charger PIN", WHITE, MUTED);
+                  chargerPin = input("12345678", WHITE, MUTED);
                   chargerPin.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
                   chargerPin.setFilters(new InputFilter[]{new InputFilter.LengthFilter(8)});
-                  fwInput = input("Firmware version (auto; isi manual jika diperlukan)", WHITE, MUTED);
-                  access.addView(labeled("Charger PIN (visible, max 8 chars)", chargerPin, MUTED));
-                  access.addView(labeled("Firmware", fwInput, MUTED));
-                  authBtn = button("CONNECT + AUTHENTICATE", ACCENT, Color.rgb(5,33,38));
-                  LinearLayout.LayoutParams abp = new LinearLayout.LayoutParams(-1,dp(54)); abp.setMargins(0,dp(10),0,0);
-                  access.addView(authBtn, abp);
-                  root.addView(access, cardLp());
+                  access.addView(labeled("Charger PIN • visible • exactly 8 characters", chargerPin, MUTED));
+
+                  authBtn = button("CONNECT + AUTHENTICATE", ACCENT, Color.rgb(4,35,38));
+                  LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(-1,dp(56));
+                  alp.setMargins(0,dp(10),0,0);
+                  access.addView(authBtn, alp);
                   authBtn.setOnClickListener(v -> authenticateCharger());
+                  root.addView(access, cardLp());
 
                   LinearLayout ocpp = card(CARD);
                   ocpp.addView(section("CUSTOM OCPP SERVER", ACCENT));
-                  chargePointId = input("e.g. ABB-V2-NEW", WHITE, MUTED);
-                  serverUrl = input("e.g. ws://192.168.10.186:9220", WHITE, MUTED);
-                  authKey = input("Authorization Key / Password", WHITE, MUTED);
+                  chargePointId = input("ABB-V2-NEW", WHITE, MUTED);
+                  serverUrl = input("ws://192.168.10.186:9220", WHITE, MUTED);
+                  authKey = input("Hex AuthorizationKey / password", WHITE, MUTED);
                   authKey.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
                   requiresPassword = new CheckBox(this);
                   requiresPassword.setText("Server requires password / AuthKey");
                   requiresPassword.setTextColor(WHITE);
                   requiresPassword.setChecked(true);
+
                   ocpp.addView(labeled("Charger ID / Charge Point Identity", chargePointId, MUTED));
                   ocpp.addView(labeled("OCPP Server URL", serverUrl, MUTED));
                   ocpp.addView(labeled("AuthKey / Password", authKey, MUTED));
                   ocpp.addView(requiresPassword);
-                  TextView proto = text("OCPP 1.6J  •  WS/WSS detected automatically",12,false,MUTED);
-                  proto.setPadding(0,dp(5),0,dp(8));
-                  ocpp.addView(proto);
-                  saveBtn = button("CONFIGURE CHARGER", ACCENT, Color.rgb(5,33,38));
+
+                  TextView hint = text("OCPP 1.6J • ws/wss auto-detected • AuthKey is sent in ABB's binary securityKey field.", 11, false, MUTED);
+                  hint.setPadding(0,dp(4),0,dp(8));
+                  ocpp.addView(hint);
+
+                  saveBtn = button("CONFIGURE CHARGER", ACCENT, Color.rgb(4,35,38));
                   saveBtn.setEnabled(false);
                   ocpp.addView(saveBtn, new LinearLayout.LayoutParams(-1,dp(58)));
-                  root.addView(ocpp, cardLp());
                   saveBtn.setOnClickListener(v -> configureCharger());
+                  root.addView(ocpp, cardLp());
 
-                  LinearLayout pcard = card(CARD);
-                  pcard.addView(section("COMMISSIONING STATUS", ACCENT));
+                  LinearLayout progressCard = card(CARD);
+                  progressCard.addView(section("COMMISSIONING STATUS", ACCENT));
                   progressBox = new LinearLayout(this);
                   progressBox.setOrientation(LinearLayout.VERTICAL);
-                  pcard.addView(progressBox);
+                  progressCard.addView(progressBox);
                   progress("Bluetooth", false, "Waiting");
+                  progress("Authorization", false, "Waiting");
                   progress("Secure session", false, "Waiting");
-                  progress("Charger authentication", false, "Waiting");
+                  progress("Authentication", false, "Waiting");
                   progress("OCPP configuration", false, "Waiting");
                   progress("Verification", false, "Waiting");
-                  verifyBtn = button("VERIFY CONNECTION", Color.rgb(47,75,96), WHITE);
-                  LinearLayout.LayoutParams vlp = new LinearLayout.LayoutParams(-1,dp(50)); vlp.setMargins(0,dp(10),0,0);
-                  pcard.addView(verifyBtn, vlp);
-                  root.addView(pcard, cardLp());
-                  verifyBtn.setOnClickListener(v -> verify());
+
+                  verifyBtn = button("VERIFY SECURE SESSION", SECONDARY, WHITE);
+                  LinearLayout.LayoutParams vlp = new LinearLayout.LayoutParams(-1,dp(50));
+                  vlp.setMargins(0,dp(10),0,0);
+                  progressCard.addView(verifyBtn, vlp);
+                  verifyBtn.setOnClickListener(v -> verifySession());
+                  root.addView(progressCard, cardLp());
+
+                  LinearLayout admin = card(CARD);
+                  admin.addView(section("ADMIN AUTHORIZATION • ONE TIME", ACCENT));
+                  adminStatus = text("", 12, false, MUTED);
+                  admin.addView(adminStatus);
+
+                  adminToggle = button("SHOW ADMIN SETUP", SECONDARY, WHITE);
+                  admin.addView(adminToggle, new LinearLayout.LayoutParams(-1,dp(48)));
+
+                  adminFields = new LinearLayout(this);
+                  adminFields.setOrientation(LinearLayout.VERTICAL);
+                  adminFields.setVisibility(View.GONE);
+                  adminEmail = input("installer@example.com", WHITE, MUTED);
+                  adminPassword = input("ABB account password", WHITE, MUTED);
+                  adminPassword.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+                  adminFields.addView(labeled("ABB TerraConfig account email", adminEmail, MUTED));
+                  adminFields.addView(labeled("Password • used only during authorization and never stored", adminPassword, MUTED));
+                  adminLogin = button("AUTHORIZE THIS APP", ACCENT, Color.rgb(4,35,38));
+                  adminClear = button("CLEAR SAVED AUTHORIZATION", SECONDARY, WHITE);
+                  adminFields.addView(adminLogin, new LinearLayout.LayoutParams(-1,dp(52)));
+                  LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(-1,dp(48));
+                  clp.setMargins(0,dp(7),0,0);
+                  adminFields.addView(adminClear, clp);
+                  admin.addView(adminFields);
+                  root.addView(admin, cardLp());
+
+                  adminToggle.setOnClickListener(v -> {
+                      boolean show = adminFields.getVisibility() != View.VISIBLE;
+                      adminFields.setVisibility(show ? View.VISIBLE : View.GONE);
+                      adminToggle.setText(show ? "HIDE ADMIN SETUP" : "SHOW ADMIN SETUP");
+                  });
+                  adminLogin.setOnClickListener(v -> authorizeAdmin());
+                  adminClear.setOnClickListener(v -> clearAuthorization());
 
                   LinearLayout debug = card(CARD);
-                  TextView dh = section("ADVANCED / DEBUG LOG", ACCENT);
-                  debug.addView(dh);
-                  logText = text("", 10, false, Color.rgb(178,203,219));
+                  debug.addView(section("ADVANCED / DEBUG LOG", ACCENT));
+                  logText = text("",10,false,Color.rgb(180,205,220));
                   logText.setTypeface(Typeface.MONOSPACE);
                   logText.setTextIsSelectable(true);
-                  debug.addView(logText, new LinearLayout.LayoutParams(-1,dp(340)));
-                  Button copy = button("COPY DEBUG LOG", Color.rgb(47,75,96), WHITE);
-                  debug.addView(copy, new LinearLayout.LayoutParams(-1,dp(48)));
+                  debug.addView(logText,new LinearLayout.LayoutParams(-1,dp(330)));
+                  Button copy = button("COPY DEBUG LOG", SECONDARY, WHITE);
+                  debug.addView(copy,new LinearLayout.LayoutParams(-1,dp(48)));
                   copy.setOnClickListener(v -> copyLog());
                   root.addView(debug, cardLp());
 
@@ -442,580 +513,673 @@ jobs:
                   updateButtons();
               }
 
-              private LinearLayout card(int color) {
-                  LinearLayout x = new LinearLayout(this);
-                  x.setOrientation(LinearLayout.VERTICAL);
-                  x.setPadding(dp(16),dp(15),dp(16),dp(15));
-                  GradientDrawable gd = new GradientDrawable();
-                  gd.setColor(color);
-                  gd.setCornerRadius(dp(16));
-                  gd.setStroke(dp(1), Color.rgb(33,59,78));
-                  x.setBackground(gd);
-                  return x;
-              }
+              private void authorizeAdmin() {
+                  String email = adminEmail.getText().toString().trim();
+                  String password = adminPassword.getText().toString();
+                  if (email.isEmpty() || password.isEmpty()) { toast("Email and password are required for one-time authorization."); return; }
 
-              private LinearLayout.LayoutParams cardLp() {
-                  LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1,-2);
-                  p.setMargins(0,dp(10),0,dp(4));
-                  return p;
-              }
-
-              private TextView section(String s, int c) {
-                  TextView t = text(s,14,true,c);
-                  t.setLetterSpacing(.08f);
-                  t.setPadding(0,0,0,dp(10));
-                  return t;
-              }
-
-              private LinearLayout labeled(String label, View field, int muted) {
-                  LinearLayout box = new LinearLayout(this);
-                  box.setOrientation(LinearLayout.VERTICAL);
-                  TextView l = text(label,12,true,muted);
-                  l.setPadding(0,dp(5),0,0);
-                  box.addView(l);
-                  box.addView(field, new LinearLayout.LayoutParams(-1,dp(50)));
-                  return box;
-              }
-
-              private EditText input(String hint, int fg, int hintColor) {
-                  EditText e = new EditText(this);
-                  e.setHint(hint);
-                  e.setHintTextColor(hintColor);
-                  e.setTextColor(fg);
-                  e.setTextSize(15);
-                  e.setSingleLine(true);
-                  e.setPadding(dp(12),0,dp(12),0);
-                  GradientDrawable gd = new GradientDrawable();
-                  gd.setColor(Color.rgb(8,24,39));
-                  gd.setCornerRadius(dp(10));
-                  gd.setStroke(dp(1),Color.rgb(44,68,87));
-                  e.setBackground(gd);
-                  return e;
-              }
-
-              private Button button(String s, int bg, int fg) {
-                  Button b = new Button(this);
-                  b.setText(s);
-                  b.setTextColor(fg);
-                  b.setTextSize(13);
-                  b.setTypeface(Typeface.DEFAULT,Typeface.BOLD);
-                  b.setAllCaps(false);
-                  GradientDrawable gd = new GradientDrawable();
-                  gd.setColor(bg);
-                  gd.setCornerRadius(dp(12));
-                  b.setBackground(gd);
-                  return b;
-              }
-
-              private TextView text(String s,float sp,boolean bold,int color) {
-                  TextView t = new TextView(this);
-                  t.setText(s);
-                  t.setTextSize(sp);
-                  t.setTextColor(color);
-                  if (bold) t.setTypeface(Typeface.DEFAULT,Typeface.BOLD);
-                  return t;
-              }
-
-              private void addDevice(BluetoothDevice d, String name, String addr, int rssi) {
-                  Button b = button(name + "\n" + addr + "   RSSI " + rssi + " dBm", Color.rgb(20,43,61), Color.WHITE);
-                  b.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
-                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1,dp(66));
-                  lp.setMargins(0,dp(8),0,0);
-                  deviceList.addView(b,lp);
-                  b.setOnClickListener(v -> {
-                      deviceNumber = name;
-                      selectedDevice.setText(name + "   •   " + rssi + " dBm");
-                      connect(d);
-                  });
-              }
-
-              private void startScan() {
-                  if (adapter == null) { failStatus("Bluetooth unavailable",""); return; }
-                  if (!permOk()) { requestPerms(); return; }
-                  if (!adapter.isEnabled()) { toast("Turn Bluetooth ON"); return; }
-                  scanner = adapter.getBluetoothLeScanner();
-                  if (scanner == null) { failStatus("BLE scanner unavailable",""); return; }
-                  stopScan();
-                  seen.clear();
-                  deviceList.removeAllViews();
-                  setStatus("Scanning chargers", "Looking for TACW devices...");
-                  try {
-                      scanner.startScan(scanCallback);
-                      main.postDelayed(this::stopScan, 20000);
-                  } catch(Exception e) { failStatus("Scan error",e.getMessage()); }
-              }
-
-              private void stopScan() {
-                  if (scanner != null) try { scanner.stopScan(scanCallback); } catch(Exception ignored) {}
-              }
-
-              private void connect(BluetoothDevice d) {
-                  stopScan();
-                  disconnect();
-                  deviceNumber = safeName(d) == null ? deviceNumber : safeName(d);
-                  selectedDevice.setText(deviceNumber + " • connecting...");
-                  setStatus("Connecting", deviceNumber);
-                  try {
-                      gatt = Build.VERSION.SDK_INT >= 23
-                              ? d.connectGatt(this,false,gattCallback,BluetoothDevice.TRANSPORT_LE)
-                              : d.connectGatt(this,false,gattCallback);
-                  } catch(Exception e) { failStatus("BLE connect failed",e.getMessage()); }
-              }
-
-              private boolean credentialsReady() {
-                  return chargerPin.getText().toString().trim().length() == 8
-                          && !deviceNumber.isEmpty();
-              }
-
-              private void authenticateCharger() {
-                  if (!transportReady) { toast("Connect charger first."); return; }
-                  if (!credentialsReady()) { toast("Charger PIN harus tepat 8 karakter."); return; }
-
-                  authenticated = false;
-                  updateButtons();
-                  progress("Secure session", false, "Getting authorized cipher...");
-                  setStatus("Secure authentication", "Authorizing " + deviceNumber + "...");
-                  authBtn.setEnabled(false);
-
+                  adminLogin.setEnabled(false);
+                  adminStatus.setText("Authorizing...");
                   new Thread(() -> {
                       try {
-                          pinOnlyAuthorize();
+                          JSONObject token = oauthPasswordLogin(email,password);
+                          saveAuthorization(token,email);
+                          adminPassword.setText("");
+                          ensureUserId();
                           runOnUiThread(() -> {
-                              progress("Secure session", true, "Cipher authorized");
-                              String fw = fwInput.getText().toString().trim();
-                              if (!fw.isEmpty()) firmwareVersion = fw;
-                              if (firmwareVersion.isEmpty()) {
-                                  failStatus("Firmware version required",
-                                          "Cloud did not return firmware. Enter exact firmware in Secure Access.");
-                                  authBtn.setEnabled(true);
-                                  return;
-                              }
-                              appendLog("Secure material ready. firmware=" + firmwareVersion + " userId=" + userId);
-                              startHandshake1();
+                              adminFields.setVisibility(View.GONE);
+                              adminToggle.setText("SHOW ADMIN SETUP");
+                              updateAdminState();
+                              progress("Authorization",true,"Saved authorization ready");
+                              toast("Authorization saved securely. Daily use now only needs charger PIN.");
                           });
                       } catch(Exception e) {
-                          appendLog("AUTH BACKEND ERROR: " + e);
-                          failStatus("ABB authorization failed", safeError(e));
-                          runOnUiThread(() -> authBtn.setEnabled(true));
+                          appendLog("ADMIN AUTH ERROR: " + safeError(e));
+                          runOnUiThread(() -> adminStatus.setText("Authorization failed: " + safeError(e)));
+                      } finally {
+                          runOnUiThread(() -> adminLogin.setEnabled(true));
                       }
                   }).start();
               }
 
-              private void pinOnlyAuthorize() throws Exception {
+              private JSONObject oauthPasswordLogin(String email,String password) throws Exception {
+                  String form = "grant_type=password"
+                          + "&client_id=" + enc(CLIENT_ID)
+                          + "&client_secret=" + enc(CLIENT_SECRET)
+                          + "&username=" + enc(email)
+                          + "&password=" + enc(password);
+                  return new JSONObject(http("POST",API+"/api/oauth/token",
+                          "application/x-www-form-urlencoded",form,null));
+              }
+
+              private void saveAuthorization(JSONObject token,String email) throws Exception {
+                  String access = token.optString("access_token","");
+                  String refresh = token.optString("refresh_token","");
+                  long expires = token.optLong("expires_in",3600);
+                  if (access.isEmpty()) throw new Exception("Server did not return access_token.");
+                  if (refresh.isEmpty()) refresh = readSecure("refresh_token");
+
+                  writeSecure("access_token",access);
+                  writeSecure("refresh_token",refresh);
+                  writeSecure("account_email",email);
+                  prefs.edit().putLong("expires_at",System.currentTimeMillis()+Math.max(60,expires-60)*1000L).apply();
+              }
+
+              private String ensureAccessToken() throws Exception {
+                  String token = readSecure("access_token");
+                  long exp = prefs.getLong("expires_at",0);
+                  if (!token.isEmpty() && System.currentTimeMillis() < exp) return token;
+                  return refreshAccessToken();
+              }
+
+              private String refreshAccessToken() throws Exception {
+                  String refresh = readSecure("refresh_token");
+                  if (refresh.isEmpty()) throw new Exception("Admin authorization required.");
+
+                  String form = "grant_type=refresh_token"
+                          + "&client_id=" + enc(CLIENT_ID)
+                          + "&client_secret=" + enc(CLIENT_SECRET)
+                          + "&refresh_token=" + enc(refresh);
+                  JSONObject token = new JSONObject(http("POST",API+"/api/oauth/token",
+                          "application/x-www-form-urlencoded",form,null));
+                  saveAuthorization(token,readSecure("account_email"));
+                  return readSecure("access_token");
+              }
+
+              private String authorizedHttp(String method,String url,String contentType,String body) throws Exception {
+                  String token = ensureAccessToken();
+                  try {
+                      return http(method,url,contentType,body,token);
+                  } catch(HttpError e) {
+                      if (e.code != 401) throw e;
+                      token = refreshAccessToken();
+                      return http(method,url,contentType,body,token);
+                  }
+              }
+
+              private void ensureUserId() throws Exception {
+                  int saved = prefs.getInt("user_id",0);
+                  if (saved > 0) { userId=saved; return; }
+                  Object me = parseJsonAny(authorizedHttp("GET",API+"/api/v2/users/me",null,null));
+                  Integer id = findInt(me,"id");
+                  if (id == null || id <= 0) throw new Exception("ABB user ID not found.");
+                  userId=id;
+                  prefs.edit().putInt("user_id",id).apply();
+              }
+
+              private boolean hasSavedAuthorization() {
+                  return !readSecure("refresh_token").isEmpty() || !readSecure("access_token").isEmpty();
+              }
+
+              private void updateAdminState() {
+                  boolean ok = hasSavedAuthorization();
+                  String email = readSecure("account_email");
+                  adminStatus.setText(ok
+                          ? "✓ Authorization saved" + (email.isEmpty() ? "" : " for " + email) + ". Password is not stored."
+                          : "Not authorized yet. Open this section once, login, then daily operation only uses charger PIN.");
+                  progress("Authorization",ok,ok ? "Saved token ready" : "One-time setup required");
+              }
+
+              private void clearAuthorization() {
+                  prefs.edit().remove("access_token").remove("refresh_token").remove("account_email")
+                          .remove("expires_at").remove("user_id").apply();
+                  try { deleteKey(); } catch(Exception ignored) {}
+                  userId=0;
+                  updateAdminState();
+                  toast("Saved ABB authorization cleared.");
+              }
+
+              private void authenticateCharger() {
+                  if (!transportReady) { toast("Connect charger first."); return; }
                   String pin = chargerPin.getText().toString().trim();
-                  if (pin.length() != 8) throw new Exception("PIN charger harus 8 karakter.");
+                  if (pin.length() != 8) { toast("Charger PIN must be exactly 8 characters."); return; }
+                  if (!hasSavedAuthorization()) {
+                      toast("One-time Admin Authorization is required first.");
+                      adminFields.setVisibility(View.VISIBLE);
+                      adminToggle.setText("HIDE ADMIN SETUP");
+                      return;
+                  }
+                  if (firmwareVersion.isEmpty()) {
+                      failStatus("Firmware not detected","Re-scan charger. Secure firmware version is read from BLE advertising data.");
+                      return;
+                  }
 
-                  JSONObject req = new JSONObject();
-                  req.put("deviceNumber", deviceNumber);
-                  req.put("pinCode", pin);
+                  authenticated=false;
+                  encryptedMode=false;
+                  sessionToken=new byte[8];
+                  updateButtons();
+                  progress("Secure session",false,"Requesting cipher with charger PIN...");
+                  setStatus("Authenticating charger",deviceNumber+" • FW "+firmwareVersion);
 
-                  Object cipherResp = null;
+                  new Thread(() -> {
+                      try {
+                          ensureUserId();
+                          fetchCipherWithPin(pin);
+                          runOnUiThread(() -> {
+                              progress("Authorization",true,"PIN authorized");
+                              progress("Secure session",true,"Cipher loaded");
+                              startHandshake1();
+                          });
+                      } catch(Exception e) {
+                          appendLog("PIN/CIPHER ERROR: " + safeError(e));
+                          failStatus("PIN authorization failed",safeError(e));
+                          updateButtons();
+                      }
+                  }).start();
+              }
+
+              private void fetchCipherWithPin(String pin) throws Exception {
+                  JSONObject request = new JSONObject();
+                  request.put("pinCode",pin);
+                  request.put("deviceNumber",deviceNumber);
+
+                  Object response = null;
                   Exception last = null;
 
-                  // TerraConfig contains a dedicated PIN-check endpoint. Try it first without
-                  // an ABB user login so the installer only needs the charger PIN.
-                  String[] endpoints = new String[] {
-                          API + "/api/v2/devices/check-pincode",
-                          API + "/api/v2/devices/" + URLEncoder.encode(deviceNumber,"UTF-8") + "/cipher"
-                  };
+                  try {
+                      response = parseJsonAny(authorizedHttp("POST",API+"/api/v2/devices/refresh-ciphers",
+                              "application/json",request.toString()));
+                  } catch(Exception e) {
+                      last=e;
+                      appendLog("refresh-ciphers failed: "+safeError(e));
+                  }
 
-                  for (String ep : endpoints) {
+                  String keyHex = findString(response,"secretKey");
+                  String infoHex = findString(response,"info");
+
+                  if (keyHex.isEmpty() || infoHex.isEmpty()) {
                       try {
-                          cipherResp = parseJsonAny(http("POST", ep, "application/json", req.toString(), null));
-                          String k = findString(cipherResp,"secretKey");
-                          String i = findString(cipherResp,"info");
-                          if (!k.isEmpty() && !i.isEmpty()) break;
+                          JSONObject body = new JSONObject();
+                          body.put("pinCode",pin);
+                          response = parseJsonAny(authorizedHttp("POST",
+                                  API+"/api/v2/devices/"+URLEncoder.encode(deviceNumber,"UTF-8")+"/cipher",
+                                  "application/json",body.toString()));
+                          keyHex=findString(response,"secretKey");
+                          infoHex=findString(response,"info");
                       } catch(Exception e) {
                           last=e;
-                          appendLog("PIN authorization endpoint failed: " + safeError(e));
-                          cipherResp=null;
+                          appendLog("device cipher endpoint failed: "+safeError(e));
                       }
                   }
 
-                  // Some backend revisions expose the cipher as GET on the deviceNumber route.
-                  if (cipherResp == null) {
-                      try {
-                          String ep = API + "/api/v2/devices/" + URLEncoder.encode(deviceNumber,"UTF-8")
-                                  + "/cipher?pinCode=" + URLEncoder.encode(pin,"UTF-8");
-                          cipherResp = parseJsonAny(http("GET", ep, null, null, null));
-                      } catch(Exception e) {
-                          last=e;
-                          appendLog("PIN cipher GET failed: " + safeError(e));
-                      }
-                  }
-
-                  if (cipherResp == null)
-                      throw new Exception(last == null ? "PIN authorization failed." : safeError(last));
-
-                  String keyHex = findString(cipherResp,"secretKey");
-                  String infoHex = findString(cipherResp,"info");
                   if (keyHex.isEmpty() || infoHex.isEmpty())
-                      throw new Exception("PIN accepted response did not include cipher secretKey/info.");
+                      throw new Exception(last==null ? "Cipher not returned. Check charger PIN." : safeError(last));
 
-                  encryptionKey = unhex(keyHex);
-                  cipherInfo = unhex(infoHex);
-                  if (encryptionKey.length != 16 || cipherInfo.length != 16)
-                      throw new Exception("Invalid cipher length key=" + encryptionKey.length + " info=" + cipherInfo.length);
+                  encryptionKey=unhex(keyHex);
+                  cipherInfo=unhex(infoHex);
+                  if (encryptionKey.length!=16 || cipherInfo.length!=16)
+                      throw new Exception("Invalid secure cipher size.");
 
-                  Integer uid = findInt(cipherResp,"userId");
-                  // TerraConfig secure response may return a userId. If it does not, 0 is used
-                  // as the installer/session identifier and the charger decides acceptance.
-                  userId = uid == null ? 0 : uid;
+                  Integer uid=findInt(response,"userId");
+                  if (uid!=null && uid>0) {
+                      userId=uid;
+                      prefs.edit().putInt("user_id",uid).apply();
+                  }
+                  if (userId<=0) ensureUserId();
 
-                  String fw = findString(cipherResp,"softVersion");
-                  if (fw.isEmpty()) fw = findString(cipherResp,"firmwareVersion");
-                  if (!fw.isEmpty()) firmwareVersion = normalizeFw(fw);
-
-                  String manualFw = fwInput.getText().toString().trim();
-                  if (!manualFw.isEmpty()) firmwareVersion = normalizeFw(manualFw);
-
-                  if (firmwareVersion.isEmpty())
-                      throw new Exception("Firmware version belum diketahui. Isi firmware charger pada field Firmware.");
-
-                  appendLog("PIN-only secure material ready. firmware=" + firmwareVersion);
+                  appendLog("PIN accepted; secure cipher received. Secret values are intentionally hidden.");
               }
 
               private void startHandshake1() {
                   try {
-                      sessionToken = new byte[8];
-                      clientNonce = new byte[16];
+                      clientNonce=new byte[16];
                       rng.nextBytes(clientNonce);
-                      progress("Charger authentication", false, "Handshake 1/3...");
-                      byte[] payload = concat(new byte[]{1}, clientNonce);
-                      sendEncrypted(CMD_AUTH,payload,p -> {
+                      progress("Authentication",false,"Handshake 1/3");
+                      sendPlain(CMD_AUTH,concat(new byte[]{1},clientNonce),p -> {
                           try {
-                              if (p.code != 0) throw new Exception("Handshake 1 response code=" + p.code);
-                              byte[] x = p.payload;
-                              if (x == null || x.length < 34) throw new Exception("Handshake 1 payload too short");
-                              int idx = x[0] & 0xff;
-                              int result = x[1] & 0xff;
-                              if (idx != 1) throw new Exception("Unexpected handshake index=" + idx);
-                              byte[] echoed = Arrays.copyOfRange(x,2,18);
-                              byte[] serverNonce = Arrays.copyOfRange(x,18,34);
-                              if (!Arrays.equals(echoed,clientNonce)) throw new Exception("Client nonce mismatch");
-                              if (isAllZero(serverNonce)) throw new Exception("Server nonce missing");
-                              appendLog("Handshake 1 OK result=" + result);
+                              requirePacketOk(p,"Handshake 1");
+                              if (p.payload==null || p.payload.length<34) throw new Exception("Handshake 1 payload too short.");
+                              int idx=p.payload[0]&0xff;
+                              if (idx!=1) throw new Exception("Unexpected handshake index "+idx);
+
+                              byte[] echoed=Arrays.copyOfRange(p.payload,2,18);
+                              byte[] serverNonce=Arrays.copyOfRange(p.payload,18,34);
+                              if (!Arrays.equals(echoed,clientNonce)) throw new Exception("Client nonce mismatch.");
+                              if (isAllZero(serverNonce)) throw new Exception("Server nonce missing.");
+
+                              byte[] aad=lastBytes(p.payload,22);
+                              if (aad.length==22 && !Arrays.equals(aad,buildAad()))
+                                  throw new Exception("AAD mismatch; detected firmware/device identity differs.");
+
+                              appendLog("Handshake 1 OK");
                               startHandshake2(serverNonce);
-                          } catch(Exception e) { authFailed("Handshake 1 failed",e); }
+                          } catch(Exception e) { authFailed(e); }
                       });
-                  } catch(Exception e) { authFailed("Handshake 1 start failed",e); }
+                  } catch(Exception e) { authFailed(e); }
               }
 
               private void startHandshake2(byte[] serverNonce) {
-                  progress("Charger authentication", false, "Handshake 2/3...");
-                  sendEncrypted(CMD_AUTH,concat(new byte[]{2},serverNonce),p -> {
+                  progress("Authentication",false,"Handshake 2/3");
+                  sendPlain(CMD_AUTH,concat(new byte[]{2},serverNonce),p -> {
                       try {
-                          if (p.code != 0) throw new Exception("Handshake 2 response code=" + p.code);
-                          byte[] x = p.payload;
-                          if (x == null || x.length < 10) throw new Exception("Handshake 2 payload too short");
-                          int idx=x[0]&0xff, result=x[1]&0xff;
-                          if (idx != 2 || result != 1) throw new Exception("Handshake 2 rejected idx="+idx+" result="+result);
-                          sessionToken = Arrays.copyOfRange(x,2,10);
-                          if (isAllZero(sessionToken)) throw new Exception("Session token missing");
+                          requirePacketOk(p,"Handshake 2");
+                          if (p.payload==null || p.payload.length<10) throw new Exception("Handshake 2 payload too short.");
+                          int idx=p.payload[0]&0xff;
+                          int result=p.payload[1]&0xff;
+                          if (idx!=2 || result!=1) throw new Exception("Handshake 2 rejected. result="+result);
+
+                          sessionToken=Arrays.copyOfRange(p.payload,2,10);
+                          if (isAllZero(sessionToken)) throw new Exception("Session token missing.");
+
+                          byte[] aad=lastBytes(p.payload,22);
+                          if (aad.length==22 && !Arrays.equals(aad,buildAad()))
+                              throw new Exception("Handshake 2 AAD mismatch.");
+
                           appendLog("Handshake 2 OK; session token received.");
                           startHandshake3();
-                      } catch(Exception e) { authFailed("Handshake 2 failed",e); }
+                      } catch(Exception e) { authFailed(e); }
                   });
               }
 
               private void startHandshake3() throws Exception {
-                  progress("Charger authentication", false, "Handshake 3/3...");
-                  byte[] block = new byte[48];
-                  byte[] dn = deviceNumber.replace("-","").getBytes(StandardCharsets.UTF_8);
+                  progress("Authentication",false,"Handshake 3/3");
+                  byte[] block=new byte[48];
+                  byte[] dn=deviceNumber.replace("-","").getBytes(StandardCharsets.UTF_8);
                   System.arraycopy(dn,0,block,0,Math.min(20,dn.length));
                   block[20]=2;
                   block[21]=1;
-                  byte[] uid = String.valueOf(userId).getBytes(StandardCharsets.UTF_8);
+
+                  byte[] uid=String.valueOf(userId).getBytes(StandardCharsets.UTF_8);
                   System.arraycopy(uid,0,block,22,Math.min(15,uid.length));
 
-                  sendEncrypted(CMD_AUTH,concat(new byte[]{3},block),p -> {
-                      if (p.code != 0) { authFailed("Handshake 3 rejected",new Exception("code="+p.code)); return; }
-                      appendLog("Handshake 3 response received.");
-                      main.postDelayed(this::querySysInfoAfterAuth,150);
+                  sendPlain(CMD_AUTH,concat(new byte[]{3},block),p -> {
+                      try {
+                          requirePacketOk(p,"Handshake 3");
+                          if (p.payload!=null && p.payload.length>=2) {
+                              int idx=p.payload[0]&0xff;
+                              int result=p.payload[1]&0xff;
+                              if (idx==3 && result==0) throw new Exception("Handshake 3 rejected.");
+                          }
+                          encryptedMode=true;
+                          appendLog("Handshake 3 OK; AES-GCM mode enabled.");
+                          querySysInfo();
+                      } catch(Exception e) { authFailed(e); }
                   });
               }
 
-              private void querySysInfoAfterAuth() {
+              private void querySysInfo() {
                   sendEncrypted(CMD_SYSINFO,new byte[0],p -> {
-                      if (p.code != 0) {
-                          authFailed("Authentication verification failed",new Exception("B1 code="+p.code));
-                          return;
-                      }
-                      authenticated = true;
-                      progress("Charger authentication", true, "Authenticated / session ready");
-                      progress("Secure session", true, "AES-GCM active");
-                      setStatus("CHARGER AUTHENTICATED", deviceNumber + " • secure BLE ready");
-                      appendLog("AUTH SUCCESS. Charger should acknowledge the application session (beep depends on firmware).");
-                      updateButtons();
+                      try {
+                          requirePacketOk(p,"System info");
+                          appendLog("Encrypted system-info query OK.");
+                          syncTime();
+                      } catch(Exception e) { authFailed(e); }
                   });
               }
 
-              private void authFailed(String title, Exception e) {
+              private void syncTime() {
+                  long now=System.currentTimeMillis()/1000L;
+                  int offsetHours=TimeZone.getDefault().getOffset(System.currentTimeMillis())/(60*60*1000);
+                  byte[] payload=new byte[5];
+                  payload[0]=(byte)(now&0xff);
+                  payload[1]=(byte)((now>>8)&0xff);
+                  payload[2]=(byte)((now>>16)&0xff);
+                  payload[3]=(byte)((now>>24)&0xff);
+                  payload[4]=(byte)(offsetHours+12);
+
+                  sendEncrypted(CMD_SYNC_TIME,payload,p -> {
+                      try {
+                          requirePacketOk(p,"Sync time");
+                          authenticated=true;
+                          progress("Authentication",true,"Secure charger session active");
+                          progress("Secure session",true,"AES-GCM active");
+                          setStatus("CHARGER AUTHENTICATED",
+                                  deviceNumber+" • secure session ready • charger acknowledgement/beep expected");
+                          appendLog("AUTH SUCCESS. Official Terra flow is now complete through SYNC_TIME.");
+                          updateButtons();
+                      } catch(Exception e) { authFailed(e); }
+                  });
+              }
+
+              private void authFailed(Exception e) {
                   authenticated=false;
-                  progress("Charger authentication",false,safeError(e));
-                  failStatus(title,safeError(e));
+                  encryptedMode=false;
+                  progress("Authentication",false,safeError(e));
+                  failStatus("Charger authentication failed",safeError(e));
                   updateButtons();
-                  runOnUiThread(() -> authBtn.setEnabled(true));
               }
 
               private void configureCharger() {
                   if (!authenticated) { toast("Authenticate charger first."); return; }
 
-                  String cid = chargePointId.getText().toString().trim();
-                  String surl = serverUrl.getText().toString().trim();
-                  String key = authKey.getText().toString();
-                  if (cid.isEmpty()) { toast("Charger ID is required."); return; }
-                  if (cid.length() > 64) { toast("Charger ID too long."); return; }
-                  if (!(surl.startsWith("ws://") || surl.startsWith("wss://"))) {
+                  String cp=chargePointId.getText().toString().trim();
+                  String url=serverUrl.getText().toString().trim();
+                  String key=authKey.getText().toString().trim();
+
+                  if (cp.isEmpty()) { toast("Charger ID is required."); return; }
+                  if (!(url.startsWith("ws://") || url.startsWith("wss://"))) {
                       toast("OCPP URL must start with ws:// or wss://"); return;
                   }
-                  if (requiresPassword.isChecked() && key.isEmpty()) {
-                      toast("AuthKey/password is required."); return;
-                  }
+                  if (requiresPassword.isChecked()) {
+                      if (key.isEmpty()) { toast("AuthKey is required."); return; }
+                      if ((key.length()&1)==1 || !key.matches("[0-9A-Fa-f]+")) {
+                          toast("ABB securityKey expects hexadecimal AuthKey with an even number of characters.");
+                          return;
+                      }
+                  } else key="";
 
                   try {
-                      byte[] payload = buildOcppPayload(surl,cid,requiresPassword.isChecked()?key:"");
-                      progress("OCPP configuration",false,"Writing secure configuration...");
+                      byte[] payload=buildOcppPayload(url,cp,key);
+                      progress("OCPP configuration",false,"Writing D6 configuration...");
                       progress("Verification",false,"Waiting");
                       saveBtn.setEnabled(false);
-                      appendLog("Writing OCPP: id=" + cid + " url=" + surl + " auth=" + (key.isEmpty()?"off":"on"));
+                      appendLog("TX OCPP D6 id="+cp+" url="+url+" auth="+(key.isEmpty()?"off":"on"));
 
                       sendEncrypted(CMD_OCPP,payload,p -> {
                           try {
-                              if (p.code != 0) throw new Exception("OCPP command response code="+p.code);
-                              int result = p.payload != null && p.payload.length > 0 ? (p.payload[0]&0xff) : 1;
-                              if (result == 0) throw new Exception("Charger reported configuration failure");
-                              if (result == 2) throw new Exception("Charger reported security identity failure");
-                              progress("OCPP configuration",true,"Configuration accepted");
-                              setStatus("CONFIGURATION SAVED","Verifying charger response...");
-                              appendLog("OCPP D6 accepted result=" + result);
-                              main.postDelayed(this::verifyOcppStatus,700);
+                              requirePacketOk(p,"OCPP configure");
+                              int result=(p.payload!=null && p.payload.length>0)?(p.payload[0]&0xff):1;
+                              if (result==0) throw new Exception("Charger reported OCPP configuration failure.");
+                              if (result==2) throw new Exception("Charger reported security identity failure.");
+                              progress("OCPP configuration",true,"Accepted by charger");
+                              setStatus("CONFIGURATION SAVED","Charger accepted custom OCPP configuration.");
+                              appendLog("OCPP D6 accepted result="+result);
+                              main.postDelayed(this::verifyOcpp,700);
                           } catch(Exception e) {
                               progress("OCPP configuration",false,safeError(e));
                               failStatus("Configuration failed",safeError(e));
                               updateButtons();
                           }
                       });
-                  } catch(Exception e) { failStatus("Invalid OCPP configuration",safeError(e)); }
-              }
-
-              private byte[] buildOcppPayload(String fullUrl,String chargerId,String password) throws Exception {
-                  Uri uri = Uri.parse(fullUrl);
-                  String scheme = uri.getScheme();
-                  if (scheme == null) throw new Exception("Invalid URL");
-                  boolean tls = "wss".equalsIgnoreCase(scheme);
-                  int port = uri.getPort();
-                  if (port <= 0) port = tls ? 443 : 80;
-
-                  // Terra protocol separates domain URL and port. Keep scheme, host and path; remove :port.
-                  String host = uri.getHost();
-                  if (host == null || host.isEmpty()) throw new Exception("URL host missing");
-                  StringBuilder domain = new StringBuilder();
-                  domain.append(scheme.toLowerCase(Locale.US)).append("://").append(host);
-                  String path = uri.getEncodedPath();
-                  if (path != null && !path.isEmpty()) domain.append(path);
-                  if (uri.getEncodedQuery()!=null && !uri.getEncodedQuery().isEmpty())
-                      domain.append("?").append(uri.getEncodedQuery());
-
-                  byte[] d = domain.toString().getBytes(StandardCharsets.UTF_8);
-                  byte[] sk = password.getBytes(StandardCharsets.UTF_8);
-                  byte[] tag = chargerId.getBytes(StandardCharsets.UTF_8);
-                  if (d.length > 255 || sk.length > 255 || tag.length > 255) throw new Exception("Field exceeds protocol length");
-
-                  ByteArrayOutputStream o = new ByteArrayOutputStream();
-                  o.write(1);                         // serverEnable
-                  o.write(d.length);
-                  o.write(d);
-                  o.write(leShort(port));
-                  o.write(1);                         // protocolType = OCPP
-                  byte[] pv = new byte[10];
-                  byte[] pvb = "ocpp1.6j".getBytes(StandardCharsets.UTF_8);
-                  System.arraycopy(pvb,0,pv,0,Math.min(10,pvb.length));
-                  o.write(pv);
-                  o.write(sk.length);
-                  if (sk.length>0) o.write(sk);
-                  o.write(tls ? 1 : 0);
-                  if (tls) {
-                      o.write(0);                     // certificateNo
-                      o.write(leInt(0));              // certificateSize
-                      o.write(leShort(512));          // downloadBytes
+                  } catch(Exception e) {
+                      failStatus("Invalid OCPP configuration",safeError(e));
                   }
-                  o.write(tag.length);                // Charge Point Identity / tag
-                  o.write(tag);
-                  return o.toByteArray();
               }
 
-              private void verifyOcppStatus() {
-                  if (!authenticated) { progress("Verification",false,"Session disconnected"); updateButtons(); return; }
+              private byte[] buildOcppPayload(String fullUrl,String chargerId,String securityKeyHex) throws Exception {
+                  java.net.URI uri=new java.net.URI(fullUrl);
+                  String scheme=uri.getScheme();
+                  String host=uri.getHost();
+                  if (scheme==null || host==null) throw new Exception("Invalid OCPP URL.");
+
+                  boolean tls="wss".equalsIgnoreCase(scheme);
+                  int port=uri.getPort();
+                  if (port<=0) port=tls?443:80;
+
+                  StringBuilder domain=new StringBuilder();
+                  domain.append(scheme.toLowerCase(Locale.US)).append("://").append(host);
+                  String path=uri.getRawPath();
+                  if (path!=null && !path.isEmpty()) domain.append(path);
+                  String query=uri.getRawQuery();
+                  if (query!=null && !query.isEmpty()) domain.append("?").append(query);
+
+                  byte[] domainBytes=domain.toString().getBytes(StandardCharsets.UTF_8);
+                  byte[] keyBytes=securityKeyHex.isEmpty()?new byte[0]:unhex(securityKeyHex);
+                  byte[] tag=chargerId.getBytes(StandardCharsets.UTF_8);
+
+                  if (domainBytes.length>255 || keyBytes.length>255 || tag.length>255)
+                      throw new Exception("OCPP field too long.");
+
+                  ByteArrayOutputStream out=new ByteArrayOutputStream();
+                  out.write(1); // serverEnable
+                  out.write(domainBytes.length);
+                  out.write(domainBytes);
+                  out.write(leShort(port));
+                  out.write(1); // protocolType: OCPP
+
+                  byte[] protocol=new byte[10];
+                  byte[] p="ocpp1.6j".getBytes(StandardCharsets.UTF_8);
+                  System.arraycopy(p,0,protocol,0,Math.min(protocol.length,p.length));
+                  out.write(protocol);
+
+                  out.write(keyBytes.length);
+                  if (keyBytes.length>0) out.write(keyBytes);
+
+                  out.write(tls?1:0);
+                  if (tls) {
+                      out.write(0);        // certificateNo
+                      out.write(leInt(0)); // certificateSize
+                      out.write(leShort(512));
+                  }
+
+                  out.write(tag.length);
+                  out.write(tag);
+                  return out.toByteArray();
+              }
+
+              private void verifyOcpp() {
+                  if (!authenticated) {
+                      progress("Verification",false,"Charger reconnected after save");
+                      updateButtons();
+                      return;
+                  }
+
                   sendEncrypted(CMD_OCPP_STATUS,new byte[0],p -> {
-                      if (p.code == 0) {
-                          progress("Verification",true,"Charger responded after save");
+                      if (p.code==0 && p.error==null) {
+                          progress("Verification",true,"Charger responded after configuration");
                           setStatus("COMMISSIONING COMPLETE",
-                                  "Configuration written. Watch OCPP server for ChargeBoxId: " + chargePointId.getText().toString().trim());
-                          appendLog("VERIFY D8 OK payload=" + hex(p.payload));
+                                  "Check OCPP server for ChargeBoxId: "+chargePointId.getText().toString().trim());
+                          appendLog("D8 verify OK payload="+hex(p.payload));
                       } else {
-                          progress("Verification",false,"D8 response code " + p.code);
-                          setStatus("Saved; reconnect may be in progress",
-                                  "Check OCPP server for new ChargeBoxId.");
+                          progress("Verification",false,"Saved; charger may be reconnecting");
+                          setStatus("CONFIGURATION SAVED",
+                                  "Charger may reconnect. Check OCPP server for the new ChargeBoxId.");
                       }
                       updateButtons();
                   });
               }
 
-              private void verify() {
+              private void verifySession() {
                   if (!authenticated) { toast("Authenticate charger first."); return; }
-                  querySysInfoAfterAuth();
+                  querySysInfo();
               }
 
-              private void sendEncrypted(int cmd, byte[] payload, PacketCallback cb) {
+              private void sendPlain(int cmd,byte[] payload,PacketCallback cb) {
                   try {
-                      if (!transportReady || tx == null) throw new Exception("BLE transport not ready");
-                      if (encryptionKey == null || cipherInfo == null) throw new Exception("Secure cipher not loaded");
-                      byte[] packet = encryptedWrap(cmd,payload);
-                      waitingCmd = cmd;
-                      waitingCallback = cb;
-                      appendLog("TX cmd=0x" + Integer.toHexString(cmd).toUpperCase(Locale.US)
-                              + " bytes=" + packet.length);
+                      byte[] packet=plainWrap(cmd,payload);
+                      armResponse(cmd,cb);
+                      appendLog("TX PLAIN cmd=0x"+hexByte(cmd)+" bytes="+packet.length);
                       queuePacket(packet);
-                  } catch(Exception e) {
-                      Packet p = new Packet(); p.cmd=cmd; p.code=-1; p.error=safeError(e);
-                      if (cb!=null) cb.onPacket(p);
-                  }
+                  } catch(Exception e) { dispatchError(cmd,cb,e); }
               }
 
-              private byte[] encryptedWrap(int cmd, byte[] payload) throws Exception {
-                  byte[] token = sessionToken == null ? new byte[8] : sessionToken;
-                  byte[] plain = concat(token,payload==null?new byte[0]:payload);
-                  byte[] iv = new byte[12]; rng.nextBytes(iv);
-                  byte[] aad = buildAad();
-
-                  Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
-                  c.init(Cipher.ENCRYPT_MODE,new SecretKeySpec(encryptionKey,"AES"),new GCMParameterSpec(128,iv));
-                  c.updateAAD(aad);
-                  byte[] encrypted = c.doFinal(plain);
-                  int clen = encrypted.length - 16;
-                  byte[] ciphertext = Arrays.copyOfRange(encrypted,0,clen);
-                  byte[] tag = Arrays.copyOfRange(encrypted,clen,encrypted.length);
-
-                  ByteArrayOutputStream body = new ByteArrayOutputStream();
-                  body.write(ciphertext);
-                  if (cmd != CMD_AUTH) body.write(aad);
-                  body.write(iv);
-                  body.write(tag);
-                  if (cmd != CMD_AUTH) body.write(cipherInfo);
-                  byte[] b = body.toByteArray();
-
-                  ByteArrayOutputStream h = new ByteArrayOutputStream();
-                  h.write((cmd==0xBA || cmd==0xD9) ? 0xAA : 0xFE);
-                  h.write(cmd);
-                  h.write(0);
-                  h.write(0);
-                  h.write(leShort(b.length));
-                  h.write(0xA5);
-                  byte[] pre = h.toByteArray();
-                  int chk=0;
-                  for(byte x:pre) chk ^= x & 0xff;
-                  for(byte x:b) chk ^= x & 0xff;
-                  h.write(chk & 0xff);
-                  h.write(b);
-                  return h.toByteArray();
-              }
-
-              private byte[] buildAad() throws Exception {
-                  byte[] aad = new byte[22];
-                  byte[] dn = deviceNumber.getBytes(StandardCharsets.UTF_8);
-                  System.arraycopy(dn,0,aad,0,Math.min(20,dn.length));
-                  String clean = firmwareVersion.replace(".","");
-                  int fw;
-                  try { fw = Integer.parseInt(clean); }
-                  catch(Exception e) { throw new Exception("Invalid firmware version: " + firmwareVersion); }
-                  byte[] f = leShort(fw);
-                  aad[20]=f[0]; aad[21]=f[1];
-                  return aad;
-              }
-
-              private Packet parsePacket(byte[] raw) {
-                  Packet p = new Packet();
+              private void sendEncrypted(int cmd,byte[] payload,PacketCallback cb) {
                   try {
-                      if (raw.length < 8) throw new Exception("packet too short");
-                      p.cmd = raw[1]&0xff;
-                      p.code = raw[2]&0xff;
-                      int len = (raw[4]&0xff) | ((raw[5]&0xff)<<8);
-                      if (raw.length < 8+len) throw new Exception("incomplete packet");
-                      p.body = Arrays.copyOfRange(raw,8,8+len);
+                      if (!encryptedMode) throw new Exception("Encrypted session is not active.");
+                      byte[] packet=encryptedWrap(cmd,payload);
+                      armResponse(cmd,cb);
+                      appendLog("TX SECURE cmd=0x"+hexByte(cmd)+" bytes="+packet.length);
+                      queuePacket(packet);
+                  } catch(Exception e) { dispatchError(cmd,cb,e); }
+              }
 
-                      int chk=0;
-                      for(int i=0;i<7;i++) chk ^= raw[i]&0xff;
-                      for(byte x:p.body) chk ^= x&0xff;
-                      if ((raw[7]&0xff)!=(chk&0xff)) throw new Exception("checksum mismatch");
-
-                      if (p.code != 0) {
-                          p.payload = p.body;
-                          return p;
+              private void armResponse(int cmd,PacketCallback cb) {
+                  waitingCmd=cmd;
+                  waitingCallback=cb;
+                  if (responseTimeout!=null) main.removeCallbacks(responseTimeout);
+                  responseTimeout=() -> {
+                      if (waitingCallback!=null && waitingCmd==cmd) {
+                          PacketCallback x=waitingCallback;
+                          waitingCallback=null;
+                          waitingCmd=-1;
+                          Packet p=new Packet();
+                          p.cmd=cmd;p.code=-1;p.error="Response timeout";
+                          x.onPacket(p);
                       }
+                  };
+                  main.postDelayed(responseTimeout,10000);
+              }
 
-                      if (encryptionKey != null) {
-                          byte[] aad = buildAad();
-                          int extra = p.cmd==CMD_AUTH ? 28 : 66;
-                          int clen = p.body.length-extra;
-                          if (clen < 0) throw new Exception("encrypted body length invalid");
+              private void dispatchError(int cmd,PacketCallback cb,Exception e) {
+                  Packet p=new Packet();p.cmd=cmd;p.code=-1;p.error=safeError(e);
+                  if (cb!=null) cb.onPacket(p);
+              }
 
-                          byte[] ciphertext = Arrays.copyOfRange(p.body,0,clen);
-                          int pos=clen;
-                          if (p.cmd!=CMD_AUTH) {
-                              byte[] receivedAad=Arrays.copyOfRange(p.body,pos,pos+22);
-                              pos+=22;
-                              if (!Arrays.equals(receivedAad,aad)) appendLog("WARN response AAD differs.");
-                          }
-                          byte[] iv=Arrays.copyOfRange(p.body,pos,pos+12); pos+=12;
-                          byte[] tag=Arrays.copyOfRange(p.body,pos,pos+16); pos+=16;
-                          // trailing 16 bytes are cipher info for non-auth responses
+              private byte[] plainWrap(int cmd,byte[] payload) {
+                  if (payload==null) payload=new byte[0];
+                  byte[] token=sessionToken==null?new byte[8]:sessionToken;
+                  byte[] frame=new byte[16+payload.length];
+                  frame[0]=(byte)((cmd==0xBA || cmd==0xD9)?0xAA:0xFE);
+                  frame[1]=(byte)cmd;
+                  frame[2]=0;frame[3]=0;
+                  frame[4]=(byte)(payload.length&0xff);
+                  frame[5]=(byte)((payload.length>>8)&0xff);
+                  frame[6]=0;
+                  System.arraycopy(token,0,frame,8,Math.min(8,token.length));
+                  System.arraycopy(payload,0,frame,16,payload.length);
 
-                          Cipher c=Cipher.getInstance("AES/GCM/NoPadding");
-                          c.init(Cipher.DECRYPT_MODE,new SecretKeySpec(encryptionKey,"AES"),new GCMParameterSpec(128,iv));
-                          c.updateAAD(aad);
-                          byte[] plain=c.doFinal(concat(ciphertext,tag));
-                          if (plain.length<8) throw new Exception("decrypted packet shorter than token");
-                          p.token=Arrays.copyOfRange(plain,0,8);
-                          p.payload=Arrays.copyOfRange(plain,8,plain.length);
-                      } else p.payload=p.body;
-                  } catch(Exception e) { p.error=safeError(e); p.code=-1; }
-                  return p;
+                  int xor=0;
+                  for(int i=0;i<7;i++) xor^=frame[i]&0xff;
+                  for(int i=8;i<frame.length;i++) xor^=frame[i]&0xff;
+                  frame[7]=(byte)xor;
+                  return frame;
+              }
+
+              private byte[] encryptedWrap(int cmd,byte[] payload) throws Exception {
+                  if (encryptionKey==null || encryptionKey.length!=16) throw new Exception("Encryption key unavailable.");
+                  if (cipherInfo==null || cipherInfo.length!=16) throw new Exception("Cipher info unavailable.");
+                  if (payload==null) payload=new byte[0];
+
+                  byte[] plain=concat(sessionToken,payload);
+                  byte[] aad=buildAad();
+                  byte[] iv=new byte[12];
+                  rng.nextBytes(iv);
+
+                  Cipher cipher=Cipher.getInstance("AES/GCM/NoPadding");
+                  cipher.init(Cipher.ENCRYPT_MODE,new SecretKeySpec(encryptionKey,"AES"),new GCMParameterSpec(128,iv));
+                  cipher.updateAAD(aad);
+                  byte[] encrypted=cipher.doFinal(plain);
+                  int cipherLen=encrypted.length-16;
+                  byte[] cipherText=Arrays.copyOfRange(encrypted,0,cipherLen);
+                  byte[] tag=Arrays.copyOfRange(encrypted,cipherLen,encrypted.length);
+
+                  byte[] body=concat(cipherText,aad,iv,tag,cipherInfo);
+                  byte[] frame=new byte[8+body.length];
+                  frame[0]=(byte)((cmd==0xBA || cmd==0xD9)?0xAA:0xFE);
+                  frame[1]=(byte)cmd;
+                  frame[2]=0;frame[3]=0;
+                  frame[4]=(byte)(body.length&0xff);
+                  frame[5]=(byte)((body.length>>8)&0xff);
+                  frame[6]=(byte)0xA5;
+                  System.arraycopy(body,0,frame,8,body.length);
+
+                  int xor=0;
+                  for(int i=0;i<7;i++) xor^=frame[i]&0xff;
+                  for(byte b:body) xor^=b&0xff;
+                  frame[7]=(byte)xor;
+                  return frame;
               }
 
               private void onRx(byte[] part) {
-                  if (part == null || part.length==0) return;
+                  if (part==null || part.length==0) return;
                   try {
                       rxBuffer.write(part);
                       byte[] all=rxBuffer.toByteArray();
+
                       while(all.length>=8) {
                           int start=0;
                           while(start<all.length && (all[start]&0xff)!=0xFE && (all[start]&0xff)!=0xAA) start++;
-                          if(start>0) all=Arrays.copyOfRange(all,start,all.length);
-                          if(all.length<8) break;
+                          if (start>0) all=Arrays.copyOfRange(all,start,all.length);
+                          if (all.length<8) break;
+
                           int len=(all[4]&0xff)|((all[5]&0xff)<<8);
-                          int total=8+len;
-                          if(all.length<total) break;
-                          byte[] packet=Arrays.copyOfRange(all,0,total);
+                          boolean enc=(all[6]&0xff)==0xA5;
+                          int total=enc?8+len:16+len;
+                          if (all.length<total) break;
+
+                          byte[] frame=Arrays.copyOfRange(all,0,total);
                           all=Arrays.copyOfRange(all,total,all.length);
-                          Packet p=parsePacket(packet);
-                          appendLog("RX cmd=0x"+Integer.toHexString(p.cmd).toUpperCase(Locale.US)
+                          Packet p=parseFrame(frame,enc);
+                          appendLog("RX "+(enc?"SECURE":"PLAIN")+" cmd=0x"+hexByte(p.cmd)
                                   +" code="+p.code+" payload="+hex(p.payload)
                                   +(p.error==null?"":" error="+p.error));
-                          if(waitingCallback!=null && waitingCmd==p.cmd) {
+
+                          if (waitingCallback!=null && waitingCmd==p.cmd) {
+                              if (responseTimeout!=null) main.removeCallbacks(responseTimeout);
                               PacketCallback cb=waitingCallback;
-                              waitingCallback=null; waitingCmd=-1;
+                              waitingCallback=null;
+                              waitingCmd=-1;
                               cb.onPacket(p);
                           }
                       }
+
                       rxBuffer.reset();
                       rxBuffer.write(all);
-                  } catch(Exception e) { appendLog("RX error: "+safeError(e)); }
+                  } catch(Exception e) { appendLog("RX parse error: "+safeError(e)); }
+              }
+
+              private Packet parseFrame(byte[] frame,boolean encrypted) {
+                  Packet p=new Packet();
+                  p.encrypted=encrypted;
+                  try {
+                      p.cmd=frame[1]&0xff;
+                      p.code=frame[2]&0xff;
+                      int len=(frame[4]&0xff)|((frame[5]&0xff)<<8);
+
+                      int xor=0;
+                      for(int i=0;i<7;i++) xor^=frame[i]&0xff;
+                      for(int i=8;i<frame.length;i++) xor^=frame[i]&0xff;
+                      if ((frame[7]&0xff)!=(xor&0xff)) throw new Exception("Checksum mismatch.");
+
+                      if (!encrypted) {
+                          if (frame.length<16+len) throw new Exception("Plain frame incomplete.");
+                          p.token=Arrays.copyOfRange(frame,8,16);
+                          p.payload=Arrays.copyOfRange(frame,16,16+len);
+                          return p;
+                      }
+
+                      if (p.code!=0) {
+                          p.payload=Arrays.copyOfRange(frame,8,frame.length);
+                          return p;
+                      }
+
+                      byte[] body=Arrays.copyOfRange(frame,8,8+len);
+                      if (body.length<66) throw new Exception("Encrypted body too short.");
+
+                      int cipherLen=body.length-66;
+                      byte[] cipherText=Arrays.copyOfRange(body,0,cipherLen);
+                      byte[] receivedAad=Arrays.copyOfRange(body,cipherLen,cipherLen+22);
+                      byte[] iv=Arrays.copyOfRange(body,cipherLen+22,cipherLen+34);
+                      byte[] tag=Arrays.copyOfRange(body,cipherLen+34,cipherLen+50);
+                      byte[] info=Arrays.copyOfRange(body,cipherLen+50,cipherLen+66);
+
+                      byte[] aad=buildAad();
+                      if (!Arrays.equals(receivedAad,aad)) throw new Exception("Encrypted response AAD mismatch.");
+                      if (cipherInfo!=null && cipherInfo.length==16 && !Arrays.equals(info,cipherInfo))
+                          appendLog("WARN: response cipher info differs.");
+
+                      Cipher c=Cipher.getInstance("AES/GCM/NoPadding");
+                      c.init(Cipher.DECRYPT_MODE,new SecretKeySpec(encryptionKey,"AES"),new GCMParameterSpec(128,iv));
+                      c.updateAAD(aad);
+                      byte[] plain=c.doFinal(concat(cipherText,tag));
+                      if (plain.length<8) throw new Exception("Decrypted payload shorter than token.");
+
+                      p.token=Arrays.copyOfRange(plain,0,8);
+                      p.payload=Arrays.copyOfRange(plain,8,plain.length);
+                  } catch(Exception e) {
+                      p.code=-1;
+                      p.error=safeError(e);
+                  }
+                  return p;
+              }
+
+              private byte[] buildAad() throws Exception {
+                  if (deviceNumber.isEmpty()) throw new Exception("Device number unavailable.");
+                  if (firmwareVersion.isEmpty()) throw new Exception("Firmware version unavailable.");
+
+                  byte[] aad=new byte[22];
+                  byte[] dn=deviceNumber.getBytes(StandardCharsets.UTF_8);
+                  System.arraycopy(dn,0,aad,0,Math.min(20,dn.length));
+
+                  String digits=firmwareVersion.replace(".","");
+                  short fw;
+                  try { fw=Short.parseShort(digits); }
+                  catch(Exception e) { throw new Exception("Invalid firmware version: "+firmwareVersion); }
+
+                  aad[20]=(byte)(fw&0xff);
+                  aad[21]=(byte)((fw>>8)&0xff);
+                  return aad;
+              }
+
+              private void requirePacketOk(Packet p,String step) throws Exception {
+                  if (p==null) throw new Exception(step+": no response.");
+                  if (p.error!=null) throw new Exception(step+": "+p.error);
+                  if (p.code!=0) throw new Exception(step+": response code "+p.code);
               }
 
               private void queuePacket(byte[] packet) {
                   txChunks.clear();
-                  int chunk = Math.max(20,Math.min(180,mtu-3));
+                  int chunk=Math.max(20,Math.min(180,mtu-3));
                   for(int i=0;i<packet.length;i+=chunk)
                       txChunks.add(Arrays.copyOfRange(packet,i,Math.min(packet.length,i+chunk)));
                   txBusy=false;
@@ -1023,129 +1187,228 @@ jobs:
               }
 
               private void sendNextChunk() {
-                  if(txBusy || txChunks.isEmpty() || gatt==null || tx==null) return;
-                  byte[] b=txChunks.poll();
+                  if (txBusy || txChunks.isEmpty() || gatt==null || tx==null) return;
+                  byte[] bytes=txChunks.poll();
                   txBusy=true;
                   try {
-                      if(Build.VERSION.SDK_INT>=33) {
-                          int r=gatt.writeCharacteristic(tx,b,BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
-                          if(r!=BluetoothStatusCodes.SUCCESS) {
-                              txBusy=false; failStatus("BLE write error","status="+r); return;
+                      if (Build.VERSION.SDK_INT>=33) {
+                          int r=gatt.writeCharacteristic(tx,bytes,BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+                          if (r!=BluetoothStatusCodes.SUCCESS) {
+                              txBusy=false;
+                              failStatus("BLE write error","status="+r);
                           }
                       } else {
                           tx.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
-                          tx.setValue(b);
-                          if(!gatt.writeCharacteristic(tx)) {
-                              txBusy=false; failStatus("BLE write rejected",""); return;
+                          tx.setValue(bytes);
+                          if (!gatt.writeCharacteristic(tx)) {
+                              txBusy=false;
+                              failStatus("BLE write rejected","");
                           }
                       }
-                  } catch(Exception e) { txBusy=false; failStatus("BLE write exception",safeError(e)); }
+                  } catch(Exception e) {
+                      txBusy=false;
+                      failStatus("BLE write exception",safeError(e));
+                  }
+              }
+
+              private void startScan() {
+                  if (adapter==null) { failStatus("Bluetooth unavailable",""); return; }
+                  if (!permOk()) { requestPerms(); return; }
+                  if (!adapter.isEnabled()) { toast("Turn Bluetooth ON."); return; }
+
+                  scanner=adapter.getBluetoothLeScanner();
+                  if (scanner==null) { failStatus("BLE scanner unavailable",""); return; }
+
+                  stopScan();
+                  seen.clear();
+                  firmwareByAddress.clear();
+                  deviceList.removeAllViews();
+                  setStatus("Scanning","Looking for TACW chargers...");
+                  try {
+                      scanner.startScan(scanCallback);
+                      main.postDelayed(this::stopScan,20000);
+                  } catch(Exception e) { failStatus("Scan error",safeError(e)); }
+              }
+
+              private void stopScan() {
+                  if (scanner!=null) try { scanner.stopScan(scanCallback); } catch(Exception ignored) {}
+              }
+
+              private void addDevice(BluetoothDevice d,String name,String address,int rssi,String fw) {
+                  String extra=fw.isEmpty()?"":" • FW "+fw;
+                  Button b=button(name+"\n"+address+" • RSSI "+rssi+" dBm"+extra,
+                          Color.rgb(20,43,61),Color.WHITE);
+                  b.setGravity(Gravity.START|Gravity.CENTER_VERTICAL);
+                  LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,dp(70));
+                  lp.setMargins(0,dp(8),0,0);
+                  deviceList.addView(b,lp);
+                  b.setOnClickListener(v -> {
+                      deviceNumber=name;
+                      deviceAddress=address;
+                      firmwareVersion=fw;
+                      selectedDevice.setText(name+" • "+rssi+" dBm"+extra);
+                      connect(d);
+                  });
+              }
+
+              private void connect(BluetoothDevice d) {
+                  stopScan();
+                  disconnectGattOnly();
+                  clearSession();
+                  setStatus("Connecting",deviceNumber);
+                  try {
+                      gatt=Build.VERSION.SDK_INT>=23
+                              ? d.connectGatt(this,false,gattCallback,BluetoothDevice.TRANSPORT_LE)
+                              : d.connectGatt(this,false,gattCallback);
+                  } catch(Exception e) { failStatus("BLE connect failed",safeError(e)); }
+              }
+
+              private void disconnect() {
+                  stopScan();
+                  disconnectGattOnly();
+                  clearSession();
+                  setStatus("Disconnected","Scan and select charger.");
+                  updateButtons();
+              }
+
+              private void disconnectGattOnly() {
+                  BluetoothGatt gg=gatt;
+                  gatt=null;
+                  if (gg!=null) {
+                      try { gg.disconnect(); } catch(Exception ignored) {}
+                      try { gg.close(); } catch(Exception ignored) {}
+                  }
+              }
+
+              private void clearSession() {
+                  transportReady=false;
+                  authenticated=false;
+                  encryptedMode=false;
+                  tx=null;rx=null;
+                  encryptionKey=null;
+                  cipherInfo=null;
+                  sessionToken=new byte[8];
+                  clientNonce=null;
+                  waitingCmd=-1;
+                  waitingCallback=null;
+                  if (responseTimeout!=null) main.removeCallbacks(responseTimeout);
+                  txChunks.clear();
+                  rxBuffer.reset();
               }
 
               private String http(String method,String endpoint,String contentType,String body,String bearer) throws Exception {
                   HttpURLConnection c=(HttpURLConnection)new URL(endpoint).openConnection();
-                  c.setConnectTimeout(15000); c.setReadTimeout(20000);
+                  c.setConnectTimeout(15000);
+                  c.setReadTimeout(20000);
                   c.setRequestMethod(method);
                   c.setRequestProperty("Accept","application/json");
                   c.setRequestProperty("X-APP-VERSION","3.5.0");
-                  if(bearer!=null && !bearer.isEmpty()) c.setRequestProperty("Authorization","Bearer "+bearer);
-                  if(body!=null) {
+                  if (bearer!=null && !bearer.isEmpty()) c.setRequestProperty("Authorization","Bearer "+bearer);
+
+                  if (body!=null) {
                       c.setDoOutput(true);
                       c.setRequestProperty("Content-Type",contentType==null?"application/json":contentType);
-                      try(OutputStream os=c.getOutputStream()) { os.write(body.getBytes(StandardCharsets.UTF_8)); }
+                      try(OutputStream os=c.getOutputStream()) {
+                          os.write(body.getBytes(StandardCharsets.UTF_8));
+                      }
                   }
+
                   int code=c.getResponseCode();
                   InputStream in=code>=200&&code<300?c.getInputStream():c.getErrorStream();
                   String text=readAll(in);
-                  if(code<200||code>=300) throw new Exception("HTTP "+code+" "+compact(text));
+                  if (code<200 || code>=300) throw new HttpError(code,"HTTP "+code+" "+compact(text));
                   return text;
               }
 
-              private static Object parseJsonAny(String s) throws Exception {
-                  String x=s.trim();
-                  if(x.startsWith("[")) return new JSONArray(x);
-                  return new JSONObject(x);
+              private SecretKey getOrCreateKey() throws Exception {
+                  KeyStore ks=KeyStore.getInstance("AndroidKeyStore");
+                  ks.load(null);
+                  if (ks.containsAlias(KEY_ALIAS)) {
+                      return ((KeyStore.SecretKeyEntry)ks.getEntry(KEY_ALIAS,null)).getSecretKey();
+                  }
+
+                  KeyGenerator kg=KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES,"AndroidKeyStore");
+                  kg.init(new KeyGenParameterSpec.Builder(KEY_ALIAS,
+                          KeyProperties.PURPOSE_ENCRYPT|KeyProperties.PURPOSE_DECRYPT)
+                          .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                          .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                          .build());
+                  return kg.generateKey();
               }
 
-              private static String findString(Object obj,String key) {
-                  if(obj==null) return "";
+              private void writeSecure(String name,String plain) throws Exception {
+                  if (plain==null) plain="";
+                  SecretKey key=getOrCreateKey();
+                  Cipher c=Cipher.getInstance("AES/GCM/NoPadding");
+                  c.init(Cipher.ENCRYPT_MODE,key);
+                  byte[] iv=c.getIV();
+                  byte[] encrypted=c.doFinal(plain.getBytes(StandardCharsets.UTF_8));
+                  prefs.edit().putString(name,Base64.encodeToString(concat(iv,encrypted),Base64.NO_WRAP)).apply();
+              }
+
+              private String readSecure(String name) {
                   try {
-                      if(obj instanceof JSONObject) {
-                          JSONObject j=(JSONObject)obj;
-                          if(j.has(key) && !j.isNull(key)) return String.valueOf(j.get(key));
-                          Iterator<String> it=j.keys();
-                          while(it.hasNext()) {
-                              Object v=j.opt(it.next());
-                              String r=findString(v,key); if(!r.isEmpty()) return r;
+                      String saved=prefs.getString(name,"");
+                      if (saved==null || saved.isEmpty()) return "";
+                      byte[] all=Base64.decode(saved,Base64.NO_WRAP);
+                      if (all.length<13) return "";
+
+                      byte[] iv=Arrays.copyOfRange(all,0,12);
+                      byte[] encrypted=Arrays.copyOfRange(all,12,all.length);
+                      Cipher c=Cipher.getInstance("AES/GCM/NoPadding");
+                      c.init(Cipher.DECRYPT_MODE,getOrCreateKey(),new GCMParameterSpec(128,iv));
+                      return new String(c.doFinal(encrypted),StandardCharsets.UTF_8);
+                  } catch(Exception e) { return ""; }
+              }
+
+              private void deleteKey() throws Exception {
+                  KeyStore ks=KeyStore.getInstance("AndroidKeyStore");
+                  ks.load(null);
+                  if (ks.containsAlias(KEY_ALIAS)) ks.deleteEntry(KEY_ALIAS);
+              }
+
+              private static String firmwareFromScanRecord(byte[] record) {
+                  try {
+                      if (record==null) return "";
+                      int pos=0;
+                      while(pos<record.length) {
+                          int len=record[pos]&0xff;
+                          if (len==0) break;
+                          if (pos+len>=record.length) break;
+                          int type=record[pos+1]&0xff;
+                          if (type==0xFF) {
+                              int dataLen=len-1;
+                              int start=pos+2;
+                              if (dataLen>=5 && (record[start]&0xff)==0xFE) {
+                                  int b3=record[start+3]&0xff;
+                                  int b4=record[start+4]&0xff;
+                                  if (b3==0x56) b3=0;
+                                  if (b4==0x56) b4=0;
+                                  int fw=b3|(b4<<8);
+                                  String s=String.valueOf(fw);
+                                  while(s.length()<3) s=s+"0";
+                                  return s.substring(0,1)+"."+s.substring(1,2)+"."+s.substring(2);
+                              }
                           }
-                      } else if(obj instanceof JSONArray) {
-                          JSONArray a=(JSONArray)obj;
-                          for(int i=0;i<a.length();i++){String r=findString(a.opt(i),key);if(!r.isEmpty())return r;}
+                          pos+=len+1;
                       }
-                  } catch(Exception ignored){}
+                  } catch(Exception ignored) {}
                   return "";
               }
 
-              private static Integer findInt(Object obj,String key) {
-                  String s=findString(obj,key);
-                  try { return s.isEmpty()?null:Integer.parseInt(s); } catch(Exception e){ return null; }
+              private void requestPerms() {
+                  if (Build.VERSION.SDK_INT>=31)
+                      requestPermissions(new String[]{Manifest.permission.BLUETOOTH_SCAN,Manifest.permission.BLUETOOTH_CONNECT},REQ_PERMS);
+                  else if (Build.VERSION.SDK_INT>=23)
+                      requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION},REQ_PERMS);
               }
 
-              private static JSONObject findObjectByDeviceNumber(Object obj,String dn) {
-                  if(obj instanceof JSONObject) {
-                      JSONObject j=(JSONObject)obj;
-                      if(dn.equals(j.optString("deviceNumber",""))) return j;
-                      Iterator<String> it=j.keys();
-                      while(it.hasNext()) {
-                          JSONObject r=findObjectByDeviceNumber(j.opt(it.next()),dn); if(r!=null)return r;
-                      }
-                  } else if(obj instanceof JSONArray) {
-                      JSONArray a=(JSONArray)obj;
-                      for(int i=0;i<a.length();i++){JSONObject r=findObjectByDeviceNumber(a.opt(i),dn);if(r!=null)return r;}
-                  }
-                  return null;
-              }
-
-              private static String readAll(InputStream in) throws Exception {
-                  if(in==null)return "";
-                  ByteArrayOutputStream b=new ByteArrayOutputStream();
-                  byte[] buf=new byte[4096]; int n;
-                  while((n=in.read(buf))!=-1)b.write(buf,0,n);
-                  return b.toString("UTF-8");
-              }
-
-              private static String compact(String x) {
-                  if(x==null)return "";
-                  x=x.replace("\n"," ").replace("\r"," ");
-                  return x.length()>220?x.substring(0,220):x;
-              }
-
-              private static String enc(String s) throws Exception { return URLEncoder.encode(s,"UTF-8"); }
-
-              private void progress(String name,boolean ok,String detail) {
-                  runOnUiThread(() -> {
-                      TextView found=null;
-                      for(int i=0;i<progressBox.getChildCount();i++) {
-                          View v=progressBox.getChildAt(i);
-                          if(v.getTag()!=null && v.getTag().equals(name)){found=(TextView)v;break;}
-                      }
-                      String mark=ok?"✓":"○";
-                      String s=mark+"  "+name+"   "+detail;
-                      if(found==null) {
-                          found=text(s,13,true,ok?Color.rgb(42,213,196):Color.rgb(151,171,188));
-                          found.setTag(name); found.setPadding(0,dp(4),0,dp(4)); progressBox.addView(found);
-                      } else {
-                          found.setText(s); found.setTextColor(ok?Color.rgb(42,213,196):Color.rgb(151,171,188));
-                      }
-                  });
-              }
-
-              private void setStatus(String a,String b) {
-                  runOnUiThread(() -> { statusTitle.setText(a); statusDetail.setText(b==null?"":b); });
-              }
-              private void failStatus(String a,String b) {
-                  appendLog("ERROR "+a+" :: "+b);
-                  setStatus(a,b);
+              private boolean permOk() {
+                  if (Build.VERSION.SDK_INT>=31)
+                      return checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN)==PackageManager.PERMISSION_GRANTED
+                              && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)==PackageManager.PERMISSION_GRANTED;
+                  return Build.VERSION.SDK_INT<23
+                          || checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)==PackageManager.PERMISSION_GRANTED;
               }
 
               private void updateButtons() {
@@ -1157,32 +1420,112 @@ jobs:
                   });
               }
 
-              private void disconnect() {
-                  stopScan();
-                  BluetoothGatt gg=gatt; gatt=null;
-                  transportReady=false; authenticated=false;
-                  tx=null;rx=null; waitingCmd=-1;waitingCallback=null;
-                  txChunks.clear(); rxBuffer.reset();
-                  if(gg!=null){try{gg.disconnect();}catch(Exception ignored){} try{gg.close();}catch(Exception ignored){}}
-                  updateButtons();
+              private void progress(String name,boolean ok,String detail) {
+                  runOnUiThread(() -> {
+                      TextView found=null;
+                      for(int i=0;i<progressBox.getChildCount();i++) {
+                          View v=progressBox.getChildAt(i);
+                          if (name.equals(v.getTag())) { found=(TextView)v; break; }
+                      }
+
+                      String line=(ok?"✓":"○")+"  "+name+"   "+detail;
+                      if (found==null) {
+                          found=text(line,13,true,ok?Color.rgb(44,220,199):Color.rgb(153,177,194));
+                          found.setTag(name);
+                          found.setPadding(0,dp(4),0,dp(4));
+                          progressBox.addView(found);
+                      } else {
+                          found.setText(line);
+                          found.setTextColor(ok?Color.rgb(44,220,199):Color.rgb(153,177,194));
+                      }
+                  });
               }
 
-              private void requestPerms() {
-                  if(Build.VERSION.SDK_INT>=31)
-                      requestPermissions(new String[]{Manifest.permission.BLUETOOTH_SCAN,Manifest.permission.BLUETOOTH_CONNECT},REQ_PERMS);
-                  else if(Build.VERSION.SDK_INT>=23)
-                      requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION},REQ_PERMS);
+              private LinearLayout card(int color) {
+                  LinearLayout v=new LinearLayout(this);
+                  v.setOrientation(LinearLayout.VERTICAL);
+                  v.setPadding(dp(16),dp(15),dp(16),dp(15));
+                  GradientDrawable gd=new GradientDrawable();
+                  gd.setColor(color);
+                  gd.setCornerRadius(dp(16));
+                  gd.setStroke(dp(1),Color.rgb(32,58,77));
+                  v.setBackground(gd);
+                  return v;
               }
 
-              private boolean permOk() {
-                  if(Build.VERSION.SDK_INT>=31)
-                      return checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN)==PackageManager.PERMISSION_GRANTED
-                              && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)==PackageManager.PERMISSION_GRANTED;
-                  return Build.VERSION.SDK_INT<23 || checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)==PackageManager.PERMISSION_GRANTED;
+              private LinearLayout.LayoutParams cardLp() {
+                  LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,-2);
+                  lp.setMargins(0,dp(10),0,dp(4));
+                  return lp;
               }
 
-              private String safeName(BluetoothDevice d){try{return d==null?null:d.getName();}catch(Exception e){return null;}}
-              private String safeAddress(BluetoothDevice d){try{return d==null?null:d.getAddress();}catch(Exception e){return null;}}
+              private TextView section(String s,int color) {
+                  TextView t=text(s,14,true,color);
+                  t.setLetterSpacing(.08f);
+                  t.setPadding(0,0,0,dp(10));
+                  return t;
+              }
+
+              private LinearLayout labeled(String label,View field,int muted) {
+                  LinearLayout x=new LinearLayout(this);
+                  x.setOrientation(LinearLayout.VERTICAL);
+                  TextView l=text(label,12,true,muted);
+                  l.setPadding(0,dp(6),0,dp(4));
+                  x.addView(l);
+                  x.addView(field,new LinearLayout.LayoutParams(-1,dp(50)));
+                  return x;
+              }
+
+              private EditText input(String hint,int fg,int hintColor) {
+                  EditText e=new EditText(this);
+                  e.setHint(hint);
+                  e.setHintTextColor(hintColor);
+                  e.setTextColor(fg);
+                  e.setTextSize(15);
+                  e.setSingleLine(true);
+                  e.setPadding(dp(12),0,dp(12),0);
+                  GradientDrawable gd=new GradientDrawable();
+                  gd.setColor(Color.rgb(8,24,39));
+                  gd.setCornerRadius(dp(10));
+                  gd.setStroke(dp(1),Color.rgb(44,68,87));
+                  e.setBackground(gd);
+                  return e;
+              }
+
+              private Button button(String s,int bg,int fg) {
+                  Button b=new Button(this);
+                  b.setText(s);
+                  b.setAllCaps(false);
+                  b.setTextColor(fg);
+                  b.setTextSize(13);
+                  b.setTypeface(Typeface.DEFAULT,Typeface.BOLD);
+                  GradientDrawable gd=new GradientDrawable();
+                  gd.setColor(bg);
+                  gd.setCornerRadius(dp(12));
+                  b.setBackground(gd);
+                  return b;
+              }
+
+              private TextView text(String s,float size,boolean bold,int color) {
+                  TextView t=new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(size);
+                  t.setTextColor(color);
+                  if (bold) t.setTypeface(Typeface.DEFAULT,Typeface.BOLD);
+                  return t;
+              }
+
+              private void setStatus(String title,String detail) {
+                  runOnUiThread(() -> {
+                      statusTitle.setText(title);
+                      statusDetail.setText(detail==null?"":detail);
+                  });
+              }
+
+              private void failStatus(String title,String detail) {
+                  appendLog("ERROR "+title+" :: "+detail);
+                  setStatus(title,detail);
+              }
 
               private void copyLog() {
                   ClipboardManager cm=(ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
@@ -1191,50 +1534,127 @@ jobs:
               }
 
               private void appendLog(String s) {
-                  // Never log ABB password, charger PIN, AuthKey, bearer token, cipher key or info.
-                  final String line=new SimpleDateFormat("HH:mm:ss.SSS",Locale.US).format(new Date())+"  "+s+"\n";
-                  runOnUiThread(() -> { if(logText!=null)logText.append(line); });
+                  // Never log account password, charger PIN, access/refresh token, cipher key/info, or OCPP AuthKey.
+                  String line=new SimpleDateFormat("HH:mm:ss.SSS",Locale.US).format(new Date())+"  "+s+"\n";
+                  runOnUiThread(() -> { if (logText!=null) logText.append(line); });
               }
 
-              private static byte[] concat(byte[]... arr) {
+              private static Object parseJsonAny(String s) throws Exception {
+                  String x=s.trim();
+                  return x.startsWith("[")?new JSONArray(x):new JSONObject(x);
+              }
+
+              private static String findString(Object obj,String key) {
+                  if (obj==null) return "";
+                  try {
+                      if (obj instanceof JSONObject) {
+                          JSONObject j=(JSONObject)obj;
+                          if (j.has(key) && !j.isNull(key)) return String.valueOf(j.get(key));
+                          Iterator<String> it=j.keys();
+                          while(it.hasNext()) {
+                              String r=findString(j.opt(it.next()),key);
+                              if (!r.isEmpty()) return r;
+                          }
+                      } else if (obj instanceof JSONArray) {
+                          JSONArray a=(JSONArray)obj;
+                          for(int i=0;i<a.length();i++) {
+                              String r=findString(a.opt(i),key);
+                              if (!r.isEmpty()) return r;
+                          }
+                      }
+                  } catch(Exception ignored) {}
+                  return "";
+              }
+
+              private static Integer findInt(Object obj,String key) {
+                  String s=findString(obj,key);
+                  try { return s.isEmpty()?null:Integer.parseInt(s); }
+                  catch(Exception e) { return null; }
+              }
+
+              private static String readAll(InputStream in) throws Exception {
+                  if (in==null) return "";
+                  ByteArrayOutputStream b=new ByteArrayOutputStream();
+                  byte[] buf=new byte[4096];
+                  int n;
+                  while((n=in.read(buf))!=-1) b.write(buf,0,n);
+                  return b.toString("UTF-8");
+              }
+
+              private static String compact(String s) {
+                  if (s==null) return "";
+                  s=s.replace("\n"," ").replace("\r"," ");
+                  return s.length()>240?s.substring(0,240):s;
+              }
+
+              private static String enc(String s) throws Exception { return URLEncoder.encode(s,"UTF-8"); }
+              private static String safeError(Exception e) { return e==null?"Unknown error":(e.getMessage()==null?e.getClass().getSimpleName():e.getMessage()); }
+              private String safeName(BluetoothDevice d) { try { return d==null?null:d.getName(); } catch(Exception e) { return null; } }
+              private String safeAddress(BluetoothDevice d) { try { return d==null?null:d.getAddress(); } catch(Exception e) { return null; } }
+
+              private static byte[] concat(byte[]... arrays) {
                   int total=0;
-                  for(byte[] x:arr) if(x!=null) total+=x.length;
+                  for(byte[] a:arrays) if (a!=null) total+=a.length;
                   byte[] out=new byte[total];
-                  int pos=0;
-                  for(byte[] x:arr) {
-                      if(x==null) continue;
-                      System.arraycopy(x,0,out,pos,x.length);
-                      pos+=x.length;
+                  int p=0;
+                  for(byte[] a:arrays) {
+                      if (a==null) continue;
+                      System.arraycopy(a,0,out,p,a.length);
+                      p+=a.length;
                   }
                   return out;
               }
-              private static byte[] leShort(int v){return new byte[]{(byte)(v&255),(byte)((v>>8)&255)};}
-              private static byte[] leInt(int v){return new byte[]{(byte)v,(byte)(v>>8),(byte)(v>>16),(byte)(v>>24)};}
-              private static byte[] unhex(String s) {
-                  s=s.replaceAll("[^0-9A-Fa-f]","");
-                  if((s.length()&1)==1)s="0"+s;
-                  byte[] b=new byte[s.length()/2];
-                  for(int i=0;i<b.length;i++)b[i]=(byte)Integer.parseInt(s.substring(i*2,i*2+2),16);
-                  return b;
+
+              private static byte[] lastBytes(byte[] b,int n) {
+                  if (b==null || b.length<n) return new byte[0];
+                  return Arrays.copyOfRange(b,b.length-n,b.length);
               }
+
+              private static boolean isAllZero(byte[] b) {
+                  if (b==null) return true;
+                  for(byte x:b) if (x!=0) return false;
+                  return true;
+              }
+
+              private static byte[] leShort(int v) {
+                  return new byte[]{(byte)(v&0xff),(byte)((v>>8)&0xff)};
+              }
+
+              private static byte[] leInt(int v) {
+                  return new byte[]{(byte)v,(byte)(v>>8),(byte)(v>>16),(byte)(v>>24)};
+              }
+
+              private static byte[] unhex(String s) {
+                  if (s==null) return new byte[0];
+                  s=s.replaceAll("[^0-9A-Fa-f]","");
+                  if ((s.length()&1)==1) return new byte[0];
+                  byte[] out=new byte[s.length()/2];
+                  for(int i=0;i<out.length;i++)
+                      out[i]=(byte)Integer.parseInt(s.substring(i*2,i*2+2),16);
+                  return out;
+              }
+
               private static String hex(byte[] b) {
-                  if(b==null)return "";
+                  if (b==null) return "";
                   StringBuilder s=new StringBuilder();
-                  for(byte x:b)s.append(String.format(Locale.US,"%02X",x));
+                  for(byte x:b) s.append(String.format(Locale.US,"%02X",x));
                   return s.toString();
               }
-              private static boolean isAllZero(byte[] b){if(b==null)return true;for(byte x:b)if(x!=0)return false;return true;}
-              private static String normalizeFw(String s){
-                  if(s==null)return "";
-                  s=s.trim();
-                  java.util.regex.Matcher m=java.util.regex.Pattern.compile("(\\d+\\.\\d+\\.\\d+)").matcher(s);
-                  return m.find()?m.group(1):s;
-              }
-              private static String safeError(Exception e){return e==null?"Unknown error":(e.getMessage()==null?e.getClass().getSimpleName():e.getMessage());}
-              private int dp(int v){return Math.round(v*getResources().getDisplayMetrics().density);}
-              private void toast(String s){runOnUiThread(() -> Toast.makeText(this,s,Toast.LENGTH_LONG).show());}
 
-              @Override protected void onDestroy(){super.onDestroy();disconnect();}
+              private static String hexByte(int b) {
+                  return String.format(Locale.US,"%02X",b&0xff);
+              }
+
+              private int dp(int v) { return Math.round(v*getResources().getDisplayMetrics().density); }
+
+              private void toast(String s) {
+                  runOnUiThread(() -> Toast.makeText(this,s,Toast.LENGTH_LONG).show());
+              }
+
+              @Override protected void onDestroy() {
+                  super.onDestroy();
+                  disconnect();
+              }
           }
           EOF
 
@@ -1247,14 +1667,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-PIN-Direct-Provisioner.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure.apk
           cd artifact
-          sha256sum ABB-Terra-PIN-Direct-Provisioner.apk | tee ABB-Terra-PIN-Direct-Provisioner.apk.sha256
+          sha256sum ABB-Terra-Direct-Secure.apk | tee ABB-Terra-Direct-Secure.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ABB-Terra-PIN-Direct-Provisioner
+          name: ABB-Terra-Direct-Secure
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
