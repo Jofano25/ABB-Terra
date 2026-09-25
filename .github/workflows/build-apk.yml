@@ -1,4 +1,4 @@
-name: Build ABB Terra Direct Secure 3.5
+name: Build ABB Terra Direct Secure 3.6
 
 on:
   workflow_dispatch:
@@ -79,8 +79,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 350
-                  versionName '3.5-direct-secure'
+                  versionCode 360
+                  versionName '3.6-direct-secure'
               }
 
               buildTypes {
@@ -398,7 +398,7 @@ jobs:
 
                   if (hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("ABB Terra Direct Secure 3.5 started");
+                      appendLog("ABB Terra Direct Secure 3.6 started");
                       appendLog("Saved authorization found. Opening commissioning screen.");
                   } else {
                       showLoginScreen();
@@ -676,7 +676,7 @@ jobs:
                           runOnUiThread(() -> {
                               adminPassword.setText("");
                               buildUi();
-                              appendLog("ABB Terra Direct Secure 3.5 started");
+                              appendLog("ABB Terra Direct Secure 3.6 started");
                               appendLog("LOGIN SUCCESS. Authorization stored securely; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -1320,6 +1320,11 @@ jobs:
               }
 
               private void readCurrentConfig() {
+                  if (Looper.myLooper()!=Looper.getMainLooper()) {
+                      main.post(this::readCurrentConfig);
+                      return;
+                  }
+
                   if (!authenticated) {
                       toast("Authenticate charger first.");
                       return;
@@ -1503,6 +1508,11 @@ jobs:
               }
 
               private void loadLocalProfile() {
+                  if (Looper.myLooper()!=Looper.getMainLooper()) {
+                      main.post(this::loadLocalProfile);
+                      return;
+                  }
+
                   if (deviceNumber==null || deviceNumber.isEmpty()) return;
 
                   String conn=readProfile("conn_type");
@@ -1647,8 +1657,21 @@ jobs:
               }
 
               private void dispatchError(int cmd,PacketCallback cb,Exception e) {
-                  Packet p=new Packet();p.cmd=cmd;p.code=-1;p.error=safeError(e);
-                  if (cb!=null) cb.onPacket(p);
+                  Packet p=new Packet();
+                  p.cmd=cmd;
+                  p.code=-1;
+                  p.error=safeError(e);
+
+                  if (cb!=null) {
+                      main.post(() -> {
+                          try {
+                              cb.onPacket(p);
+                          } catch(Exception callbackError) {
+                              appendLog("CALLBACK ERROR: "+safeError(callbackError));
+                              failStatus("Protocol callback failed",safeError(callbackError));
+                          }
+                      });
+                  }
               }
 
               private byte[] plainWrap(int cmd,byte[] payload) {
@@ -1739,10 +1762,23 @@ jobs:
 
                           if (waitingCallback!=null && waitingCmd==p.cmd) {
                               if (responseTimeout!=null) main.removeCallbacks(responseTimeout);
-                              PacketCallback cb=waitingCallback;
+
+                              final PacketCallback cb=waitingCallback;
+                              final Packet response=p;
                               waitingCallback=null;
                               waitingCmd=-1;
-                              cb.onPacket(p);
+
+                              // BluetoothGattCallback is normally delivered on a Binder thread.
+                              // Every higher-level protocol callback is moved to the main thread
+                              // so UI read/write and the automatic read-back flow are safe.
+                              main.post(() -> {
+                                  try {
+                                      cb.onPacket(response);
+                                  } catch(Exception callbackError) {
+                                      appendLog("CALLBACK ERROR: "+safeError(callbackError));
+                                      failStatus("Protocol callback failed",safeError(callbackError));
+                                  }
+                              });
                           }
                       }
 
@@ -2357,14 +2393,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-3.5.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-3.6.apk
           cd artifact
-          sha256sum ABB-Terra-Direct-Secure-3.5.apk | tee ABB-Terra-Direct-Secure-3.5.apk.sha256
+          sha256sum ABB-Terra-Direct-Secure-3.6.apk | tee ABB-Terra-Direct-Secure-3.6.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ABB-Terra-Direct-Secure-3.5
+          name: ABB-Terra-Direct-Secure-3.6
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
