@@ -1,4 +1,4 @@
-name: Build ABB Terra Direct Secure 4.2 WIFI-D4-FLOW-FIX
+name: Build ABB Terra Direct Secure 4.3 WIFI-CE-D2-LONGTIMEOUT
 
 on:
   workflow_dispatch:
@@ -79,8 +79,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 400
-                  versionName '4.2-wifi-d4-flow-fix-fw210'
+                  versionCode 430
+                  versionName '4.3-wifi-ce-d2-longtimeout-fw210'
               }
 
               buildTypes {
@@ -435,7 +435,7 @@ jobs:
 
                   if (hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("ABB Terra Direct Secure 4.2 started");
+                      appendLog("ABB Terra Direct Secure 4.3 started");
                       appendLog("Saved authorization found. Opening commissioning screen.");
                   } else {
                       showLoginScreen();
@@ -713,7 +713,7 @@ jobs:
                           runOnUiThread(() -> {
                               adminPassword.setText("");
                               buildUi();
-                              appendLog("ABB Terra Direct Secure 4.2 started");
+                              appendLog("ABB Terra Direct Secure 4.3 started");
                               appendLog("LOGIN SUCCESS. Authorization stored securely; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -1135,7 +1135,9 @@ jobs:
               }
 
               private void changeNetworkModeForApply(int mode,Runnable next) {
-                  // 0xD4 is the actual CHANGE_NET_MODE command in the Chargedot/ABB protocol.
+                  // Kept only for diagnostics/other firmware. FW 2.1.0 on TACW752826G1511
+                  // returned response code 20 (command does not exist), so normal apply does NOT call it.
+                  // 0xD4 is catalogued as CHANGE_NET_MODE in other Chargedot/ABB variants.
                   // D3 on FW 2.1.0 reports mode=1 for Wi-Fi and mode=2 for Ethernet, so use
                   // that enum here. This is best-effort: the raw response is logged and a
                   // parser guess is never allowed to block D2.
@@ -1409,15 +1411,16 @@ jobs:
                   appendLog("WIFI APPLY target ssid="+ssid+" password=<hidden>");
                   progress("Internet connection",false,"Preparing Wi-Fi DHCP...");
 
-                  // FW 2.1.0 already reports DHCP in AA, so normally AB is skipped.
-                  // Select Wi-Fi using the protocol's actual D4 CHANGE_NET_MODE command,
-                  // then write SSID/password with D2. Do not use AB inner byte[1] as a
-                  // guessed success/failure flag.
+                  // FW 2.1.0 READ AA already reports DHCP, so normally AB is skipped.
+                  // FW 2.1.0 explicitly returned response-code 20 for D4 CHANGE_NET_MODE,
+                  // therefore DO NOT send D4. CE_AUTH mode=6 is confirmed accepted by this
+                  // charger and is used only to select/authorize Wi-Fi before D2.
                   int wifiAaType=(lastAaInterfaceType>=0)?lastAaInterfaceType:0;
                   appendLog("WIFI FLOW interfaceEnum="+wifiAaType
                           +" aaIpMode="+lastAaIpMode+" d3Mode=1(Wi-Fi)");
+                  appendLog("D4 skipped: FW 2.1.0 reports command does not exist. Using CE_AUTH mode=6 before D2.");
                   ensureDhcpBeforeNetworkWrite(wifiAaType,() ->
-                      changeNetworkModeForApply(1,() -> sendWifiCredentialsForApply(ssid,password)));
+                      enableConnectionAuth(NET_WIFI,() -> sendWifiCredentialsForApply(ssid,password)));
               }
 
               private void sendWifiCredentialsForApply(String ssid,String password) {
@@ -1425,6 +1428,8 @@ jobs:
                   progress("Internet connection",false,"Writing Wi-Fi SSID/password...");
                   connectionStatus.setText("Writing Wi-Fi "+ssid+" • DHCP. Charger may restart BLE/network.");
                   appendLog("TX WIFI D2 ssid="+ssid+" password=<hidden> payloadLen="+payload.length);
+                  appendLog("D2 response window=40s (FW 2.1.0 previously replied after ~21s). "+
+                          "Disconnect before response is treated as expected restart.");
 
                   // Arm expected reboot BEFORE D2. FW 2.1.0 can restart/disconnect before
                   // sending the D2 response, which happened in 3.8 after about 7 seconds.
@@ -1448,23 +1453,37 @@ jobs:
                                   "Waiting for restart/reconnect, then READ ALL verifies SSID from E4.");
                           connectionStatus.setText("Wi-Fi write sent. Waiting for charger read-back verification...");
 
-                          // Some firmware does not disconnect BLE. Verify in-place after grace period.
+                          // Some firmware does not disconnect BLE. Once D2 finally replies,
+                          // allow the network stack a few seconds and then read E4 back directly.
                           main.postDelayed(() -> {
                               if (authenticated && awaitingExpectedReboot && !readInProgress) {
-                                  appendLog("No BLE disconnect after D2; starting in-place verification.");
+                                  appendLog("No BLE disconnect after successful D2; starting in-place E4 verification.");
                                   awaitingExpectedReboot=false;
                                   readCurrentConfig();
                               }
-                          },9000);
+                          },5000);
 
                       } catch(Exception e) {
-                          // If the charger rebooted, clearSession cancels this callback.
-                          // A real protocol error while still connected is shown here.
+                          // If the charger rebooted, clearSession cancels this callback and the
+                          // auto-reconnect path verifies E4. If it stayed connected but D2 timed
+                          // out, do one charger read-back before declaring failure because some
+                          // FW applies the setting asynchronously.
+                          String err=safeError(e);
+                          if (gatt!=null && authenticated && err.toLowerCase(Locale.US).contains("timeout")) {
+                              appendLog("D2 timeout while BLE is still connected; verifying actual E4 state before failing.");
+                              main.postDelayed(() -> {
+                                  if (authenticated && !readInProgress) {
+                                      awaitingExpectedReboot=false;
+                                      readCurrentConfig();
+                                  }
+                              },1500);
+                              return;
+                          }
                           if (gatt!=null && authenticated) {
                               awaitingExpectedReboot=false;
                               wifiWritePending=false;
-                              progress("Internet connection",false,safeError(e));
-                              failStatus("Wi-Fi write failed",safeError(e));
+                              progress("Internet connection",false,err);
+                              failStatus("Wi-Fi write failed",err);
                               saveBtn.setEnabled(true);
                           }
                       }
@@ -1477,7 +1496,7 @@ jobs:
                   connectionStatus.setText("Setting Ethernet DHCP / network mode...");
 
                   ensureDhcpBeforeNetworkWrite(2,() ->
-                      changeNetworkModeForApply(2,() -> {
+                      enableConnectionAuth(NET_ETHERNET,() -> {
                           progress("Internet connection",true,"Ethernet DHCP/mode command sent");
                           saveLocalProfile();
                           awaitingExpectedReboot=true;
@@ -2085,21 +2104,29 @@ jobs:
                   } catch(Exception e) { dispatchError(cmd,cb,e); }
               }
 
+              private long responseTimeoutMs(int cmd) {
+                  // FW 2.1.0 can take ~21 seconds to answer D2 while applying Wi-Fi.
+                  // All normal BLE commands keep the original 10 second timeout.
+                  if (cmd==CMD_WIFI_CONFIG) return 40000L;
+                  return 10000L;
+              }
+
               private void armResponse(int cmd,PacketCallback cb) {
                   waitingCmd=cmd;
                   waitingCallback=cb;
                   if (responseTimeout!=null) main.removeCallbacks(responseTimeout);
+                  final long timeoutMs=responseTimeoutMs(cmd);
                   responseTimeout=() -> {
                       if (waitingCallback!=null && waitingCmd==cmd) {
                           PacketCallback x=waitingCallback;
                           waitingCallback=null;
                           waitingCmd=-1;
                           Packet p=new Packet();
-                          p.cmd=cmd;p.code=-1;p.error="Response timeout";
+                          p.cmd=cmd;p.code=-1;p.error="Response timeout after "+(timeoutMs/1000)+"s";
                           x.onPacket(p);
                       }
                   };
-                  main.postDelayed(responseTimeout,10000);
+                  main.postDelayed(responseTimeout,timeoutMs);
               }
 
               private void dispatchError(int cmd,PacketCallback cb,Exception e) {
@@ -2841,14 +2868,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-4.2.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-4.3.apk
           cd artifact
-          sha256sum ABB-Terra-Direct-Secure-4.2.apk | tee ABB-Terra-Direct-Secure-4.2.apk.sha256
+          sha256sum ABB-Terra-Direct-Secure-4.3.apk | tee ABB-Terra-Direct-Secure-4.3.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ABB-Terra-Direct-Secure-4.2
+          name: ABB-Terra-Direct-Secure-4.3
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
