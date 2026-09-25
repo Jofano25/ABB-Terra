@@ -1,4 +1,4 @@
-name: Build ABB Terra Direct Secure 3.8 READ-ALL
+name: Build ABB Terra Direct Secure 3.9 WIFI-FIX
 
 on:
   workflow_dispatch:
@@ -79,8 +79,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 380
-                  versionName '3.8-readall-fw210'
+                  versionCode 390
+                  versionName '3.9-wifi-fix-fw210'
               }
 
               buildTypes {
@@ -173,6 +173,7 @@ jobs:
               private static final int REQ_PERMS = 7201;
               private static final int CMD_AUTH = 0xFE;
               private static final int CMD_QUERY_TCPIP = 0xAA;
+              private static final int CMD_CONFIGURE_TCPIP = 0xAB;
               private static final int CMD_SYNC_TIME = 0xB0;
               private static final int CMD_SYSINFO = 0xB1;
               private static final int CMD_CE_AUTH = 0xCE;
@@ -205,6 +206,8 @@ jobs:
               private int mtu = 158;
               private boolean transportReady = false;
               private boolean authenticated = false;
+              private boolean authInProgress = false;
+              private boolean readInProgress = false;
               private boolean encryptedMode = false;
               private boolean internetReady = false;
               private int expectedNetworkMode = 0;
@@ -212,6 +215,9 @@ jobs:
               private boolean lastOcppApplyOk = false;
               private String lastOcppApplyMessage = "Not applied";
               private boolean awaitingExpectedReboot = false;
+              private boolean wifiWritePending = false;
+              private String pendingDesiredSsid = "";
+              private String pendingDesiredOcppUrl = "";
               private boolean autoReconnectEnabled = false;
               private String autoReconnectDeviceNumber = "";
               private String deviceNumber = "";
@@ -314,6 +320,8 @@ jobs:
                           String target=deviceNumber;
 
                           clearSession();
+                          authInProgress=false;
+                          readInProgress=false;
                           progress("Bluetooth", false, rebootFlow ? "Charger rebooting..." : "Disconnected");
                           progress("Secure session", false, "Not authenticated");
 
@@ -370,13 +378,18 @@ jobs:
                                   + " • enter PIN");
                           updateButtons();
 
-                          if (chargerPin.getText().toString().trim().length() == 8 && hasSavedAuthorization()) {
-                              main.postDelayed(this::autoAuthenticate, 250);
+                          if (chargerPin.getText().toString().trim().length() == 8
+                                  && hasSavedAuthorization()
+                                  && !authenticated
+                                  && !authInProgress) {
+                              main.postDelayed(this::autoAuthenticate, 400);
                           }
                       }
                   }
 
-                  private void autoAuthenticate() { authenticateCharger(); }
+                  private void autoAuthenticate() {
+                      if (!authenticated && !authInProgress && transportReady) authenticateCharger();
+                  }
 
                   @Override public void onCharacteristicWrite(BluetoothGatt gg, BluetoothGattCharacteristic characteristic, int status) {
                       txBusy = false;
@@ -403,7 +416,7 @@ jobs:
 
                   if (hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("ABB Terra Direct Secure 3.8 started");
+                      appendLog("ABB Terra Direct Secure 3.9 started");
                       appendLog("Saved authorization found. Opening commissioning screen.");
                   } else {
                       showLoginScreen();
@@ -553,8 +566,8 @@ jobs:
                   ocppCard.addView(requiresPassword);
 
                   TextView hint = text(
-                          "READ ALL reads Wi-Fi, DHCP/static, network status and OCPP data. "
-                          +"APPLY ALL tries OCPP compatibility variants first, then writes network even if OCPP is rejected.",
+                          "READ ALL shows values actually stored in charger. APPLY ALL writes OCPP, sets Wi-Fi TCP/IP to DHCP, "
+                          +"writes SSID/password, then verifies the actual SSID from E4 after reconnect.",
                           11,false,MUTED);
                   hint.setPadding(0,dp(4),0,dp(8));
                   ocppCard.addView(hint);
@@ -681,7 +694,7 @@ jobs:
                           runOnUiThread(() -> {
                               adminPassword.setText("");
                               buildUi();
-                              appendLog("ABB Terra Direct Secure 3.8 started");
+                              appendLog("ABB Terra Direct Secure 3.9 started");
                               appendLog("LOGIN SUCCESS. Authorization stored securely; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -786,6 +799,14 @@ jobs:
               }
 
               private void authenticateCharger() {
+                  if (authInProgress) {
+                      appendLog("AUTH ignored: secure authentication already in progress.");
+                      return;
+                  }
+                  if (authenticated) {
+                      appendLog("AUTH ignored: secure session already authenticated.");
+                      return;
+                  }
                   if (!transportReady) { toast("Connect charger first."); return; }
                   String pin = chargerPin.getText().toString().trim();
                   if (pin.length() != 8) { toast("Charger PIN must be exactly 8 characters."); return; }
@@ -799,11 +820,13 @@ jobs:
                       return;
                   }
 
+                  authInProgress=true;
                   authenticated=false;
                   encryptedMode=false;
                   sessionToken=new byte[8];
                   updateButtons();
                   progress("Secure session",false,"Requesting cipher with charger PIN...");
+                  progress("Authentication",false,"Starting secure authentication...");
                   setStatus("Authenticating charger",deviceNumber+" • FW "+firmwareVersion);
 
                   new Thread(() -> {
@@ -811,13 +834,14 @@ jobs:
                           ensureUserId();
                           fetchCipherWithPin(pin);
                           runOnUiThread(() -> {
+                              if (!authInProgress || authenticated) return;
                               progress("Authorization",true,"PIN authorized");
                               progress("Secure session",true,"Cipher loaded");
-                              // Secure Terra AC firmware encrypts the 0xFE handshake itself.
                               encryptedMode=true;
                               startHandshake1();
                           });
                       } catch(Exception e) {
+                          authInProgress=false;
                           appendLog("PIN/CIPHER ERROR: " + safeError(e));
                           failStatus("PIN authorization failed",safeError(e));
                           updateButtons();
@@ -995,23 +1019,30 @@ jobs:
                       try {
                           requirePacketOk(p,"Sync time");
                           authenticated=true;
+                          authInProgress=false;
                           internetReady=false;
                           progress("Authentication",true,"Secure charger session active");
                           progress("Secure session",true,"AES-GCM active");
                           progress("Internet connection",false,"Ready to edit / apply");
                           progress("OCPP configuration",false,"Ready to edit / apply");
-                          setOcppUiEnabled(true);setOcppUiEnabled(true);
+                          setOcppUiEnabled(true);
                           loadLocalProfile();
                           setStatus("CHARGER AUTHENTICATED",
-                                  deviceNumber+" • secure session ready • beep/acknowledgement confirmed");
+                                  deviceNumber+" • secure session ready");
                           appendLog("AUTH SUCCESS. Secure BLE handshake + SYNC_TIME complete.");
                           updateButtons();
-                          main.postDelayed(this::readCurrentConfig,450);
+
+                          // Exactly one automatic READ ALL after a complete authentication.
+                          main.postDelayed(() -> {
+                              if (authenticated && !authInProgress && !readInProgress)
+                                  readCurrentConfig();
+                          },650);
                       } catch(Exception e) { authFailed(e); }
                   });
               }
 
               private void authFailed(Exception e) {
+                  authInProgress=false;
                   authenticated=false;
                   encryptedMode=false;
                   progress("Authentication",false,safeError(e));
@@ -1039,31 +1070,58 @@ jobs:
                   return (payload[1]&0xff)|((payload[2]&0xff)<<8);
               }
 
-              private void enableConnectionMode(int mode,Runnable onSuccess) {
-                  byte[] payload=new byte[]{(byte)(mode&0xff),0x00};
+              private byte[] buildDhcpPayload(int interfaceType) {
+                  // Same 18-byte layout returned by AA:
+                  // [0] interface 1=Wi-Fi, 2=Ethernet
+                  // [1] IP mode 0=DHCP, 1=Static
+                  // [2..17] IP/mask/gateway/DNS; zeros for DHCP.
+                  byte[] out=new byte[18];
+                  out[0]=(byte)(interfaceType&0xff);
+                  out[1]=0x00;
+                  return out;
+              }
 
+              private void configureDhcpBeforeNetworkWrite(int interfaceType,Runnable next) {
+                  byte[] payload=buildDhcpPayload(interfaceType);
+                  String name=interfaceType==1?"Wi-Fi":"Ethernet";
+                  appendLog("TX AB TCPIP interface="+name+" mode=DHCP payload="+hex(payload));
+                  progress("Internet connection",false,"Setting "+name+" TCP/IP to DHCP...");
+
+                  sendEncrypted(CMD_CONFIGURE_TCPIP,payload,p -> {
+                      try {
+                          requirePacketOk(p,"Configure TCP/IP DHCP");
+                          int detail=parseConfigDetail(p.payload);
+                          appendLog("RX AB TCPIP payload="+hex(p.payload)+" detail=0x"
+                                  +String.format(Locale.US,"%04X",detail));
+                          // Some firmware returns a short/empty success body. Only a non-zero
+                          // 3-byte detail is treated as warning, not a blocker for D2.
+                          if (p.payload!=null && p.payload.length>=3 && detail!=0)
+                              appendLog("AB DHCP warning detail=0x"+String.format(Locale.US,"%04X",detail)
+                                      +"; continuing with Wi-Fi credentials.");
+                      } catch(Exception e) {
+                          appendLog("AB DHCP warning: "+safeError(e)+"; continuing with Wi-Fi credentials.");
+                      }
+                      if (next!=null) main.postDelayed(next,250);
+                  });
+              }
+
+              private void enableConnectionAuth(int mode,Runnable next) {
+                  // CE_AUTH payload format is confirmed by this charger: [mode, 0x00].
+                  // FW 2.1.0 accepted mode 6 for Wi-Fi in the 3.8 log.
+                  byte[] payload=new byte[]{(byte)(mode&0xff),0x00};
+                  String name=mode==NET_WIFI?"Wi-Fi":mode==NET_ETHERNET?"Ethernet":"mode "+mode;
+                  appendLog("TX CE_AUTH "+name+" mode="+mode);
                   sendEncrypted(CMD_CE_AUTH,payload,p -> {
                       try {
-                          requirePacketOk(p,"Enable connection mode");
-
-                          // CEAuthenticationResponse.process() reads payload byte 0 as its code.
+                          requirePacketOk(p,"CE connection authorization");
                           int ceCode=(p.payload!=null && p.payload.length>0)?(p.payload[0]&0xff):0;
-                          appendLog("RX CE_AUTH mode="+mode+" payload="+hex(p.payload)+" ceCode="+ceCode);
-
+                          appendLog("RX CE_AUTH payload="+hex(p.payload)+" ceCode="+ceCode);
                           if (ceCode!=0)
-                              throw new Exception("CE_AUTH rejected, code="+ceCode);
-
-                          String modeName=mode==NET_WIFI?"Wi-Fi":mode==NET_ETHERNET?"Ethernet":"mode "+mode;
-                          appendLog(modeName+" enabled on charger.");
-                          if (onSuccess!=null) main.postDelayed(onSuccess,350);
-
+                              appendLog("CE_AUTH warning code="+ceCode+"; continuing with network write.");
                       } catch(Exception e) {
-                          internetReady=false;
-                          setOcppUiEnabled(false);
-                          progress("Internet connection",false,safeError(e));
-                          failStatus("Connection enable failed",safeError(e));
-                          updateButtons();
+                          appendLog("CE_AUTH warning: "+safeError(e)+"; continuing with network write.");
                       }
+                      if (next!=null) main.postDelayed(next,250);
                   });
               }
 
@@ -1202,8 +1260,9 @@ jobs:
               }
 
               private void tryOcppVariant(String url,String cp,String key,
-                      int connectionPosition,String ssid,String wifiPass,int variant) {
-                  if (variant>=4) {
+                      int connectionPosition,String ssid,String wifiPass,int attempt) {
+                  final int[] order=new int[]{2,0,3,1};
+                  if (attempt>=order.length) {
                       lastOcppApplyOk=false;
                       lastOcppApplyMessage="All D6 compatibility variants rejected";
                       progress("OCPP configuration",false,lastOcppApplyMessage);
@@ -1212,10 +1271,11 @@ jobs:
                       return;
                   }
 
+                  final int variant=order[attempt];
                   try {
                       byte[] payload=buildOcppPayload(url,cp,key,variant);
-                      appendLog("TX OCPP D6 variant="+variant+" id="+cp+" url="+url
-                              +" auth="+(key.isEmpty()?"off":"on"));
+                      appendLog("TX OCPP D6 variant="+variant+" attempt="+(attempt+1)+"/"+order.length
+                              +" id="+cp+" url="+url+" auth="+(key.isEmpty()?"off":"on"));
 
                       sendEncrypted(CMD_OCPP,payload,p -> {
                           try {
@@ -1233,27 +1293,28 @@ jobs:
                                   lastOcppApplyOk=true;
                                   boolean carriesTag=(variant==0 || variant==2);
                                   lastOcppApplyMessage="Accepted variant "+variant
-                                          +(carriesTag?" (with Charger ID tag)":" (server fields; Charger ID will be verified by READ ALL)");
+                                          +(carriesTag?" (with Charger ID tag)":"");
                                   progress("OCPP configuration",true,lastOcppApplyMessage);
                                   appendLog("OCPP D6 accepted using variant="+variant+".");
+                                  pendingDesiredOcppUrl=url;
                                   saveLocalProfile();
                                   continueWithNetwork(connectionPosition,ssid,wifiPass);
                                   return;
                               }
 
-                              appendLog("OCPP variant "+variant+" rejected; trying next compatibility layout.");
+                              appendLog("OCPP variant "+variant+" rejected; trying next layout.");
                               main.postDelayed(() -> tryOcppVariant(url,cp,key,
-                                      connectionPosition,ssid,wifiPass,variant+1),250);
+                                      connectionPosition,ssid,wifiPass,attempt+1),250);
 
                           } catch(Exception e) {
                               appendLog("OCPP variant "+variant+" warning: "+safeError(e));
                               main.postDelayed(() -> tryOcppVariant(url,cp,key,
-                                      connectionPosition,ssid,wifiPass,variant+1),250);
+                                      connectionPosition,ssid,wifiPass,attempt+1),250);
                           }
                       });
                   } catch(Exception e) {
                       appendLog("OCPP variant "+variant+" build warning: "+safeError(e));
-                      tryOcppVariant(url,cp,key,connectionPosition,ssid,wifiPass,variant+1);
+                      tryOcppVariant(url,cp,key,connectionPosition,ssid,wifiPass,attempt+1);
                   }
               }
 
@@ -1265,88 +1326,90 @@ jobs:
               }
 
               private void applyWifiLast(String ssid,String password) {
-                  expectedNetworkMode=NET_WIFI;
-                  progress("Internet connection",false,"Enabling Wi-Fi...");
-                  appendLog("TX CE_AUTH enable Wi-Fi mode=6");
+                  expectedNetworkMode=1; // D3 enum: 1=Wi-Fi on FW 2.1.0
+                  pendingDesiredSsid=ssid;
+                  wifiWritePending=true;
+                  appendLog("WIFI APPLY target ssid="+ssid+" password=<hidden>");
+                  progress("Internet connection",false,"Preparing Wi-Fi DHCP...");
 
-                  enableConnectionMode(NET_WIFI,() -> {
-                      byte[] payload=buildWifiPayload(ssid,password);
-                      progress("Internet connection",false,"Saving Wi-Fi credentials LAST...");
-                      connectionStatus.setText(
-                              "Saving Wi-Fi to charger. Reboot is expected after this step.");
-                      appendLog("TX WIFI D2 ssid="+ssid+" password=<hidden>");
+                  // First explicitly configure Wi-Fi TCP/IP for DHCP (AB).
+                  // Then run the CE authorization step that this FW already accepted,
+                  // and finally write SSID/password with D2.
+                  configureDhcpBeforeNetworkWrite(1,() ->
+                      enableConnectionAuth(NET_WIFI,() -> sendWifiCredentialsForApply(ssid,password)));
+              }
 
-                      sendEncrypted(CMD_WIFI_CONFIG,payload,p -> {
-                          try {
-                              requirePacketOk(p,"Wi-Fi configuration");
-                              int detail=parseConfigDetail(p.payload);
+              private void sendWifiCredentialsForApply(String ssid,String password) {
+                  byte[] payload=buildWifiPayload(ssid,password);
+                  progress("Internet connection",false,"Writing Wi-Fi SSID/password...");
+                  connectionStatus.setText("Writing Wi-Fi "+ssid+" • DHCP. Charger may restart BLE/network.");
+                  appendLog("TX WIFI D2 ssid="+ssid+" password=<hidden> payloadLen="+payload.length);
 
-                              appendLog("RX WIFI D2 payload="+hex(p.payload)+" detail=0x"
+                  // Arm expected reboot BEFORE D2. FW 2.1.0 can restart/disconnect before
+                  // sending the D2 response, which happened in 3.8 after about 7 seconds.
+                  awaitingExpectedReboot=true;
+                  autoReconnectDeviceNumber=deviceNumber;
+                  saveLocalProfile();
+
+                  sendEncrypted(CMD_WIFI_CONFIG,payload,p -> {
+                      try {
+                          requirePacketOk(p,"Wi-Fi configuration");
+                          int detail=parseConfigDetail(p.payload);
+                          appendLog("RX WIFI D2 payload="+hex(p.payload)+" detail=0x"
+                                  +String.format(Locale.US,"%04X",detail));
+
+                          if (p.payload!=null && p.payload.length>=3 && detail!=0)
+                              throw new Exception("Wi-Fi configuration rejected, detail=0x"
                                       +String.format(Locale.US,"%04X",detail));
 
-                              if (detail!=0)
-                                  throw new Exception("Wi-Fi configuration rejected, detail=0x"
-                                          +String.format(Locale.US,"%04X",detail));
+                          progress("Internet connection",true,"Wi-Fi write accepted; verifying after restart");
+                          setStatus("WI-FI WRITE SENT",
+                                  "Waiting for restart/reconnect, then READ ALL verifies SSID from E4.");
+                          connectionStatus.setText("Wi-Fi write sent. Waiting for charger read-back verification...");
 
-                              progress("Internet connection",true,"Saved; reboot expected");
-                              saveLocalProfile();
+                          // Some firmware does not disconnect BLE. Verify in-place after grace period.
+                          main.postDelayed(() -> {
+                              if (authenticated && awaitingExpectedReboot && !readInProgress) {
+                                  appendLog("No BLE disconnect after D2; starting in-place verification.");
+                                  awaitingExpectedReboot=false;
+                                  readCurrentConfig();
+                              }
+                          },9000);
 
-                              awaitingExpectedReboot=true;
-                              autoReconnectDeviceNumber=deviceNumber;
-
-                              setStatus(lastOcppApplyOk?"CONFIGURATION SAVED":"NETWORK SAVED / OCPP NEEDS ATTENTION",
-                                      lastOcppApplyOk
-                                              ?"Waiting for charger reboot and automatic reconnect..."
-                                              :"Wi-Fi saved. OCPP was not accepted; READ ALL after reconnect and review D6 log.");
-                              connectionStatus.setText(
-                                      "✓ Saved. Waiting for reboot → reconnect → automatic read-back.");
-
-                              // If firmware only restarts the network stack, not BLE, read it back
-                              // after a short grace period without forcing another reboot.
-                              main.postDelayed(() -> {
-                                  if (authenticated && awaitingExpectedReboot) {
-                                      appendLog("No BLE disconnect detected; reading configuration in-place.");
-                                      awaitingExpectedReboot=false;
-                                      readCurrentConfig();
-                                      saveBtn.setEnabled(true);
-                                  }
-                              },9000);
-
-                          } catch(Exception e) {
+                      } catch(Exception e) {
+                          // If the charger rebooted, clearSession cancels this callback.
+                          // A real protocol error while still connected is shown here.
+                          if (gatt!=null && authenticated) {
                               awaitingExpectedReboot=false;
+                              wifiWritePending=false;
                               progress("Internet connection",false,safeError(e));
-                              failStatus("Wi-Fi save failed",safeError(e));
+                              failStatus("Wi-Fi write failed",safeError(e));
                               saveBtn.setEnabled(true);
                           }
-                      });
+                      }
                   });
               }
 
               private void applyEthernetLast() {
-                  expectedNetworkMode=NET_ETHERNET;
-                  progress("Internet connection",false,"Enabling Ethernet LAST...");
-                  connectionStatus.setText("Saving Ethernet mode to charger...");
+                  expectedNetworkMode=2;
+                  progress("Internet connection",false,"Preparing Ethernet DHCP...");
+                  connectionStatus.setText("Setting Ethernet DHCP / network mode...");
 
-                  enableConnectionMode(NET_ETHERNET,() -> {
-                      progress("Internet connection",true,"Ethernet enabled");
-                      saveLocalProfile();
-
-                      awaitingExpectedReboot=true;
-                      autoReconnectDeviceNumber=deviceNumber;
-
-                      setStatus(lastOcppApplyOk?"CONFIGURATION SAVED":"NETWORK SAVED / OCPP NEEDS ATTENTION",
-                              lastOcppApplyOk
-                                      ?"Waiting for charger reboot / network restart..."
-                                      :"Ethernet saved. OCPP was not accepted; READ ALL after reconnect.");
-
-                      main.postDelayed(() -> {
-                          if (authenticated && awaitingExpectedReboot) {
-                              awaitingExpectedReboot=false;
-                              readCurrentConfig();
-                              saveBtn.setEnabled(true);
-                          }
-                      },7000);
-                  });
+                  configureDhcpBeforeNetworkWrite(2,() ->
+                      enableConnectionAuth(NET_ETHERNET,() -> {
+                          progress("Internet connection",true,"Ethernet DHCP/mode command sent");
+                          saveLocalProfile();
+                          awaitingExpectedReboot=true;
+                          autoReconnectDeviceNumber=deviceNumber;
+                          setStatus(lastOcppApplyOk?"CONFIGURATION SAVED":"NETWORK SAVED / OCPP NEEDS ATTENTION",
+                                  "Waiting for charger network restart / read-back...");
+                          main.postDelayed(() -> {
+                              if (authenticated && awaitingExpectedReboot && !readInProgress) {
+                                  awaitingExpectedReboot=false;
+                                  readCurrentConfig();
+                              }
+                          },7000);
+                      }));
               }
 
               private void readCurrentConfig() {
@@ -1359,11 +1422,21 @@ jobs:
                       toast("Authenticate charger first.");
                       return;
                   }
+                  if (authInProgress) {
+                      appendLog("READ ALL delayed: authentication still in progress.");
+                      main.postDelayed(this::readCurrentConfig,700);
+                      return;
+                  }
+                  if (readInProgress) {
+                      appendLog("READ ALL ignored: another READ ALL is already running.");
+                      return;
+                  }
 
+                  readInProgress=true;
                   loadLocalProfile();
                   progress("Current configuration",false,"READ ALL in progress...");
                   setStatus("READING ALL CONFIGURATION",
-                          "B1/E4/AA/D3/DB/C5 • Wi-Fi, DHCP/static and OCPP");
+                          "E4/AA/D3/DB/C5 • Wi-Fi, DHCP/static and OCPP");
                   appendLog("READ ALL START: E4 -> AA -> D3 -> DB -> C5");
 
                   queryWifiInfo(() ->
@@ -1390,8 +1463,25 @@ jobs:
 
                           if (!ssid.isEmpty()) {
                               writeSecure(profileKey("wifi_ssid"),ssid);
-                              if (!password.isEmpty())
-                                  writeSecure(profileKey("wifi_password"),password);
+                              if (!password.isEmpty()) writeSecure(profileKey("wifi_password"),password);
+                          }
+
+                          if (wifiWritePending && !pendingDesiredSsid.isEmpty()) {
+                              if (pendingDesiredSsid.equals(ssid)) {
+                                  appendLog("WIFI VERIFY OK desired="+pendingDesiredSsid+" actual="+ssid);
+                                  progress("Internet connection",true,"Wi-Fi saved: "+ssid+" • DHCP requested");
+                                  connectionStatus.setText("✓ Wi-Fi verified from charger: "+ssid+" • DHCP");
+                                  wifiWritePending=false;
+                                  pendingDesiredSsid="";
+                              } else {
+                                  appendLog("WIFI VERIFY FAILED desired="+pendingDesiredSsid+" actual="+ssid);
+                                  progress("Internet connection",false,"Wi-Fi NOT saved; charger still reports "+ssid);
+                                  connectionStatus.setText("✕ Wi-Fi not changed. Charger actual SSID: "+ssid);
+                                  setStatus("WI-FI NOT SAVED",
+                                          "Requested "+pendingDesiredSsid+" but charger still reports "+ssid+". Check AP/password/2.4 GHz and log AB/D4/D2.");
+                                  wifiWritePending=false;
+                                  pendingDesiredSsid="";
+                              }
                           }
 
                       } catch(Exception e) {
@@ -1631,10 +1721,12 @@ jobs:
                       if (!cachedAuth.isEmpty()) authKey.setText(cachedAuth);
 
                       progress("Current configuration",true,"READ ALL complete");
-                      setStatus("CONFIGURATION LOADED",
-                              "Wi-Fi + DHCP/static + D3 status + OCPP read complete. "
-                              +"AuthKey is hidden by charger and restored only from encrypted local app storage when available.");
+                      if (!statusTitle.getText().toString().equals("WI-FI NOT SAVED")) {
+                          setStatus("CONFIGURATION LOADED",
+                                  "Wi-Fi + DHCP/static + D3 status + OCPP read complete. Values shown are read from charger.");
+                      }
                       appendLog("READ ALL COMPLETE");
+                      readInProgress=false;
                       saveBtn.setEnabled(authenticated);
                   });
               }
@@ -2228,6 +2320,8 @@ jobs:
               private void clearSession() {
                   transportReady=false;
                   authenticated=false;
+                  authInProgress=false;
+                  readInProgress=false;
                   encryptedMode=false;
                   internetReady=false;
                   expectedNetworkMode=0;
@@ -2362,8 +2456,8 @@ jobs:
               private void updateButtons() {
                   runOnUiThread(() -> {
                       disconnectBtn.setEnabled(gatt!=null);
-                      authBtn.setEnabled(transportReady && !authenticated);
-                      if (readConfigBtn!=null) readConfigBtn.setEnabled(authenticated);
+                      authBtn.setEnabled(transportReady && !authenticated && !authInProgress);
+                      if (readConfigBtn!=null) readConfigBtn.setEnabled(authenticated && !authInProgress && !readInProgress);
                       verifyBtn.setEnabled(authenticated);
                       setOcppUiEnabled(authenticated);
                   });
@@ -2616,14 +2710,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-3.8.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-3.9.apk
           cd artifact
-          sha256sum ABB-Terra-Direct-Secure-3.8.apk | tee ABB-Terra-Direct-Secure-3.8.apk.sha256
+          sha256sum ABB-Terra-Direct-Secure-3.9.apk | tee ABB-Terra-Direct-Secure-3.9.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ABB-Terra-Direct-Secure-3.8
+          name: ABB-Terra-Direct-Secure-3.9
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
