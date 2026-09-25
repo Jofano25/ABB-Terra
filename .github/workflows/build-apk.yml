@@ -1,4 +1,4 @@
-name: Build ABB Terra Direct Secure 3.3
+name: Build ABB Terra Direct Secure 3.4
 
 on:
   workflow_dispatch:
@@ -79,8 +79,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 330
-                  versionName '3.3-direct-secure'
+                  versionCode 340
+                  versionName '3.4-direct-secure'
               }
 
               buildTypes {
@@ -174,9 +174,9 @@ jobs:
               private static final int CMD_AUTH = 0xFE;
               private static final int CMD_SYNC_TIME = 0xB0;
               private static final int CMD_SYSINFO = 0xB1;
+              private static final int CMD_CE_AUTH = 0xCE;
               private static final int CMD_WIFI_CONFIG = 0xD2;
               private static final int CMD_NETWORK_STATUS = 0xD3;
-              private static final int CMD_CHANGE_NET_MODE = 0xD4;
               private static final int CMD_OCPP = 0xD6;
               private static final int CMD_OCPP_STATUS = 0xD8;
 
@@ -226,6 +226,7 @@ jobs:
 
               private TextView statusTitle, statusDetail, selectedDevice, logText, adminStatus, connectionStatus;
               private LinearLayout deviceList, progressBox, adminFields, wifiFields, ocppCard;
+              private View mainContent;
               private EditText chargerPin, wifiSsid, wifiPassword, chargePointId, serverUrl, authKey, adminEmail, adminPassword;
               private CheckBox requiresPassword;
               private Spinner connectionType;
@@ -358,15 +359,17 @@ jobs:
                   super.onCreate(savedInstanceState);
                   prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
                   getWindow().setStatusBarColor(Color.rgb(6,16,28));
-                  buildUi();
-
                   BluetoothManager bm = (BluetoothManager)getSystemService(BLUETOOTH_SERVICE);
                   adapter = bm == null ? null : bm.getAdapter();
                   requestPerms();
 
-                  updateAdminState();
-                  appendLog("ABB Terra Direct Secure 3.3 started");
-                  appendLog("Daily operation: PIN → secure BLE → SAVE INTERNET CONNECTION → custom OCPP. Handshake result byte 0x00 = accepted.");
+                  if (hasSavedAuthorization()) {
+                      buildUi();
+                      appendLog("ABB Terra Direct Secure 3.4 started");
+                      appendLog("Saved authorization found. Opening commissioning screen.");
+                  } else {
+                      showLoginScreen();
+                  }
               }
 
               private void buildUi() {
@@ -384,11 +387,34 @@ jobs:
                   root.setPadding(dp(16), dp(18), dp(16), dp(30));
                   sv.addView(root, new ScrollView.LayoutParams(-1,-2));
 
-                  root.addView(text("ABB TERRA", 27, true, WHITE));
+                  LinearLayout header = new LinearLayout(this);
+                  header.setOrientation(LinearLayout.HORIZONTAL);
+                  header.setGravity(Gravity.CENTER_VERTICAL);
+
+                  LinearLayout brand = new LinearLayout(this);
+                  brand.setOrientation(LinearLayout.VERTICAL);
+                  brand.addView(text("ABB TERRA", 27, true, WHITE));
                   TextView sub = text("DIRECT COMMISSIONING", 13, true, ACCENT);
                   sub.setLetterSpacing(.18f);
-                  sub.setPadding(0,0,0,dp(14));
-                  root.addView(sub);
+                  brand.addView(sub);
+
+                  Button logout = button("LOGOUT", SECONDARY, WHITE);
+                  header.addView(brand,new LinearLayout.LayoutParams(0,-2,1));
+                  header.addView(logout,new LinearLayout.LayoutParams(dp(92),dp(44)));
+                  root.addView(header);
+
+                  String account=readSecure("account_email");
+                  TextView signed = text(account.isEmpty()
+                          ?"Installer authorization active"
+                          :"Authorized: "+account,11,false,MUTED);
+                  signed.setPadding(0,dp(4),0,dp(12));
+                  root.addView(signed);
+
+                  logout.setOnClickListener(v -> {
+                      disconnect();
+                      clearAuthorization();
+                      showLoginScreen();
+                  });
 
                   LinearLayout statusCard = card(CARD);
                   statusTitle = text("READY", 19, true, WHITE);
@@ -431,7 +457,7 @@ jobs:
                   root.addView(access, cardLp());
 
                   LinearLayout internet = card(CARD);
-                  internet.addView(section("INTERNET CONNECTION • SAVE FIRST", ACCENT));
+                  internet.addView(section("CHARGER INTERNET CONNECTION • SAVE FIRST", ACCENT));
 
                   connectionType = new Spinner(this);
                   ArrayAdapter<String> connectionAdapter = new ArrayAdapter<>(
@@ -450,13 +476,13 @@ jobs:
                   wifiFields.addView(labeled("Wi-Fi Password", wifiPassword, MUTED));
                   internet.addView(wifiFields);
 
-                  connectionStatus = text("Not saved. OCPP configuration is locked.", 12, true, MUTED);
+                  connectionStatus = text("Not saved to charger. OCPP configuration is locked.", 12, true, MUTED);
                   connectionStatus.setPadding(0,dp(8),0,dp(8));
                   internet.addView(connectionStatus);
 
                   LinearLayout internetButtons = new LinearLayout(this);
                   internetButtons.setOrientation(LinearLayout.HORIZONTAL);
-                  saveConnectionBtn = button("SAVE CONNECTION", ACCENT, Color.rgb(4,35,38));
+                  saveConnectionBtn = button("SAVE TO CHARGER", ACCENT, Color.rgb(4,35,38));
                   checkConnectionBtn = button("CHECK STATUS", SECONDARY, WHITE);
                   internetButtons.addView(saveConnectionBtn, new LinearLayout.LayoutParams(0,dp(54),1));
                   LinearLayout.LayoutParams cslp = new LinearLayout.LayoutParams(0,dp(54),1);
@@ -470,7 +496,7 @@ jobs:
                           internetReady=false;
                           expectedNetworkMode=0;
                           setOcppUiEnabled(false);
-                          connectionStatus.setText("Connection changed. Press SAVE CONNECTION.");
+                          connectionStatus.setText("Connection changed. Press SAVE TO CHARGER.");
                       }
                       @Override public void onNothingSelected(AdapterView<?> parent) {}
                   });
@@ -526,39 +552,6 @@ jobs:
                   verifyBtn.setOnClickListener(v -> verifySession());
                   root.addView(progressCard, cardLp());
 
-                  LinearLayout admin = card(CARD);
-                  admin.addView(section("ADMIN AUTHORIZATION • ONE TIME", ACCENT));
-                  adminStatus = text("", 12, false, MUTED);
-                  admin.addView(adminStatus);
-
-                  adminToggle = button("SHOW ADMIN SETUP", SECONDARY, WHITE);
-                  admin.addView(adminToggle, new LinearLayout.LayoutParams(-1,dp(48)));
-
-                  adminFields = new LinearLayout(this);
-                  adminFields.setOrientation(LinearLayout.VERTICAL);
-                  adminFields.setVisibility(View.GONE);
-                  adminEmail = input("installer@example.com", WHITE, MUTED);
-                  adminPassword = input("ABB account password", WHITE, MUTED);
-                  adminPassword.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-                  adminFields.addView(labeled("ABB TerraConfig account email", adminEmail, MUTED));
-                  adminFields.addView(labeled("Password • used only during authorization and never stored", adminPassword, MUTED));
-                  adminLogin = button("AUTHORIZE THIS APP", ACCENT, Color.rgb(4,35,38));
-                  adminClear = button("CLEAR SAVED AUTHORIZATION", SECONDARY, WHITE);
-                  adminFields.addView(adminLogin, new LinearLayout.LayoutParams(-1,dp(52)));
-                  LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(-1,dp(48));
-                  clp.setMargins(0,dp(7),0,0);
-                  adminFields.addView(adminClear, clp);
-                  admin.addView(adminFields);
-                  root.addView(admin, cardLp());
-
-                  adminToggle.setOnClickListener(v -> {
-                      boolean show = adminFields.getVisibility() != View.VISIBLE;
-                      adminFields.setVisibility(show ? View.VISIBLE : View.GONE);
-                      adminToggle.setText(show ? "HIDE ADMIN SETUP" : "SHOW ADMIN SETUP");
-                  });
-                  adminLogin.setOnClickListener(v -> authorizeAdmin());
-                  adminClear.setOnClickListener(v -> clearAuthorization());
-
                   LinearLayout debug = card(CARD);
                   debug.addView(section("ADVANCED / DEBUG LOG", ACCENT));
                   logText = text("",10,false,Color.rgb(180,205,220));
@@ -572,6 +565,69 @@ jobs:
 
                   setContentView(sv);
                   updateButtons();
+              }
+
+              private void showLoginScreen() {
+                  final int BG = Color.rgb(6,16,28);
+                  final int CARD = Color.rgb(13,30,47);
+                  final int ACCENT = Color.rgb(44,220,199);
+                  final int MUTED = Color.rgb(153,177,194);
+                  final int WHITE = Color.rgb(239,248,252);
+
+                  ScrollView sv=new ScrollView(this);
+                  sv.setFillViewport(true);
+                  sv.setBackgroundColor(BG);
+
+                  LinearLayout root=new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setGravity(Gravity.CENTER_HORIZONTAL);
+                  root.setPadding(dp(20),dp(48),dp(20),dp(30));
+                  sv.addView(root,new ScrollView.LayoutParams(-1,-1));
+
+                  TextView title=text("ABB TERRA",30,true,WHITE);
+                  root.addView(title);
+
+                  TextView sub=text("INSTALLER LOGIN",14,true,ACCENT);
+                  sub.setLetterSpacing(.16f);
+                  sub.setPadding(0,0,0,dp(26));
+                  root.addView(sub);
+
+                  LinearLayout loginCard=card(CARD);
+                  loginCard.addView(section("SECURE AUTHORIZATION",ACCENT));
+
+                  TextView info=text(
+                          "Login diperlukan untuk mendapatkan authorization/cipher resmi ABB. "
+                          +"Password hanya dipakai saat login dan tidak disimpan. Setelah authorization tersimpan, "
+                          +"pemakaian berikutnya langsung masuk ke halaman commissioning.",
+                          12,false,MUTED);
+                  info.setPadding(0,0,0,dp(12));
+                  loginCard.addView(info);
+
+                  adminEmail=input("TerraConfig / ABB installer email",WHITE,MUTED);
+                  adminPassword=input("Password",WHITE,MUTED);
+                  adminPassword.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_VARIATION_PASSWORD);
+
+                  loginCard.addView(labeled("Installer Email",adminEmail,MUTED));
+                  loginCard.addView(labeled("Password",adminPassword,MUTED));
+
+                  adminStatus=text("Not authorized",12,false,MUTED);
+                  adminStatus.setPadding(0,dp(8),0,dp(8));
+                  loginCard.addView(adminStatus);
+
+                  adminLogin=button("LOGIN & AUTHORIZE",ACCENT,Color.rgb(4,35,38));
+                  loginCard.addView(adminLogin,new LinearLayout.LayoutParams(-1,dp(56)));
+                  adminLogin.setOnClickListener(v -> authorizeAdmin());
+
+                  root.addView(loginCard,cardLp());
+
+                  TextView footer=text(
+                          "Setelah login berhasil, aplikasi menyimpan access/refresh authorization secara terenkripsi "
+                          +"di Android Keystore. Credential password tidak disimpan.",
+                          11,false,MUTED);
+                  footer.setPadding(dp(4),dp(14),dp(4),0);
+                  root.addView(footer);
+
+                  setContentView(sv);
               }
 
               private void authorizeAdmin() {
@@ -588,11 +644,12 @@ jobs:
                           adminPassword.setText("");
                           ensureUserId();
                           runOnUiThread(() -> {
-                              adminFields.setVisibility(View.GONE);
-                              adminToggle.setText("SHOW ADMIN SETUP");
-                              updateAdminState();
+                              adminPassword.setText("");
+                              buildUi();
+                              appendLog("ABB Terra Direct Secure 3.4 started");
+                              appendLog("LOGIN SUCCESS. Authorization stored securely; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
-                              toast("Authorization saved securely. Daily use now only needs charger PIN.");
+                              toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
                           });
                       } catch(Exception e) {
                           appendLog("ADMIN AUTH ERROR: " + safeError(e));
@@ -673,12 +730,15 @@ jobs:
               }
 
               private void updateAdminState() {
-                  boolean ok = hasSavedAuthorization();
-                  String email = readSecure("account_email");
-                  adminStatus.setText(ok
-                          ? "✓ Authorization saved" + (email.isEmpty() ? "" : " for " + email) + ". Password is not stored."
-                          : "Not authorized yet. Open this section once, login, then daily operation only uses charger PIN.");
-                  progress("Authorization",ok,ok ? "Saved token ready" : "One-time setup required");
+                  boolean ok=hasSavedAuthorization();
+                  String email=readSecure("account_email");
+                  if (adminStatus!=null) {
+                      adminStatus.setText(ok
+                              ?"✓ Authorization saved"+(email.isEmpty()?"":" for "+email)+". Password is not stored."
+                              :"Login is required.");
+                  }
+                  if (progressBox!=null)
+                      progress("Authorization",ok,ok?"Saved token ready":"Login required");
               }
 
               private void clearAuthorization() {
@@ -695,9 +755,8 @@ jobs:
                   String pin = chargerPin.getText().toString().trim();
                   if (pin.length() != 8) { toast("Charger PIN must be exactly 8 characters."); return; }
                   if (!hasSavedAuthorization()) {
-                      toast("One-time Admin Authorization is required first.");
-                      adminFields.setVisibility(View.VISIBLE);
-                      adminToggle.setText("HIDE ADMIN SETUP");
+                      toast("Installer login is required.");
+                      showLoginScreen();
                       return;
                   }
                   if (firmwareVersion.isEmpty()) {
@@ -946,11 +1005,16 @@ jobs:
                       }
 
                       byte[] payload=buildWifiPayload(ssid,password);
-                      progress("Internet connection",false,"Saving Wi-Fi credentials...");
-                      connectionStatus.setText("Saving Wi-Fi configuration...");
-                      appendLog("TX WIFI D2 ssid="+ssid+" password=<hidden>");
+                      progress("Internet connection",false,"Enabling Wi-Fi on charger...");
+                      connectionStatus.setText("Enabling Wi-Fi...");
+                      appendLog("TX CE_AUTH enable Wi-Fi mode=6");
 
-                      sendEncrypted(CMD_WIFI_CONFIG,payload,p -> {
+                      enableConnectionMode(NET_WIFI,() -> {
+                          progress("Internet connection",false,"Saving Wi-Fi credentials...");
+                          connectionStatus.setText("Wi-Fi enabled. Saving SSID/password to charger...");
+                          appendLog("TX WIFI D2 ssid="+ssid+" password=<hidden>");
+
+                          sendEncrypted(CMD_WIFI_CONFIG,payload,p -> {
                           try {
                               requirePacketOk(p,"Wi-Fi configuration");
                               int detail=parseConfigDetail(p.payload);
@@ -961,8 +1025,9 @@ jobs:
                                   throw new Exception("Wi-Fi configuration rejected, detail=0x"
                                           +String.format(Locale.US,"%04X",detail));
 
-                              connectionStatus.setText("Wi-Fi credentials saved. Switching network mode...");
-                              main.postDelayed(() -> changeNetworkMode(NET_WIFI),350);
+                              connectionStatus.setText("Wi-Fi credentials saved to charger. Checking internet...");
+                              progress("Internet connection",false,"Wi-Fi saved; waiting for network...");
+                              main.postDelayed(() -> queryNetworkStatus(0),1500);
                           } catch(Exception e) {
                               internetReady=false;
                               progress("Internet connection",false,safeError(e));
@@ -970,10 +1035,14 @@ jobs:
                               updateButtons();
                           }
                       });
+                      });
                   } else {
-                      progress("Internet connection",false,"Switching charger to Ethernet...");
-                      connectionStatus.setText("Switching to Ethernet...");
-                      changeNetworkMode(NET_ETHERNET);
+                      progress("Internet connection",false,"Enabling Ethernet on charger...");
+                      connectionStatus.setText("Enabling Ethernet...");
+                      enableConnectionMode(NET_ETHERNET,() -> {
+                          connectionStatus.setText("Ethernet enabled. Checking network status...");
+                          main.postDelayed(() -> queryNetworkStatus(0),1200);
+                      });
                   }
               }
 
@@ -997,30 +1066,29 @@ jobs:
                   return (payload[1]&0xff)|((payload[2]&0xff)<<8);
               }
 
-              private void changeNetworkMode(int mode) {
-                  sendEncrypted(CMD_CHANGE_NET_MODE,new byte[]{(byte)mode},p -> {
+              private void enableConnectionMode(int mode,Runnable onSuccess) {
+                  byte[] payload=new byte[]{(byte)(mode&0xff),0x00};
+
+                  sendEncrypted(CMD_CE_AUTH,payload,p -> {
                       try {
-                          requirePacketOk(p,"Change network mode");
-                          int detail=parseConfigDetail(p.payload);
-                          appendLog("RX D4 mode="+mode+" payload="+hex(p.payload)+" detail=0x"
-                                  +String.format(Locale.US,"%04X",detail));
+                          requirePacketOk(p,"Enable connection mode");
 
-                          if (detail!=0) {
-                              String msg=detail==0x0101
-                                      ?"network mode start failed"
-                                      : detail==0x0201
-                                      ?"unknown network mode error"
-                                      :"network detail=0x"+String.format(Locale.US,"%04X",detail);
-                              throw new Exception(msg);
-                          }
+                          // CEAuthenticationResponse.process() reads payload byte 0 as its code.
+                          int ceCode=(p.payload!=null && p.payload.length>0)?(p.payload[0]&0xff):0;
+                          appendLog("RX CE_AUTH mode="+mode+" payload="+hex(p.payload)+" ceCode="+ceCode);
 
-                          progress("Internet connection",false,"Connection saved; checking internet...");
-                          connectionStatus.setText("Connection saved. Checking network status...");
-                          main.postDelayed(() -> queryNetworkStatus(0),1500);
+                          if (ceCode!=0)
+                              throw new Exception("CE_AUTH rejected, code="+ceCode);
+
+                          String modeName=mode==NET_WIFI?"Wi-Fi":mode==NET_ETHERNET?"Ethernet":"mode "+mode;
+                          appendLog(modeName+" enabled on charger.");
+                          if (onSuccess!=null) main.postDelayed(onSuccess,350);
+
                       } catch(Exception e) {
                           internetReady=false;
+                          setOcppUiEnabled(false);
                           progress("Internet connection",false,safeError(e));
-                          failStatus("Network mode save failed",safeError(e));
+                          failStatus("Connection enable failed",safeError(e));
                           updateButtons();
                       }
                   });
@@ -1074,8 +1142,8 @@ jobs:
                               return;
                           }
 
-                          if (!success && !isHardNetworkError(detail) && attempt<5) {
-                              connectionStatus.setText("Waiting for network... "+(attempt+1)+"/6 • "+detailText);
+                          if (!success && !isHardNetworkError(detail) && attempt<11) {
+                              connectionStatus.setText("Waiting for network... "+(attempt+1)+"/12 • "+detailText);
                               main.postDelayed(() -> queryNetworkStatus(attempt+1),2000);
                               return;
                           }
@@ -1089,7 +1157,7 @@ jobs:
                           updateButtons();
 
                       } catch(Exception e) {
-                          if (attempt<5) {
+                          if (attempt<11) {
                               main.postDelayed(() -> queryNetworkStatus(attempt+1),1800);
                           } else {
                               internetReady=false;
@@ -2016,14 +2084,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-3.3.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-3.4.apk
           cd artifact
-          sha256sum ABB-Terra-Direct-Secure-3.3.apk | tee ABB-Terra-Direct-Secure-3.3.apk.sha256
+          sha256sum ABB-Terra-Direct-Secure-3.4.apk | tee ABB-Terra-Direct-Secure-3.4.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ABB-Terra-Direct-Secure-3.3
+          name: ABB-Terra-Direct-Secure-3.4
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
