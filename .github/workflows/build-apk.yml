@@ -1,4 +1,4 @@
-name: Build ABB Terra Direct Secure 4.3 WIFI-CE-D2-LONGTIMEOUT
+name: Build ABB Terra Direct Secure 4.4 BASIC-AUTH-ENABLE
 
 on:
   workflow_dispatch:
@@ -80,7 +80,7 @@ jobs:
                   minSdk 23
                   targetSdk 35
                   versionCode 430
-                  versionName '4.3-wifi-ce-d2-longtimeout-fw210'
+                  versionName '4.4-basic-auth-enable-fw210'
               }
 
               buildTypes {
@@ -435,7 +435,7 @@ jobs:
 
                   if (hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("ABB Terra Direct Secure 4.3 started");
+                      appendLog("ABB Terra Direct Secure 4.4 started");
                       appendLog("Saved authorization found. Opening commissioning screen.");
                   } else {
                       showLoginScreen();
@@ -585,8 +585,9 @@ jobs:
                   ocppCard.addView(requiresPassword);
 
                   TextView hint = text(
-                          "READ ALL shows values actually stored in charger. APPLY ALL writes OCPP, sets Wi-Fi TCP/IP to DHCP, "
-                          +"writes SSID/password, then verifies the actual SSID from E4 after reconnect.",
+                          "READ ALL shows values actually stored in charger. If Server requires password / AuthKey is checked, "
+                          +"APPLY ALL writes AuthorizationKey and enables HTTP Basic Auth on the charger, then writes OCPP and Wi-Fi. "
+                          +"For SteVe use Security Profile 1 with the same password. If unchecked, HTTP Basic Auth is disabled.",
                           11,false,MUTED);
                   hint.setPadding(0,dp(4),0,dp(8));
                   ocppCard.addView(hint);
@@ -713,7 +714,7 @@ jobs:
                           runOnUiThread(() -> {
                               adminPassword.setText("");
                               buildUi();
-                              appendLog("ABB Terra Direct Secure 4.3 started");
+                              appendLog("ABB Terra Direct Secure 4.4 started");
                               appendLog("LOGIN SUCCESS. Authorization stored securely; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -1295,6 +1296,16 @@ jobs:
                       toast("AuthKey is required.");
                       return;
                   }
+                  if (requiresPassword.isChecked()) {
+                      int authBytes=key.getBytes(StandardCharsets.UTF_8).length;
+                      if (authBytes<16 || authBytes>20) {
+                          String m="ABB Terra AuthorizationKey must be 16-20 bytes for this firmware. Current length="+authBytes;
+                          appendLog("BASIC AUTH PREFLIGHT BLOCKED: "+m);
+                          failStatus("AUTHKEY INVALID",m);
+                          toast(m);
+                          return;
+                      }
+                  }
                   if (connectionPosition==0 && ssid.trim().isEmpty()) {
                       toast("Wi-Fi SSID is required.");
                       return;
@@ -1377,7 +1388,8 @@ jobs:
                                   appendLog("OCPP D6 accepted using variant="+variant+".");
                                   pendingDesiredOcppUrl=url;
                                   saveLocalProfile();
-                                  continueWithNetwork(connectionPosition,ssid,wifiPass);
+                                  configureHttpBasicAuthForApply(!key.isEmpty(),key,
+                                          connectionPosition,ssid,wifiPass);
                                   return;
                               }
 
@@ -1402,6 +1414,71 @@ jobs:
                       applyWifiLast(ssid,wifiPass);
                   else
                       applyEthernetLast();
+              }
+
+              private void configureHttpBasicAuthForApply(boolean enable,String key,
+                      int connectionPosition,String ssid,String wifiPass) {
+                  progress("OCPP Basic Auth",false,enable?"Enabling HTTP Basic Auth...":"Disabling HTTP Basic Auth...");
+                  appendLog("BASIC AUTH APPLY enable="+enable
+                          +" authKeyBytes="+(enable?key.getBytes(StandardCharsets.UTF_8).length:0)
+                          +" username="+chargePointId.getText().toString().trim());
+
+                  // ABB documents HTTPBasicAuthEnable as a RW boolean OCPP key.
+                  // TerraConfig's local BLE C5 write uses sub-command 0x02 + JSON
+                  // and [51,value] for writable persistent values. Firmware families
+                  // may expose the same setting by internal snake_case or by its
+                  // OCPP-facing key name, so try both. AuthorizationKey itself is
+                  // already carried by the accepted D6 OCPP payload and is not logged.
+                  tryBasicAuthC5Variant(enable,key,connectionPosition,ssid,wifiPass,0);
+              }
+
+              private void tryBasicAuthC5Variant(boolean enable,String key,
+                      int connectionPosition,String ssid,String wifiPass,int attempt) {
+                  final String[] names=new String[]{
+                          "http_basic_auth_enable",
+                          "HTTPBasicAuthEnable"
+                  };
+
+                  if (attempt>=names.length) {
+                      appendLog("BASIC AUTH C5 write attempts complete. Final verification is the SteVe WebSocket handshake.");
+                      progress("OCPP Basic Auth",true,enable?"Enable command sent":"Disable command sent");
+                      continueWithNetwork(connectionPosition,ssid,wifiPass);
+                      return;
+                  }
+
+                  final String configKey=names[attempt];
+                  try {
+                      JSONObject root=new JSONObject();
+                      JSONArray arr=new JSONArray();
+                      arr.put(51);
+                      arr.put(enable?1:0);
+                      root.put(configKey,arr);
+
+                      byte[] json=root.toString().getBytes(StandardCharsets.UTF_8);
+                      byte[] payload=concat(new byte[]{0x02},json);
+                      appendLog("TX C5 BASIC_AUTH variant="+(attempt+1)
+                              +" key="+configKey+" value="+(enable?1:0)
+                              +" payloadLen="+payload.length);
+
+                      sendEncrypted(CMD_READ_CONFIGURATION,payload,p -> {
+                          try {
+                              requirePacketOk(p,"C5 Basic Auth write "+configKey);
+                              String ascii=printableUtf8(p.payload);
+                              appendLog("RX C5 BASIC_AUTH key="+configKey
+                                      +" payload="+hex(p.payload)
+                                      +(ascii.isEmpty()?"":" text="+compact(ascii)));
+                          } catch(Exception e) {
+                              appendLog("C5 BASIC_AUTH variant "+(attempt+1)+" warning: "+safeError(e));
+                          }
+
+                          main.postDelayed(() -> tryBasicAuthC5Variant(enable,key,
+                                  connectionPosition,ssid,wifiPass,attempt+1),220);
+                      });
+                  } catch(Exception e) {
+                      appendLog("C5 BASIC_AUTH build warning variant="+(attempt+1)+": "+safeError(e));
+                      main.postDelayed(() -> tryBasicAuthC5Variant(enable,key,
+                              connectionPosition,ssid,wifiPass,attempt+1),220);
+                  }
               }
 
               private void applyWifiLast(String ssid,String password) {
@@ -1853,6 +1930,13 @@ jobs:
                                   String id=findConfigValue(j,"charger_identity");
                                   if (id.isEmpty()) id=findConfigValue(j,"charge_point_id");
                                   String url=findConfigValue(j,"server_a_ip_address");
+                                  String basicAuth=findConfigValue(j,"HTTPBasicAuthEnable");
+                                  if (basicAuth.isEmpty()) basicAuth=findConfigValue(j,"http_basic_auth_enable");
+                                  if (!basicAuth.isEmpty()) {
+                                      boolean on="1".equals(basicAuth) || "true".equalsIgnoreCase(basicAuth);
+                                      requiresPassword.setChecked(on);
+                                      appendLog("READ C5 HTTPBasicAuthEnable="+basicAuth);
+                                  }
                                   if (!id.isEmpty()) {
                                       chargePointId.setText(id);
                                       appendLog("READ C5 charger identity="+id);
@@ -2868,14 +2952,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-4.3.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-4.4.apk
           cd artifact
-          sha256sum ABB-Terra-Direct-Secure-4.3.apk | tee ABB-Terra-Direct-Secure-4.3.apk.sha256
+          sha256sum ABB-Terra-Direct-Secure-4.4.apk | tee ABB-Terra-Direct-Secure-4.4.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ABB-Terra-Direct-Secure-4.3
+          name: ABB-Terra-Direct-Secure-4.4
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
