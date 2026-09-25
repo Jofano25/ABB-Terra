@@ -1,4 +1,4 @@
-name: Build ABB Terra Direct Secure FIX
+name: Build ABB Terra Direct Secure 3.2
 
 on:
   workflow_dispatch:
@@ -79,8 +79,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 310
-                  versionName '3.1-direct-secure'
+                  versionCode 320
+                  versionName '3.2-direct-secure'
               }
 
               buildTypes {
@@ -355,8 +355,8 @@ jobs:
                   requestPerms();
 
                   updateAdminState();
-                  appendLog("ABB Terra Direct Secure 3.1 started");
-                  appendLog("Daily operation: PIN + direct secure BLE. Secure 0xFE authentication is AES-GCM from handshake step 1.");
+                  appendLog("ABB Terra Direct Secure 3.2 started");
+                  appendLog("Daily operation: PIN + direct secure BLE. Secure 0xFE authentication is AES-GCM from handshake step 1. Handshake result byte 0x00 = accepted.");
               }
 
               private void buildUi() {
@@ -740,7 +740,8 @@ jobs:
                               int idx=p.payload[0]&0xff;
                               int result=p.payload[1]&0xff;
                               if (idx!=1) throw new Exception("Unexpected handshake index "+idx);
-                              if (result==0) throw new Exception("Handshake 1 rejected.");
+                              // Secure Terra firmware returns 0x00 for an accepted handshake step.
+                              if (result!=0) throw new Exception("Handshake 1 rejected. result="+result);
 
                               byte[] echoed=Arrays.copyOfRange(p.payload,2,18);
                               byte[] serverNonce=Arrays.copyOfRange(p.payload,18,34);
@@ -750,7 +751,7 @@ jobs:
                               if (isAllZero(serverNonce))
                                   throw new Exception("Handshake 1 server nonce missing.");
 
-                              appendLog("Handshake 1 OK");
+                              appendLog("Handshake 1 OK result="+result+"; client nonce verified; server nonce received.");
                               startHandshake2(serverNonce);
                           } catch(Exception e) { authFailed(e); }
                       });
@@ -769,14 +770,14 @@ jobs:
 
                           int idx=p.payload[0]&0xff;
                           int result=p.payload[1]&0xff;
-                          if (idx!=2 || result!=1)
+                          if (idx!=2 || result!=0)
                               throw new Exception("Handshake 2 rejected. idx="+idx+" result="+result);
 
                           if (p.token==null || p.token.length!=8 || isAllZero(p.token))
                               throw new Exception("Handshake 2 session token missing.");
 
                           sessionToken=Arrays.copyOf(p.token,8);
-                          appendLog("Handshake 2 OK; session token received.");
+                          appendLog("Handshake 2 OK result="+result+"; session token received.");
                           startHandshake3();
                       } catch(Exception e) { authFailed(e); }
                   });
@@ -803,13 +804,13 @@ jobs:
 
                           int idx=p.payload[0]&0xff;
                           int result=p.payload[1]&0xff;
-                          if (idx!=3 || result!=1)
+                          if (idx!=3 || result!=0)
                               throw new Exception("Handshake 3 rejected. idx="+idx+" result="+result);
 
                           if (p.token!=null && p.token.length==8 && !isAllZero(p.token))
                               sessionToken=Arrays.copyOf(p.token,8);
 
-                          appendLog("Handshake 3 OK; secure application session established.");
+                          appendLog("Handshake 3 OK result="+result+"; secure application session established.");
                           querySysInfo();
                       } catch(Exception e) { authFailed(e); }
                   });
@@ -1726,14 +1727,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-3.1.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-3.2.apk
           cd artifact
-          sha256sum ABB-Terra-Direct-Secure-3.1.apk | tee ABB-Terra-Direct-Secure-3.1.apk.sha256
+          sha256sum ABB-Terra-Direct-Secure-3.2.apk | tee ABB-Terra-Direct-Secure-3.2.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ABB-Terra-Direct-Secure-3.1
+          name: ABB-Terra-Direct-Secure-3.2
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
