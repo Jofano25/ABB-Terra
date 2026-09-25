@@ -1,4 +1,4 @@
-name: Build ABB Terra Direct Secure 4.0 WIFI-ROLLBACK-FIX
+name: Build ABB Terra Direct Secure 4.1 WIFI-AA-ENUM-FIX
 
 on:
   workflow_dispatch:
@@ -80,7 +80,7 @@ jobs:
                   minSdk 23
                   targetSdk 35
                   versionCode 400
-                  versionName '4.0-wifi-rollback-fix-fw210'
+                  versionName '4.1-wifi-aa-enum-fix-fw210'
               }
 
               buildTypes {
@@ -213,6 +213,7 @@ jobs:
               private boolean internetReady = false;
               private int expectedNetworkMode = 0;
               private String lastTcpIpSummary = "";
+              private int lastAaInterfaceType = -1; // learned from AA read-back; FW 2.1.0 reports Wi-Fi as 0
               private boolean lastOcppApplyOk = false;
               private String lastOcppApplyMessage = "Not applied";
               private boolean awaitingExpectedReboot = false;
@@ -432,7 +433,7 @@ jobs:
 
                   if (hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("ABB Terra Direct Secure 4.0 started");
+                      appendLog("ABB Terra Direct Secure 4.1 started");
                       appendLog("Saved authorization found. Opening commissioning screen.");
                   } else {
                       showLoginScreen();
@@ -710,7 +711,7 @@ jobs:
                           runOnUiThread(() -> {
                               adminPassword.setText("");
                               buildUi();
-                              appendLog("ABB Terra Direct Secure 4.0 started");
+                              appendLog("ABB Terra Direct Secure 4.1 started");
                               appendLog("LOGIN SUCCESS. Authorization stored securely; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -1087,10 +1088,12 @@ jobs:
               }
 
               private byte[] buildDhcpPayload(int interfaceType) {
-                  // Same 18-byte layout returned by AA:
-                  // [0] interface 1=Wi-Fi, 2=Ethernet
+                  // Exact 18-byte layout returned by AA:
+                  // [0] interface enum (DO NOT hardcode from assumptions)
                   // [1] IP mode 0=DHCP, 1=Static
                   // [2..17] IP/mask/gateway/DNS; zeros for DHCP.
+                  // On TACW752826G1511 FW 2.1.0, AA while Wi-Fi is active returns 0x00,
+                  // therefore Wi-Fi for AA/AB is interfaceType=0 on this firmware.
                   byte[] out=new byte[18];
                   out[0]=(byte)(interfaceType&0xff);
                   out[1]=0x00;
@@ -1099,25 +1102,41 @@ jobs:
 
               private void configureDhcpBeforeNetworkWrite(int interfaceType,Runnable next) {
                   byte[] payload=buildDhcpPayload(interfaceType);
-                  String name=interfaceType==1?"Wi-Fi":"Ethernet";
+                  String name=(interfaceType==0?"Wi-Fi(FW2.1 enum=0)":"interface "+interfaceType);
                   appendLog("TX AB TCPIP interface="+name+" mode=DHCP payload="+hex(payload));
-                  progress("Internet connection",false,"Setting "+name+" TCP/IP to DHCP...");
+                  progress("Internet connection",false,"Setting Wi-Fi TCP/IP to DHCP...");
 
                   sendEncrypted(CMD_CONFIGURE_TCPIP,payload,p -> {
                       try {
                           requirePacketOk(p,"Configure TCP/IP DHCP");
+
+                          int echo=-1;
+                          int result=0;
+                          if (p.payload!=null && p.payload.length>0) echo=p.payload[0]&0xff;
+                          if (p.payload!=null && p.payload.length>1) result=p.payload[1]&0xff;
                           int detail=parseConfigDetail(p.payload);
-                          appendLog("RX AB TCPIP payload="+hex(p.payload)+" detail=0x"
-                                  +String.format(Locale.US,"%04X",detail));
-                          // Some firmware returns a short/empty success body. Only a non-zero
-                          // 3-byte detail is treated as warning, not a blocker for D2.
+
+                          appendLog("RX AB TCPIP payload="+hex(p.payload)
+                                  +" echo="+echo+" result="+result
+                                  +" detail=0x"+String.format(Locale.US,"%04X",detail));
+
+                          // The previous 4.0 attempt sent interfaceType=1 and got 01 01.
+                          // Treat byte[1]!=0 as rejection instead of falsely calling it success.
+                          if (p.payload!=null && p.payload.length>=2 && result!=0)
+                              throw new Exception("AB DHCP rejected, interface="+echo+" result="+result);
                           if (p.payload!=null && p.payload.length>=3 && detail!=0)
-                              appendLog("AB DHCP warning detail=0x"+String.format(Locale.US,"%04X",detail)
-                                      +"; continuing with Wi-Fi credentials.");
+                              throw new Exception("AB DHCP rejected, detail=0x"
+                                      +String.format(Locale.US,"%04X",detail));
+
+                          appendLog("AB DHCP accepted for interface enum="+interfaceType+".");
+                          if (next!=null) main.postDelayed(next,250);
                       } catch(Exception e) {
-                          appendLog("AB DHCP warning: "+safeError(e)+"; continuing with Wi-Fi credentials.");
+                          wifiWritePending=false;
+                          awaitingExpectedReboot=false;
+                          progress("Internet connection",false,safeError(e));
+                          failStatus("Wi-Fi DHCP setup failed",safeError(e));
+                          saveBtn.setEnabled(true);
                       }
-                      if (next!=null) main.postDelayed(next,250);
                   });
               }
 
@@ -1377,7 +1396,10 @@ jobs:
                   // First explicitly configure Wi-Fi TCP/IP for DHCP (AB).
                   // Then run the CE authorization step that this FW already accepted,
                   // and finally write SSID/password with D2.
-                  configureDhcpBeforeNetworkWrite(1,() ->
+                  int wifiAaType=(lastAaInterfaceType>=0)?lastAaInterfaceType:0;
+                  appendLog("WIFI AA/AB interface enum selected="+wifiAaType
+                          +" (learned from AA; FW2.1 Wi-Fi expected 0)");
+                  configureDhcpBeforeNetworkWrite(wifiAaType,() ->
                       enableConnectionAuth(NET_WIFI,() -> sendWifiCredentialsForApply(ssid,password)));
               }
 
@@ -1619,10 +1641,13 @@ jobs:
                           if (p.payload==null || p.payload.length<2)
                               throw new Exception("TCP/IP payload too short: "+hex(p.payload));
 
-                          int type=p.payload[0]&0xff; // 1 Wi-Fi, 2 Ethernet
+                          int type=p.payload[0]&0xff; // firmware-specific interface enum
                           int mode=p.payload[1]&0xff; // 0 DHCP, 1 Static IP
+                          lastAaInterfaceType=type;
 
-                          String typeName=type==1?"Wi-Fi":type==2?"Ethernet":"type "+type;
+                          // On the tested FW 2.1.0, active Wi-Fi reads back as type=0.
+                          // Do not reuse D3's enum here: D3 reports Wi-Fi as mode=1.
+                          String typeName=type==0?"Wi-Fi":type==1?"Ethernet / interface 1":"type "+type;
                           String modeName=mode==0?"DHCP":mode==1?"STATIC IP":"mode "+mode;
 
                           String ip="";
@@ -1643,12 +1668,16 @@ jobs:
                                       +" gateway="+gateway+" dns="+dns));
 
                           // Keep connection selector aligned with charger.
-                          if (type==1) {
+                          if (type==0) {
                               connectionType.setSelection(0);
                               wifiFields.setVisibility(View.VISIBLE);
-                          } else if (type==2) {
-                              connectionType.setSelection(1);
-                              wifiFields.setVisibility(View.GONE);
+                          } else if (type==1) {
+                              // FW-dependent; keep Ethernet interpretation only when UI is not
+                              // already known to be Wi-Fi from D3/E4.
+                              if (wifiSsid==null || wifiSsid.getText().toString().trim().isEmpty()) {
+                                  connectionType.setSelection(1);
+                                  wifiFields.setVisibility(View.GONE);
+                              }
                           }
 
                           lastTcpIpSummary="TCP/IP: "+typeName+" • "+modeName
@@ -2794,14 +2823,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-4.0.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-4.1.apk
           cd artifact
-          sha256sum ABB-Terra-Direct-Secure-4.0.apk | tee ABB-Terra-Direct-Secure-4.0.apk.sha256
+          sha256sum ABB-Terra-Direct-Secure-4.1.apk | tee ABB-Terra-Direct-Secure-4.1.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ABB-Terra-Direct-Secure-4.0
+          name: ABB-Terra-Direct-Secure-4.1
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
