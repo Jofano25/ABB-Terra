@@ -1,11 +1,11 @@
-name: Build ABB Terra Direct Secure 3.6
+name: Build ABB Terra Direct Secure 3.8 READ-ALL
 
 on:
   workflow_dispatch:
   push:
     branches: [ main ]
     paths:
-      - '.github/workflows/build-apk.yml'
+      - '.github/workflows/build-apk*.yml'
 
 permissions:
   contents: read
@@ -79,8 +79,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 360
-                  versionName '3.6-direct-secure'
+                  versionCode 380
+                  versionName '3.8-readall-fw210'
               }
 
               buildTypes {
@@ -172,13 +172,15 @@ jobs:
 
               private static final int REQ_PERMS = 7201;
               private static final int CMD_AUTH = 0xFE;
+              private static final int CMD_QUERY_TCPIP = 0xAA;
               private static final int CMD_SYNC_TIME = 0xB0;
               private static final int CMD_SYSINFO = 0xB1;
               private static final int CMD_CE_AUTH = 0xCE;
               private static final int CMD_WIFI_CONFIG = 0xD2;
               private static final int CMD_NETWORK_STATUS = 0xD3;
+              private static final int CMD_READ_CONFIGURATION = 0xC5;
               private static final int CMD_OCPP = 0xD6;
-              private static final int CMD_OCPP_STATUS = 0xD8;
+              private static final int CMD_QUERY_DEVICE_NET_CONFIG = 0xDB;
               private static final int CMD_QUERY_WIFI_INFO = 0xE4;
 
               private static final int NET_WIFI = 6;
@@ -206,6 +208,9 @@ jobs:
               private boolean encryptedMode = false;
               private boolean internetReady = false;
               private int expectedNetworkMode = 0;
+              private String lastTcpIpSummary = "";
+              private boolean lastOcppApplyOk = false;
+              private String lastOcppApplyMessage = "Not applied";
               private boolean awaitingExpectedReboot = false;
               private boolean autoReconnectEnabled = false;
               private String autoReconnectDeviceNumber = "";
@@ -398,7 +403,7 @@ jobs:
 
                   if (hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("ABB Terra Direct Secure 3.6 started");
+                      appendLog("ABB Terra Direct Secure 3.8 started");
                       appendLog("Saved authorization found. Opening commissioning screen.");
                   } else {
                       showLoginScreen();
@@ -515,7 +520,7 @@ jobs:
                   connectionStatus.setPadding(0,dp(8),0,dp(8));
                   internet.addView(connectionStatus);
 
-                  readConfigBtn = button("READ CURRENT CONFIG", SECONDARY, WHITE);
+                  readConfigBtn = button("READ ALL CONFIG", SECONDARY, WHITE);
                   internet.addView(readConfigBtn,new LinearLayout.LayoutParams(-1,dp(52)));
                   readConfigBtn.setOnClickListener(v -> readCurrentConfig());
 
@@ -548,8 +553,8 @@ jobs:
                   ocppCard.addView(requiresPassword);
 
                   TextView hint = text(
-                          "Edit Internet + OCPP first. APPLY ALL writes OCPP first and network last, "
-                          +"so the expected network reboot happens only at the end.",
+                          "READ ALL reads Wi-Fi, DHCP/static, network status and OCPP data. "
+                          +"APPLY ALL tries OCPP compatibility variants first, then writes network even if OCPP is rejected.",
                           11,false,MUTED);
                   hint.setPadding(0,dp(4),0,dp(8));
                   ocppCard.addView(hint);
@@ -676,7 +681,7 @@ jobs:
                           runOnUiThread(() -> {
                               adminPassword.setText("");
                               buildUi();
-                              appendLog("ABB Terra Direct Secure 3.6 started");
+                              appendLog("ABB Terra Direct Secure 3.8 started");
                               appendLog("LOGIN SUCCESS. Authorization stored securely; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -995,7 +1000,7 @@ jobs:
                           progress("Secure session",true,"AES-GCM active");
                           progress("Internet connection",false,"Ready to edit / apply");
                           progress("OCPP configuration",false,"Ready to edit / apply");
-                          setOcppUiEnabled(true);
+                          setOcppUiEnabled(true);setOcppUiEnabled(true);
                           loadLocalProfile();
                           setStatus("CHARGER AUTHENTICATED",
                                   deviceNumber+" • secure session ready • beep/acknowledgement confirmed");
@@ -1127,7 +1132,7 @@ jobs:
               private boolean isHardNetworkError(int detail) {
                   return detail==0x1001 || detail==0x1002 || detail==0x1003
                           || detail==0x1005 || detail==0x1006
-                          || detail==0x1401 || detail==0x1502
+                          || detail==0x1401
                           || detail==0x5023;
               }
 
@@ -1142,7 +1147,7 @@ jobs:
                       case 0x1005: return "Invalid Wi-Fi SSID";
                       case 0x1006: return "Invalid Wi-Fi password";
                       case 0x1401: return "DHCP failed";
-                      case 0x1502: return "Set IP failed";
+                      case 0x1502: return "IP setup status 0x1502 (verify DHCP/static with AA)";
                       case 0x5023: return "Unknown Wi-Fi error";
                       default: return "Network detail 0x"+String.format(Locale.US,"%04X",detail);
                   }
@@ -1185,57 +1190,78 @@ jobs:
                   }
 
                   saveBtn.setEnabled(false);
+                  lastOcppApplyOk=false;
+                  lastOcppApplyMessage="Not applied";
                   setStatus("APPLYING CONFIGURATION",
-                          "OCPP first → network last → expected reboot once");
-                  progress("OCPP configuration",false,"Writing before network reboot...");
-                  appendLog("APPLY ALL start: OCPP first, network last.");
+                          "Trying OCPP compatibility variants, then network configuration");
+                  progress("OCPP configuration",false,"Trying D6 variants...");
+                  appendLog("APPLY ALL start: OCPP compatibility variants first; network will still be written on OCPP failure.");
+
+                  tryOcppVariant(url,cp,requiresPassword.isChecked()?key:"",
+                          connectionPosition,ssid,wifiPass,0);
+              }
+
+              private void tryOcppVariant(String url,String cp,String key,
+                      int connectionPosition,String ssid,String wifiPass,int variant) {
+                  if (variant>=4) {
+                      lastOcppApplyOk=false;
+                      lastOcppApplyMessage="All D6 compatibility variants rejected";
+                      progress("OCPP configuration",false,lastOcppApplyMessage);
+                      appendLog("OCPP D6: all variants rejected. Continuing with network configuration so Wi-Fi is not blocked.");
+                      continueWithNetwork(connectionPosition,ssid,wifiPass);
+                      return;
+                  }
 
                   try {
-                      byte[] ocppPayload=buildOcppPayload(
-                              url,
-                              cp,
-                              requiresPassword.isChecked()?key:""
-                      );
+                      byte[] payload=buildOcppPayload(url,cp,key,variant);
+                      appendLog("TX OCPP D6 variant="+variant+" id="+cp+" url="+url
+                              +" auth="+(key.isEmpty()?"off":"on"));
 
-                      appendLog("TX OCPP D6 id="+cp+" url="+url+" auth="
-                              +(requiresPassword.isChecked()?"on":"off"));
-
-                      sendEncrypted(CMD_OCPP,ocppPayload,p -> {
+                      sendEncrypted(CMD_OCPP,payload,p -> {
                           try {
-                              requirePacketOk(p,"OCPP configure");
-
+                              requirePacketOk(p,"OCPP configure variant "+variant);
                               if (p.payload==null || p.payload.length<1)
                                   throw new Exception("D6 response payload is empty.");
 
                               int result=p.payload[0]&0xff;
-                              if (result==2) {
-                                  int fault=(p.payload.length>1)?(p.payload[1]&0xff):-1;
-                                  throw new Exception("OCPP D6 rejected, faultCause="
-                                          +(fault<0?"unknown":String.valueOf(fault)));
+                              int fault=p.payload.length>1?(p.payload[1]&0xff):-1;
+                              appendLog("RX OCPP D6 variant="+variant+" result="+result
+                                      +" faultCause="+(fault<0?"n/a":String.valueOf(fault))
+                                      +" payload="+hex(p.payload));
+
+                              if (result==1) {
+                                  lastOcppApplyOk=true;
+                                  boolean carriesTag=(variant==0 || variant==2);
+                                  lastOcppApplyMessage="Accepted variant "+variant
+                                          +(carriesTag?" (with Charger ID tag)":" (server fields; Charger ID will be verified by READ ALL)");
+                                  progress("OCPP configuration",true,lastOcppApplyMessage);
+                                  appendLog("OCPP D6 accepted using variant="+variant+".");
+                                  saveLocalProfile();
+                                  continueWithNetwork(connectionPosition,ssid,wifiPass);
+                                  return;
                               }
-                              if (result!=1)
-                                  throw new Exception("Unexpected OCPP D6 result="+result
-                                          +" payload="+hex(p.payload));
 
-                              progress("OCPP configuration",true,"Accepted / stored");
-                              appendLog("OCPP D6 accepted. Writing network LAST.");
-
-                              if (connectionPosition==0)
-                                  applyWifiLast(ssid,wifiPass);
-                              else
-                                  applyEthernetLast();
+                              appendLog("OCPP variant "+variant+" rejected; trying next compatibility layout.");
+                              main.postDelayed(() -> tryOcppVariant(url,cp,key,
+                                      connectionPosition,ssid,wifiPass,variant+1),250);
 
                           } catch(Exception e) {
-                              progress("OCPP configuration",false,safeError(e));
-                              failStatus("OCPP configuration failed",safeError(e));
-                              saveBtn.setEnabled(true);
+                              appendLog("OCPP variant "+variant+" warning: "+safeError(e));
+                              main.postDelayed(() -> tryOcppVariant(url,cp,key,
+                                      connectionPosition,ssid,wifiPass,variant+1),250);
                           }
                       });
-
                   } catch(Exception e) {
-                      failStatus("Invalid OCPP configuration",safeError(e));
-                      saveBtn.setEnabled(true);
+                      appendLog("OCPP variant "+variant+" build warning: "+safeError(e));
+                      tryOcppVariant(url,cp,key,connectionPosition,ssid,wifiPass,variant+1);
                   }
+              }
+
+              private void continueWithNetwork(int connectionPosition,String ssid,String wifiPass) {
+                  if (connectionPosition==0)
+                      applyWifiLast(ssid,wifiPass);
+                  else
+                      applyEthernetLast();
               }
 
               private void applyWifiLast(String ssid,String password) {
@@ -1268,8 +1294,10 @@ jobs:
                               awaitingExpectedReboot=true;
                               autoReconnectDeviceNumber=deviceNumber;
 
-                              setStatus("CONFIGURATION SAVED",
-                                      "Waiting for charger reboot and automatic reconnect...");
+                              setStatus(lastOcppApplyOk?"CONFIGURATION SAVED":"NETWORK SAVED / OCPP NEEDS ATTENTION",
+                                      lastOcppApplyOk
+                                              ?"Waiting for charger reboot and automatic reconnect..."
+                                              :"Wi-Fi saved. OCPP was not accepted; READ ALL after reconnect and review D6 log.");
                               connectionStatus.setText(
                                       "✓ Saved. Waiting for reboot → reconnect → automatic read-back.");
 
@@ -1306,8 +1334,10 @@ jobs:
                       awaitingExpectedReboot=true;
                       autoReconnectDeviceNumber=deviceNumber;
 
-                      setStatus("CONFIGURATION SAVED",
-                              "Waiting for charger reboot / network restart...");
+                      setStatus(lastOcppApplyOk?"CONFIGURATION SAVED":"NETWORK SAVED / OCPP NEEDS ATTENTION",
+                              lastOcppApplyOk
+                                      ?"Waiting for charger reboot / network restart..."
+                                      :"Ethernet saved. OCPP was not accepted; READ ALL after reconnect.");
 
                       main.postDelayed(() -> {
                           if (authenticated && awaitingExpectedReboot) {
@@ -1331,32 +1361,37 @@ jobs:
                   }
 
                   loadLocalProfile();
-                  progress("Current configuration",false,"Reading charger...");
-                  setStatus("READING CONFIGURATION",
-                          "Reading Wi-Fi / network / OCPP status...");
+                  progress("Current configuration",false,"READ ALL in progress...");
+                  setStatus("READING ALL CONFIGURATION",
+                          "B1/E4/AA/D3/DB/C5 • Wi-Fi, DHCP/static and OCPP");
+                  appendLog("READ ALL START: E4 -> AA -> D3 -> DB -> C5");
 
                   queryWifiInfo(() ->
-                          queryNetworkStatusForRead(() ->
-                                  queryOcppStatusForRead()));
+                          queryTcpIpConfig(() ->
+                              queryNetworkStatusForRead(() ->
+                                  queryDeviceNetConfigForRead(() ->
+                                      queryGenericConfigForRead()))));
               }
 
               private void queryWifiInfo(Runnable next) {
                   sendEncrypted(CMD_QUERY_WIFI_INFO,new byte[0],p -> {
                       try {
                           requirePacketOk(p,"Query Wi-Fi info");
-                          String ssid=parseWifiSsid(p.payload);
+                          String[] wifi=parseWifiInfo(p.payload);
+                          String ssid=wifi[0];
+                          String password=wifi[1];
 
                           appendLog("RX E4 WIFI_INFO payload="+hex(p.payload)
-                                  +(ssid.isEmpty()?"":" ssid="+ssid));
+                                  +(ssid.isEmpty()?"":" ssid="+ssid)
+                                  +" password=<hidden>");
+
+                          if (!ssid.isEmpty()) wifiSsid.setText(ssid);
+                          if (!password.isEmpty()) wifiPassword.setText(password);
 
                           if (!ssid.isEmpty()) {
-                              String savedSsid=readProfile("wifi_ssid");
-                              wifiSsid.setText(ssid);
-
-                              // Charger does not safely return the Wi-Fi password.
-                              // If SSID differs from our encrypted profile, clear the old password.
-                              if (!savedSsid.isEmpty() && !savedSsid.equals(ssid))
-                                  wifiPassword.setText("");
+                              writeSecure(profileKey("wifi_ssid"),ssid);
+                              if (!password.isEmpty())
+                                  writeSecure(profileKey("wifi_password"),password);
                           }
 
                       } catch(Exception e) {
@@ -1367,44 +1402,97 @@ jobs:
                   });
               }
 
-              private String parseWifiSsid(byte[] payload) {
-                  if (payload==null || payload.length==0) return "";
+              private String[] parseWifiInfo(byte[] payload) {
+                  // TerraConfig QueryWifiInfoResponse format observed from charger:
+                  // 0x02 + SSID UTF-8 + 0x0A + PASSWORD UTF-8 + 0x03
+                  if (payload==null || payload.length==0)
+                      return new String[]{"",""};
 
-                  try {
-                      int n=payload[0]&0xff;
-                      if (n>0 && n<=payload.length-1) {
-                          String candidate=new String(
-                                  payload,1,n,StandardCharsets.UTF_8)
-                                  .replace("\u0000","").trim();
-                          if (isMostlyPrintable(candidate)) return candidate;
-                      }
-                  } catch(Exception ignored) {}
+                  int start=0;
+                  if ((payload[0]&0xff)==0x02) start=1;
 
-                  String best="";
-                  StringBuilder cur=new StringBuilder();
+                  int sep=-1;
+                  int end=payload.length;
 
-                  for (byte b:payload) {
-                      int x=b&0xff;
-                      if (x>=32 && x<=126) {
-                          cur.append((char)x);
-                      } else {
-                          if (cur.length()>best.length()) best=cur.toString();
-                          cur.setLength(0);
+                  for (int i=start;i<payload.length;i++) {
+                      int v=payload[i]&0xff;
+                      if (v==0x0A && sep<0) sep=i;
+                      if (v==0x03) {
+                          end=i;
+                          break;
                       }
                   }
 
-                  if (cur.length()>best.length()) best=cur.toString();
-                  return best.trim();
+                  if (sep<0) {
+                      String ssid=new String(payload,start,Math.max(0,end-start),
+                              StandardCharsets.UTF_8).trim();
+                      return new String[]{ssid,""};
+                  }
+
+                  String ssid=new String(payload,start,Math.max(0,sep-start),
+                          StandardCharsets.UTF_8).trim();
+                  String password=new String(payload,sep+1,Math.max(0,end-(sep+1)),
+                          StandardCharsets.UTF_8);
+
+                  return new String[]{ssid,password};
               }
 
-              private boolean isMostlyPrintable(String value) {
-                  if (value==null || value.isEmpty()) return false;
-                  int printable=0;
-                  for (int i=0;i<value.length();i++) {
-                      char c=value.charAt(i);
-                      if (c>=32 && c<127) printable++;
-                  }
-                  return printable>=Math.max(1,(int)(value.length()*0.85));
+              private void queryTcpIpConfig(Runnable next) {
+                  sendEncrypted(CMD_QUERY_TCPIP,new byte[0],p -> {
+                      try {
+                          requirePacketOk(p,"Query TCP/IP configuration");
+
+                          if (p.payload==null || p.payload.length<2)
+                              throw new Exception("TCP/IP payload too short: "+hex(p.payload));
+
+                          int type=p.payload[0]&0xff; // 1 Wi-Fi, 2 Ethernet
+                          int mode=p.payload[1]&0xff; // 0 DHCP, 1 Static IP
+
+                          String typeName=type==1?"Wi-Fi":type==2?"Ethernet":"type "+type;
+                          String modeName=mode==0?"DHCP":mode==1?"STATIC IP":"mode "+mode;
+
+                          String ip="";
+                          String mask="";
+                          String gateway="";
+                          String dns="";
+
+                          if (mode==1 && p.payload.length>=18) {
+                              ip=ipv4(p.payload,2);
+                              mask=ipv4(p.payload,6);
+                              gateway=ipv4(p.payload,10);
+                              dns=ipv4(p.payload,14);
+                          }
+
+                          appendLog("READ AA TCPIP type="+typeName
+                                  +" mode="+modeName
+                                  +(ip.isEmpty()?"":" ip="+ip+" mask="+mask
+                                      +" gateway="+gateway+" dns="+dns));
+
+                          // Keep connection selector aligned with charger.
+                          if (type==1) {
+                              connectionType.setSelection(0);
+                              wifiFields.setVisibility(View.VISIBLE);
+                          } else if (type==2) {
+                              connectionType.setSelection(1);
+                              wifiFields.setVisibility(View.GONE);
+                          }
+
+                          lastTcpIpSummary="TCP/IP: "+typeName+" • "+modeName
+                                  +(ip.isEmpty()?"":" • "+ip);
+                          connectionStatus.setText(lastTcpIpSummary);
+
+                      } catch(Exception e) {
+                          appendLog("AA TCP/IP read warning: "+safeError(e));
+                      }
+
+                      if (next!=null) next.run();
+                  });
+              }
+
+              private String ipv4(byte[] b,int off) {
+                  if (b==null || off<0 || off+4>b.length) return "";
+                  return (b[off]&0xff)+"."+(b[off+1]&0xff)+"."
+                          +(b[off+2]&0xff)+"."+(b[off+3]&0xff);
               }
 
               private void queryNetworkStatusForRead(Runnable next) {
@@ -1420,30 +1508,21 @@ jobs:
                           int mode=p.payload[1]&0xff;
                           int detail=(p.payload[2]&0xff)|((p.payload[3]&0xff)<<8);
                           String detailText=networkDetailText(detail);
+                          String modeText=mode==1?"Wi-Fi":mode==2?"Ethernet":"mode "+mode;
 
                           appendLog("READ D3 networkResult="+networkResult
-                                  +" mode="+mode
+                                  +" mode="+mode+" ("+modeText+")"
                                   +" detail=0x"+String.format(Locale.US,"%04X",detail)
                                   +" ("+detailText+")");
 
-                          if (mode==NET_WIFI) {
-                              connectionType.setSelection(0);
-                              wifiFields.setVisibility(View.VISIBLE);
-                          } else if (mode==NET_ETHERNET) {
-                              connectionType.setSelection(1);
-                              wifiFields.setVisibility(View.GONE);
-                          }
-
+                          // IMPORTANT: DHCP/static comes from AA, not D3.
+                          // D3 on FW 2.1.0 can report 0x1502 even while AA says DHCP.
                           internetReady=(detail==0x0200);
                           progress("Internet connection",internetReady,
                                   internetReady?"Internet ready":detailText);
 
-                          connectionStatus.setText(
-                                  (internetReady?"✓ ":"○ ")
-                                  +(mode==NET_WIFI?"Wi-Fi":
-                                      mode==NET_ETHERNET?"Ethernet":"mode "+mode)
-                                  +" • "+detailText
-                          );
+                          String prefix=lastTcpIpSummary.isEmpty()?"TCP/IP: unknown":lastTcpIpSummary;
+                          connectionStatus.setText(prefix+" • D3: "+detailText);
 
                       } catch(Exception e) {
                           appendLog("D3 read warning: "+safeError(e));
@@ -1453,25 +1532,177 @@ jobs:
                   });
               }
 
-              private void queryOcppStatusForRead() {
-                  sendEncrypted(CMD_OCPP_STATUS,new byte[0],p -> {
+              private void queryDeviceNetConfigForRead(Runnable next) {
+                  sendEncrypted(CMD_QUERY_DEVICE_NET_CONFIG,new byte[0],p -> {
                       try {
-                          requirePacketOk(p,"OCPP configuration status");
-                          appendLog("READ D8 OCPP_STATUS payload="+hex(p.payload));
+                          requirePacketOk(p,"Query OCPP/network configuration");
+
+                          if (p.payload==null || p.payload.length<8)
+                              throw new Exception("DB payload too short: "+hex(p.payload));
+
+                          int pos=0;
+                          int protocolType=p.payload[pos++]&0xff;
+                          int protocolVersion=p.payload[pos++]&0xff;
+
+                          int domainLen=p.payload[pos++]&0xff;
+                          if (pos+domainLen+5>p.payload.length)
+                              throw new Exception("DB domain length invalid.");
+
+                          String domain=new String(p.payload,pos,domainLen,
+                                  StandardCharsets.UTF_8);
+                          pos+=domainLen;
+
+                          int port=(p.payload[pos]&0xff)|((p.payload[pos+1]&0xff)<<8);
+                          pos+=2;
+
+                          int originalOrExternal=p.payload[pos++]&0xff;
+                          int enableTls=p.payload[pos++]&0xff;
+                          int expand=p.payload[pos++]&0xff;
+
+                          String tag="";
+                          if (pos<p.payload.length) {
+                              int tagLen=p.payload[pos++]&0xff;
+                              if (tagLen>0 && pos+tagLen<=p.payload.length)
+                                  tag=new String(p.payload,pos,tagLen,
+                                          StandardCharsets.UTF_8);
+                          }
+
+                          String fullUrl=buildOcppUrlFromRead(domain,port,enableTls);
+
+                          appendLog("READ DB OCPP protocolType="+protocolType
+                                  +" protocolVersion="+protocolVersion
+                                  +" domain="+domain
+                                  +" port="+port
+                                  +" tls="+enableTls
+                                  +" source="+originalOrExternal
+                                  +" expand="+expand
+                                  +" tag="+tag);
+
+                          if (!fullUrl.isEmpty()) serverUrl.setText(fullUrl);
+                          if (!tag.isEmpty()) chargePointId.setText(tag);
+
+                          // DB does not expose securityKey/AuthKey. Keep encrypted
+                          // local profile value if our app has one.
+                          String cachedAuth=readProfile("auth_key");
+                          if (!cachedAuth.isEmpty()) authKey.setText(cachedAuth);
 
                           progress("OCPP configuration",true,
-                                  "Status read; editable fields loaded");
+                                  "URL + Charger ID read from charger");
+
+
                       } catch(Exception e) {
-                          progress("OCPP configuration",false,
-                                  "Status unavailable; local fields retained");
-                          appendLog("D8 read warning: "+safeError(e));
+                          progress("OCPP configuration",false,"DB read failed");
+                          appendLog("DB OCPP read warning: "+safeError(e));
                       }
 
-                      progress("Current configuration",true,"Read-back complete");
+                      if (next!=null) next.run();
+                  });
+              }
+
+              private void queryGenericConfigForRead() {
+                  sendEncrypted(CMD_READ_CONFIGURATION,new byte[]{0x01},p -> {
+                      try {
+                          requirePacketOk(p,"C5 configuration read");
+                          String ascii=printableUtf8(p.payload);
+                          appendLog("READ C5 CONFIG payload="+hex(p.payload)
+                                  +(ascii.isEmpty()?"":" text="+compact(ascii)));
+
+                          if (!ascii.isEmpty() && ascii.trim().startsWith("{")) {
+                              try {
+                                  JSONObject j=new JSONObject(ascii.trim());
+                                  String id=findConfigValue(j,"charger_identity");
+                                  if (id.isEmpty()) id=findConfigValue(j,"charge_point_id");
+                                  String url=findConfigValue(j,"server_a_ip_address");
+                                  if (!id.isEmpty()) {
+                                      chargePointId.setText(id);
+                                      appendLog("READ C5 charger identity="+id);
+                                  }
+                                  if (!url.isEmpty() && serverUrl.getText().toString().trim().isEmpty())
+                                      serverUrl.setText(url);
+                              } catch(Exception parse) {
+                                  appendLog("C5 text is not recognized JSON configuration: "+safeError(parse));
+                              }
+                          }
+                      } catch(Exception e) {
+                          appendLog("C5 read warning (optional/fallback): "+safeError(e));
+                      }
+
+                      String cachedAuth=readProfile("auth_key");
+                      if (!cachedAuth.isEmpty()) authKey.setText(cachedAuth);
+
+                      progress("Current configuration",true,"READ ALL complete");
                       setStatus("CONFIGURATION LOADED",
-                              "Live charger status read. Protected fields restored from encrypted local profile.");
+                              "Wi-Fi + DHCP/static + D3 status + OCPP read complete. "
+                              +"AuthKey is hidden by charger and restored only from encrypted local app storage when available.");
+                      appendLog("READ ALL COMPLETE");
                       saveBtn.setEnabled(authenticated);
                   });
+              }
+
+              private String printableUtf8(byte[] payload) {
+                  if (payload==null || payload.length==0) return "";
+                  String x=new String(payload,StandardCharsets.UTF_8).trim();
+                  int printable=0;
+                  for(int i=0;i<x.length();i++) {
+                      char c=x.charAt(i);
+                      if (c=='\n' || c=='\r' || c=='\t' || (c>=32 && c<127)) printable++;
+                  }
+                  return x.length()>0 && printable*100/x.length()>=80 ? x : "";
+              }
+
+              private String findConfigValue(JSONObject j,String key) {
+                  try {
+                      if (j.has(key) && !j.isNull(key)) {
+                          Object v=j.get(key);
+                          if (v instanceof JSONArray) {
+                              JSONArray a=(JSONArray)v;
+                              if (a.length()>0) return String.valueOf(a.get(a.length()-1));
+                          }
+                          return String.valueOf(v);
+                      }
+                      Iterator<String> it=j.keys();
+                      while(it.hasNext()) {
+                          Object child=j.opt(it.next());
+                          if (child instanceof JSONObject) {
+                              String x=findConfigValue((JSONObject)child,key);
+                              if (!x.isEmpty()) return x;
+                          }
+                      }
+                  } catch(Exception ignored) {}
+                  return "";
+              }
+
+              private String buildOcppUrlFromRead(String domain,int port,int tls) {
+                  if (domain==null) domain="";
+                  domain=domain.trim();
+                  if (domain.isEmpty()) return "";
+
+                  String url=domain;
+                  if (!(url.startsWith("ws://") || url.startsWith("wss://"))) {
+                      url=(tls==1?"wss://":"ws://")+url;
+                  }
+
+                  try {
+                      java.net.URI uri=new java.net.URI(url);
+                      if (uri.getPort()>=0 || port<=0) return url;
+
+                      String scheme=uri.getScheme()==null?(tls==1?"wss":"ws"):uri.getScheme();
+                      String host=uri.getHost();
+
+                      if (host==null || host.isEmpty()) return url;
+
+                      StringBuilder x=new StringBuilder();
+                      x.append(scheme).append("://").append(host).append(":").append(port);
+
+                      if (uri.getRawPath()!=null) x.append(uri.getRawPath());
+                      if (uri.getRawQuery()!=null) x.append("?").append(uri.getRawQuery());
+                      return x.toString();
+
+                  } catch(Exception ignored) {
+                      if (port>0 && !url.matches(".*:\\\\d+(/.*)?$"))
+                          return url+":"+port;
+                      return url;
+                  }
               }
 
               private String profileKey(String suffix) {
@@ -1541,7 +1772,8 @@ jobs:
                           +" (password/AuthKey hidden from log).");
               }
 
-              private byte[] buildOcppPayload(String fullUrl,String chargerId,String securityKeyText) throws Exception {
+              private byte[] buildOcppPayload(String fullUrl,String chargerId,
+                      String securityKeyText,int variant) throws Exception {
                   java.net.URI uri=new java.net.URI(fullUrl);
                   String scheme=uri.getScheme();
                   String host=uri.getHost();
@@ -1551,31 +1783,42 @@ jobs:
                   int port=uri.getPort();
                   if (port<=0) port=tls?443:80;
 
-                  // TerraConfig uses String.valueOf(parsed URI) for domainUrl,
-                  // so an explicit :port remains in domainUrl as well as in the port field.
-                  byte[] domainBytes=fullUrl.getBytes(StandardCharsets.UTF_8);
+                  // Variants are deliberately tried because Terra AC firmware generations
+                  // differ in serverEnable/version string and optional trailing identity tag.
+                  int serverEnable=(variant==2 || variant==3)?0:1;
+                  String protocolVersion=(variant==2 || variant==3)?"ocpp1.6j":"ocpp16j";
+                  boolean includeTag=(variant==0 || variant==2);
 
-                  // Custom server password flow in TerraConfig:
-                  // plain text -> UTF-8 -> hex string -> RequestBodyFactory.stringToBytes()
-                  // Therefore the bytes written to D6 are the original UTF-8 text bytes.
+                  byte[] domainBytes=fullUrl.getBytes(StandardCharsets.UTF_8);
                   byte[] keyBytes=securityKeyText.isEmpty()
                           ?new byte[0]
                           :securityKeyText.getBytes(StandardCharsets.UTF_8);
                   byte[] tag=chargerId.getBytes(StandardCharsets.UTF_8);
 
+                  appendLog("D6 STRUCT variant="+variant
+                          +" serverEnable="+serverEnable
+                          +" domainLen="+domainBytes.length
+                          +" port="+port
+                          +" protocolType=1"
+                          +" protocolVersion="+protocolVersion
+                          +" keyLen="+keyBytes.length
+                          +" tls="+(tls?1:0)
+                          +" includeTag="+includeTag
+                          +(includeTag?" tagLen="+tag.length+" tag="+chargerId:""));
+
                   if (domainBytes.length>255 || keyBytes.length>255 || tag.length>255)
                       throw new Exception("OCPP field too long.");
 
                   ByteArrayOutputStream out=new ByteArrayOutputStream();
-                  out.write(1); // serverEnable
+                  out.write(serverEnable);
                   out.write(domainBytes.length);
                   out.write(domainBytes);
                   out.write(leShort(port));
-                  out.write(1); // protocolType: OCPP
+                  out.write(1); // protocolType OCPP in observed Terra AC D6 implementation
 
                   byte[] protocol=new byte[10];
-                  byte[] p="ocpp1.6j".getBytes(StandardCharsets.UTF_8);
-                  System.arraycopy(p,0,protocol,0,Math.min(protocol.length,p.length));
+                  byte[] pv=protocolVersion.getBytes(StandardCharsets.UTF_8);
+                  System.arraycopy(pv,0,protocol,0,Math.min(protocol.length,pv.length));
                   out.write(protocol);
 
                   out.write(keyBytes.length);
@@ -1583,36 +1826,16 @@ jobs:
 
                   out.write(tls?1:0);
                   if (tls) {
-                      out.write(0);        // certificateNo
-                      out.write(leInt(0)); // certificateSize
+                      out.write(0);
+                      out.write(leInt(0));
                       out.write(leShort(512));
                   }
 
-                  out.write(tag.length);
-                  out.write(tag);
-                  return out.toByteArray();
-              }
-
-              private void verifyOcpp() {
-                  if (!authenticated) {
-                      progress("Verification",false,"Charger reconnected after save");
-                      updateButtons();
-                      return;
+                  if (includeTag) {
+                      out.write(tag.length);
+                      out.write(tag);
                   }
-
-                  sendEncrypted(CMD_OCPP_STATUS,new byte[0],p -> {
-                      if (p.code==0 && p.error==null) {
-                          progress("Verification",true,"Charger responded after configuration");
-                          setStatus("COMMISSIONING COMPLETE",
-                                  "Check OCPP server for ChargeBoxId: "+chargePointId.getText().toString().trim());
-                          appendLog("D8 verify OK payload="+hex(p.payload));
-                      } else {
-                          progress("Verification",false,"Saved; charger may be reconnecting");
-                          setStatus("CONFIGURATION SAVED",
-                                  "Charger may reconnect. Check OCPP server for the new ChargeBoxId.");
-                      }
-                      updateButtons();
-                  });
+                  return out.toByteArray();
               }
 
               private void verifySession() {
@@ -1688,8 +1911,7 @@ jobs:
                   System.arraycopy(payload,0,frame,16,payload.length);
 
                   int xor=0;
-                  for(int i=0;i<7;i++) xor^=frame[i]&0xff;
-                  for(int i=8;i<frame.length;i++) xor^=frame[i]&0xff;
+                  for(int i=0;i<7;i++) xor^=frame[i]&0xff;for(int i=8;i<frame.length;i++) xor^=frame[i]&0xff;
                   frame[7]=(byte)xor;
                   return frame;
               }
@@ -2009,6 +2231,7 @@ jobs:
                   encryptedMode=false;
                   internetReady=false;
                   expectedNetworkMode=0;
+                  lastTcpIpSummary="";
                   tx=null;rx=null;
                   encryptionKey=null;
                   cipherInfo=null;
@@ -2393,14 +2616,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-3.6.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-3.8.apk
           cd artifact
-          sha256sum ABB-Terra-Direct-Secure-3.6.apk | tee ABB-Terra-Direct-Secure-3.6.apk.sha256
+          sha256sum ABB-Terra-Direct-Secure-3.8.apk | tee ABB-Terra-Direct-Secure-3.8.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ABB-Terra-Direct-Secure-3.6
+          name: ABB-Terra-Direct-Secure-3.8
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
