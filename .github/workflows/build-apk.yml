@@ -1,4 +1,4 @@
-name: Build ABB Terra Direct Secure 4.5 BASIC-AUTH-D6-FIX
+name: Build ABB Terra Direct Secure 4.6 FINAL-STABLE-FW210
 
 on:
   workflow_dispatch:
@@ -80,7 +80,7 @@ jobs:
                   minSdk 23
                   targetSdk 35
                   versionCode 430
-                  versionName '4.5-basic-auth-d6-fix-fw210'
+                  versionName '4.6-final-stable-fw210'
               }
 
               buildTypes {
@@ -435,7 +435,7 @@ jobs:
 
                   if (hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("ABB Terra Direct Secure 4.5 started");
+                      appendLog("ABB Terra Direct Secure 4.6 FINAL started");
                       appendLog("Saved authorization found. Opening commissioning screen.");
                   } else {
                       showLoginScreen();
@@ -577,7 +577,7 @@ jobs:
                   requiresPassword = new CheckBox(this);
                   requiresPassword.setText("Server requires password / AuthKey");
                   requiresPassword.setTextColor(WHITE);
-                  requiresPassword.setChecked(true);
+                  requiresPassword.setChecked(false);
 
                   ocppCard.addView(labeled("Charger ID / Charge Point Identity", chargePointId, MUTED));
                   ocppCard.addView(labeled("OCPP Server URL", serverUrl, MUTED));
@@ -585,9 +585,9 @@ jobs:
                   ocppCard.addView(requiresPassword);
 
                   TextView hint = text(
-                          "READ ALL shows values actually stored in charger. If Server requires password / AuthKey is checked, "
-                          +"APPLY ALL writes AuthorizationKey and enables HTTP Basic Auth on the charger, then writes OCPP and Wi-Fi. "
-                          +"For SteVe use Security Profile 1 with the same password. If unchecked, HTTP Basic Auth is disabled.",
+                          "READ ALL shows values actually stored in charger. FW 2.1.0 is locked to the proven D6 layout so the local OCPP URL will not roll back to ABB Cloud. "
+                          +"If Server requires password / AuthKey is checked, the AuthorizationKey is staged in D6. HTTP Basic Auth itself must then be enabled once with OCPP ChangeConfiguration (HTTPBasicAuthEnable=true) while SteVe is temporarily on Security Profile 0. "
+                          +"After that, set SteVe to Security Profile 1 with the same password. Unchecked = no AuthKey in D6.",
                           11,false,MUTED);
                   hint.setPadding(0,dp(4),0,dp(8));
                   ocppCard.addView(hint);
@@ -714,7 +714,7 @@ jobs:
                           runOnUiThread(() -> {
                               adminPassword.setText("");
                               buildUi();
-                              appendLog("ABB Terra Direct Secure 4.5 started");
+                              appendLog("ABB Terra Direct Secure 4.6 FINAL started");
                               appendLog("LOGIN SUCCESS. Authorization stored securely; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -1340,10 +1340,10 @@ jobs:
                   saveBtn.setEnabled(false);
                   lastOcppApplyOk=false;
                   lastOcppApplyMessage="Not applied";
-                  setStatus("APPLYING CONFIGURATION",
-                          "Trying OCPP compatibility variants, then network configuration");
-                  progress("OCPP configuration",false,"Trying D6 variants...");
-                  appendLog("APPLY ALL start: OCPP compatibility variants first; auth-enabled mode prioritizes serverEnable=1 layout; network still follows.");
+                  setStatus("APPLYING FINAL CONFIGURATION",
+                          "Using proven FW 2.1.0 OCPP D6 variant 2, then network configuration");
+                  progress("OCPP configuration",false,"Applying fixed D6 variant 2...");
+                  appendLog("APPLY ALL FINAL: fixed OCPP D6 variant=2 only (serverEnable=0, ocpp1.6j, Charger ID tag). Unsafe variants 0/1 are disabled to prevent rollback to ABB Cloud.");
 
                   tryOcppVariant(url,cp,requiresPassword.isChecked()?key:"",
                           connectionPosition,ssid,wifiPass,0);
@@ -1351,12 +1351,14 @@ jobs:
 
               private void tryOcppVariant(String url,String cp,String key,
                       int connectionPosition,String ssid,String wifiPass,int attempt) {
-                  final int[] order=key.isEmpty()?new int[]{2,0,3,1}:new int[]{0,1,2,3};
+                  // FINAL FW 2.1.0: only variant 2 is allowed. Logs proved variants 0/1 can
+                  // be accepted transiently and then make the charger fall back to ABB Cloud.
+                  final int[] order=new int[]{2};
                   if (attempt>=order.length) {
                       lastOcppApplyOk=false;
-                      lastOcppApplyMessage="All D6 compatibility variants rejected";
+                      lastOcppApplyMessage="Fixed D6 variant 2 rejected";
                       progress("OCPP configuration",false,lastOcppApplyMessage);
-                      appendLog("OCPP D6: all variants rejected. Continuing with network configuration so Wi-Fi is not blocked.");
+                      appendLog("OCPP D6 FINAL: variant 2 rejected. No fallback variants will be sent, so the existing endpoint is not overwritten by an unsafe layout. Network configuration will continue.");
                       continueWithNetwork(connectionPosition,ssid,wifiPass);
                       return;
                   }
@@ -1418,24 +1420,26 @@ jobs:
 
               private void configureHttpBasicAuthForApply(boolean enable,String key,
                       int connectionPosition,String ssid,String wifiPass) {
-                  progress("OCPP Basic Auth",false,enable?"Applying AuthKey through D6...":"Basic Auth disabled");
+                  progress("OCPP Basic Auth",false,enable?"Staging AuthorizationKey in fixed D6 variant 2...":"Basic Auth / AuthKey disabled");
                   appendLog("BASIC AUTH APPLY enable="+enable
                           +" authKeyBytes="+(enable?key.getBytes(StandardCharsets.UTF_8).length:0)
                           +" username="+chargePointId.getText().toString().trim());
 
-                  // v4.5: HTTPBasicAuthEnable is an OCPP configuration key, not part of
-                  // C5 SOCKET_CONFIGURATION. v4.4 proved that writing guessed C5 keys did
-                  // not make the charger send an HTTP Authorization header, so those writes
-                  // are intentionally removed.
-                  //
-                  // For auth-enabled configuration, D6 now tries variant 0 first:
-                  // serverEnable=1, protocolVersion=ocpp16j, securityKey present, tag present.
-                  // This matches the reverse-engineered Terra AC D6 layout more closely.
-                  appendLog("BASIC AUTH v4.5: C5 HTTPBasicAuthEnable write skipped.");
-                  appendLog(enable
-                          ?"BASIC AUTH v4.5: D6 auth order 0 -> 1 -> 2 -> 3; serverEnable=1/ocpp16j first."
-                          :"BASIC AUTH v4.5: auth disabled; using proven non-auth D6 order.");
-                  progress("OCPP Basic Auth",true,enable?"AuthKey sent in D6; verify SteVe handshake":"Basic Auth disabled");
+                  // FINAL FW 2.1.0 behavior:
+                  // - D6 variant 2 is the only proven persistent local-CSMS layout.
+                  // - The security key is carried in D6 when enable=true.
+                  // - BLE C5 guesses for HTTPBasicAuthEnable are intentionally disabled.
+                  // - Enabling the HTTP Authorization header itself must be bootstrapped once
+                  //   through OCPP ChangeConfiguration while the station is online on SteVe
+                  //   Security Profile 0: AuthorizationKey=<same key>, HTTPBasicAuthEnable=true.
+                  //   Then SteVe can be switched to Security Profile 1.
+                  appendLog("BASIC AUTH FINAL: AuthorizationKey "+(enable?"staged":"cleared")+" using persistent D6 variant 2.");
+                  if (enable) {
+                      appendLog("BASIC AUTH FINAL: FW 2.1.0 still requires one-time OCPP ChangeConfiguration: AuthorizationKey=<same key>, then HTTPBasicAuthEnable=true while SteVe is temporarily Security Profile 0. After Accepted, switch SteVe to Profile 1.");
+                      progress("OCPP Basic Auth",true,"AuthKey staged; HTTPBasicAuthEnable requires one-time OCPP bootstrap");
+                  } else {
+                      progress("OCPP Basic Auth",true,"AuthKey disabled in D6");
+                  }
                   continueWithNetwork(connectionPosition,ssid,wifiPass);
               }
 
@@ -2116,8 +2120,9 @@ jobs:
                   int port=uri.getPort();
                   if (port<=0) port=tls?443:80;
 
-                  // Variants are deliberately tried because Terra AC firmware generations
-                  // differ in serverEnable/version string and optional trailing identity tag.
+                  // The builder still understands the historical layouts for diagnostics,
+                  // but FINAL FW 2.1.0 apply logic sends variant 2 only because it is the
+                  // only layout repeatedly verified to persist ws://local-CSMS + Charger ID.
                   int serverEnable=(variant==2 || variant==3)?0:1;
                   String protocolVersion=(variant==2 || variant==3)?"ocpp1.6j":"ocpp16j";
                   boolean includeTag=(variant==0 || variant==2);
@@ -2959,14 +2964,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-4.5.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-4.6-FINAL.apk
           cd artifact
-          sha256sum ABB-Terra-Direct-Secure-4.5.apk | tee ABB-Terra-Direct-Secure-4.5.apk.sha256
+          sha256sum ABB-Terra-Direct-Secure-4.6-FINAL.apk | tee ABB-Terra-Direct-Secure-4.6-FINAL.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ABB-Terra-Direct-Secure-4.5
+          name: ABB-Terra-Direct-Secure-4.6-FINAL
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
