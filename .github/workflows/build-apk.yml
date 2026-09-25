@@ -1,4 +1,4 @@
-name: Build ABB Terra Direct Secure 3.2
+name: Build ABB Terra Direct Secure 3.3
 
 on:
   workflow_dispatch:
@@ -79,8 +79,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 320
-                  versionName '3.2-direct-secure'
+                  versionCode 330
+                  versionName '3.3-direct-secure'
               }
 
               buildTypes {
@@ -174,8 +174,14 @@ jobs:
               private static final int CMD_AUTH = 0xFE;
               private static final int CMD_SYNC_TIME = 0xB0;
               private static final int CMD_SYSINFO = 0xB1;
+              private static final int CMD_WIFI_CONFIG = 0xD2;
+              private static final int CMD_NETWORK_STATUS = 0xD3;
+              private static final int CMD_CHANGE_NET_MODE = 0xD4;
               private static final int CMD_OCPP = 0xD6;
               private static final int CMD_OCPP_STATUS = 0xD8;
+
+              private static final int NET_WIFI = 6;
+              private static final int NET_ETHERNET = 12;
 
               private static final String API = "https://abb-installer.chargedot.com";
               // Official TerraConfig 3.5.0 mobile OAuth client constants.
@@ -197,6 +203,8 @@ jobs:
               private boolean transportReady = false;
               private boolean authenticated = false;
               private boolean encryptedMode = false;
+              private boolean internetReady = false;
+              private int expectedNetworkMode = 0;
               private String deviceNumber = "";
               private String deviceAddress = "";
               private String firmwareVersion = "";
@@ -216,11 +224,13 @@ jobs:
 
               private SharedPreferences prefs;
 
-              private TextView statusTitle, statusDetail, selectedDevice, logText, adminStatus;
-              private LinearLayout deviceList, progressBox, adminFields;
-              private EditText chargerPin, chargePointId, serverUrl, authKey, adminEmail, adminPassword;
+              private TextView statusTitle, statusDetail, selectedDevice, logText, adminStatus, connectionStatus;
+              private LinearLayout deviceList, progressBox, adminFields, wifiFields, ocppCard;
+              private EditText chargerPin, wifiSsid, wifiPassword, chargePointId, serverUrl, authKey, adminEmail, adminPassword;
               private CheckBox requiresPassword;
-              private Button scanBtn, authBtn, saveBtn, verifyBtn, disconnectBtn, adminToggle, adminLogin, adminClear;
+              private Spinner connectionType;
+              private Button scanBtn, authBtn, saveConnectionBtn, checkConnectionBtn, saveBtn, verifyBtn,
+                      disconnectBtn, adminToggle, adminLogin, adminClear;
 
               interface PacketCallback { void onPacket(Packet p); }
 
@@ -355,8 +365,8 @@ jobs:
                   requestPerms();
 
                   updateAdminState();
-                  appendLog("ABB Terra Direct Secure 3.2 started");
-                  appendLog("Daily operation: PIN + direct secure BLE. Secure 0xFE authentication is AES-GCM from handshake step 1. Handshake result byte 0x00 = accepted.");
+                  appendLog("ABB Terra Direct Secure 3.3 started");
+                  appendLog("Daily operation: PIN → secure BLE → SAVE INTERNET CONNECTION → custom OCPP. Handshake result byte 0x00 = accepted.");
               }
 
               private void buildUi() {
@@ -420,31 +430,81 @@ jobs:
                   authBtn.setOnClickListener(v -> authenticateCharger());
                   root.addView(access, cardLp());
 
-                  LinearLayout ocpp = card(CARD);
-                  ocpp.addView(section("CUSTOM OCPP SERVER", ACCENT));
+                  LinearLayout internet = card(CARD);
+                  internet.addView(section("INTERNET CONNECTION • SAVE FIRST", ACCENT));
+
+                  connectionType = new Spinner(this);
+                  ArrayAdapter<String> connectionAdapter = new ArrayAdapter<>(
+                          this,
+                          android.R.layout.simple_spinner_dropdown_item,
+                          new String[]{"Wi-Fi", "Ethernet (DHCP / existing IP config)"});
+                  connectionType.setAdapter(connectionAdapter);
+                  internet.addView(labeled("Connection type", connectionType, MUTED));
+
+                  wifiFields = new LinearLayout(this);
+                  wifiFields.setOrientation(LinearLayout.VERTICAL);
+                  wifiSsid = input("Wi-Fi SSID", WHITE, MUTED);
+                  wifiPassword = input("Wi-Fi password", WHITE, MUTED);
+                  wifiPassword.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+                  wifiFields.addView(labeled("Wi-Fi SSID", wifiSsid, MUTED));
+                  wifiFields.addView(labeled("Wi-Fi Password", wifiPassword, MUTED));
+                  internet.addView(wifiFields);
+
+                  connectionStatus = text("Not saved. OCPP configuration is locked.", 12, true, MUTED);
+                  connectionStatus.setPadding(0,dp(8),0,dp(8));
+                  internet.addView(connectionStatus);
+
+                  LinearLayout internetButtons = new LinearLayout(this);
+                  internetButtons.setOrientation(LinearLayout.HORIZONTAL);
+                  saveConnectionBtn = button("SAVE CONNECTION", ACCENT, Color.rgb(4,35,38));
+                  checkConnectionBtn = button("CHECK STATUS", SECONDARY, WHITE);
+                  internetButtons.addView(saveConnectionBtn, new LinearLayout.LayoutParams(0,dp(54),1));
+                  LinearLayout.LayoutParams cslp = new LinearLayout.LayoutParams(0,dp(54),1);
+                  cslp.setMargins(dp(8),0,0,0);
+                  internetButtons.addView(checkConnectionBtn,cslp);
+                  internet.addView(internetButtons);
+
+                  connectionType.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+                      @Override public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                          wifiFields.setVisibility(position==0 ? View.VISIBLE : View.GONE);
+                          internetReady=false;
+                          expectedNetworkMode=0;
+                          setOcppUiEnabled(false);
+                          connectionStatus.setText("Connection changed. Press SAVE CONNECTION.");
+                      }
+                      @Override public void onNothingSelected(AdapterView<?> parent) {}
+                  });
+
+                  saveConnectionBtn.setOnClickListener(v -> saveInternetConnection());
+                  checkConnectionBtn.setOnClickListener(v -> checkInternetConnection());
+                  root.addView(internet, cardLp());
+
+                  ocppCard = card(CARD);
+                  ocppCard.addView(section("CUSTOM OCPP SERVER • AFTER INTERNET", ACCENT));
                   chargePointId = input("ABB-V2-NEW", WHITE, MUTED);
                   serverUrl = input("ws://192.168.10.186:9220", WHITE, MUTED);
-                  authKey = input("Hex AuthorizationKey / password", WHITE, MUTED);
+                  authKey = input("AuthorizationKey / password (plain text)", WHITE, MUTED);
                   authKey.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
                   requiresPassword = new CheckBox(this);
                   requiresPassword.setText("Server requires password / AuthKey");
                   requiresPassword.setTextColor(WHITE);
                   requiresPassword.setChecked(true);
 
-                  ocpp.addView(labeled("Charger ID / Charge Point Identity", chargePointId, MUTED));
-                  ocpp.addView(labeled("OCPP Server URL", serverUrl, MUTED));
-                  ocpp.addView(labeled("AuthKey / Password", authKey, MUTED));
-                  ocpp.addView(requiresPassword);
+                  ocppCard.addView(labeled("Charger ID / Charge Point Identity", chargePointId, MUTED));
+                  ocppCard.addView(labeled("OCPP Server URL", serverUrl, MUTED));
+                  ocppCard.addView(labeled("AuthKey / Password", authKey, MUTED));
+                  ocppCard.addView(requiresPassword);
 
-                  TextView hint = text("OCPP 1.6J • ws/wss auto-detected • AuthKey is sent in ABB's binary securityKey field.", 11, false, MUTED);
+                  TextView hint = text("OCPP 1.6J • ws/wss auto-detected • OCPP unlocks only after internet status is ready.", 11, false, MUTED);
                   hint.setPadding(0,dp(4),0,dp(8));
-                  ocpp.addView(hint);
+                  ocppCard.addView(hint);
 
                   saveBtn = button("CONFIGURE CHARGER", ACCENT, Color.rgb(4,35,38));
                   saveBtn.setEnabled(false);
-                  ocpp.addView(saveBtn, new LinearLayout.LayoutParams(-1,dp(58)));
+                  ocppCard.addView(saveBtn, new LinearLayout.LayoutParams(-1,dp(58)));
                   saveBtn.setOnClickListener(v -> configureCharger());
-                  root.addView(ocpp, cardLp());
+                  root.addView(ocppCard, cardLp());
+                  setOcppUiEnabled(false);
 
                   LinearLayout progressCard = card(CARD);
                   progressCard.addView(section("COMMISSIONING STATUS", ACCENT));
@@ -455,7 +515,8 @@ jobs:
                   progress("Authorization", false, "Waiting");
                   progress("Secure session", false, "Waiting");
                   progress("Authentication", false, "Waiting");
-                  progress("OCPP configuration", false, "Waiting");
+                  progress("Internet connection", false, "Save connection first");
+                  progress("OCPP configuration", false, "Locked until internet is ready");
                   progress("Verification", false, "Waiting");
 
                   verifyBtn = button("VERIFY SECURE SESSION", SECONDARY, WHITE);
@@ -840,11 +901,16 @@ jobs:
                       try {
                           requirePacketOk(p,"Sync time");
                           authenticated=true;
+                          internetReady=false;
+                          expectedNetworkMode=0;
                           progress("Authentication",true,"Secure charger session active");
                           progress("Secure session",true,"AES-GCM active");
+                          progress("Internet connection",false,"Save Wi-Fi/Ethernet connection first");
+                          progress("OCPP configuration",false,"Locked until internet is ready");
+                          setOcppUiEnabled(false);
                           setStatus("CHARGER AUTHENTICATED",
-                                  deviceNumber+" • secure session ready • charger acknowledgement/beep expected");
-                          appendLog("AUTH SUCCESS. Official Terra flow is now complete through SYNC_TIME.");
+                                  deviceNumber+" • secure session ready • beep/acknowledgement confirmed");
+                          appendLog("AUTH SUCCESS. Secure BLE handshake + SYNC_TIME complete.");
                           updateButtons();
                       } catch(Exception e) { authFailed(e); }
                   });
@@ -858,8 +924,220 @@ jobs:
                   updateButtons();
               }
 
+              private void saveInternetConnection() {
+                  if (!authenticated) {
+                      toast("Authenticate charger first.");
+                      return;
+                  }
+
+                  internetReady=false;
+                  setOcppUiEnabled(false);
+
+                  int position=connectionType.getSelectedItemPosition();
+                  expectedNetworkMode=(position==0)?NET_WIFI:NET_ETHERNET;
+
+                  if (position==0) {
+                      String ssid=wifiSsid.getText().toString();
+                      String password=wifiPassword.getText().toString();
+
+                      if (ssid.trim().isEmpty()) {
+                          toast("Wi-Fi SSID is required.");
+                          return;
+                      }
+
+                      byte[] payload=buildWifiPayload(ssid,password);
+                      progress("Internet connection",false,"Saving Wi-Fi credentials...");
+                      connectionStatus.setText("Saving Wi-Fi configuration...");
+                      appendLog("TX WIFI D2 ssid="+ssid+" password=<hidden>");
+
+                      sendEncrypted(CMD_WIFI_CONFIG,payload,p -> {
+                          try {
+                              requirePacketOk(p,"Wi-Fi configuration");
+                              int detail=parseConfigDetail(p.payload);
+                              appendLog("RX WIFI D2 payload="+hex(p.payload)+" detail=0x"
+                                      +String.format(Locale.US,"%04X",detail));
+
+                              if (detail!=0)
+                                  throw new Exception("Wi-Fi configuration rejected, detail=0x"
+                                          +String.format(Locale.US,"%04X",detail));
+
+                              connectionStatus.setText("Wi-Fi credentials saved. Switching network mode...");
+                              main.postDelayed(() -> changeNetworkMode(NET_WIFI),350);
+                          } catch(Exception e) {
+                              internetReady=false;
+                              progress("Internet connection",false,safeError(e));
+                              failStatus("Wi-Fi save failed",safeError(e));
+                              updateButtons();
+                          }
+                      });
+                  } else {
+                      progress("Internet connection",false,"Switching charger to Ethernet...");
+                      connectionStatus.setText("Switching to Ethernet...");
+                      changeNetworkMode(NET_ETHERNET);
+                  }
+              }
+
+              private byte[] buildWifiPayload(String ssid,String password) {
+                  // TerraConfig RequestBodyFactory.configurationWifiNetworkRequestBody():
+                  // 02 + SSID UTF-8 + 0A + PASSWORD UTF-8 + 03
+                  return concat(
+                          new byte[]{0x02},
+                          ssid.getBytes(StandardCharsets.UTF_8),
+                          new byte[]{0x0A},
+                          password.getBytes(StandardCharsets.UTF_8),
+                          new byte[]{0x03}
+                  );
+              }
+
+              private int parseConfigDetail(byte[] payload) {
+                  // D2 and D4 response payload:
+                  // byte 0 = sub-code
+                  // byte 1..2 = little-endian detailDescCode
+                  if (payload==null || payload.length<3) return 0;
+                  return (payload[1]&0xff)|((payload[2]&0xff)<<8);
+              }
+
+              private void changeNetworkMode(int mode) {
+                  sendEncrypted(CMD_CHANGE_NET_MODE,new byte[]{(byte)mode},p -> {
+                      try {
+                          requirePacketOk(p,"Change network mode");
+                          int detail=parseConfigDetail(p.payload);
+                          appendLog("RX D4 mode="+mode+" payload="+hex(p.payload)+" detail=0x"
+                                  +String.format(Locale.US,"%04X",detail));
+
+                          if (detail!=0) {
+                              String msg=detail==0x0101
+                                      ?"network mode start failed"
+                                      : detail==0x0201
+                                      ?"unknown network mode error"
+                                      :"network detail=0x"+String.format(Locale.US,"%04X",detail);
+                              throw new Exception(msg);
+                          }
+
+                          progress("Internet connection",false,"Connection saved; checking internet...");
+                          connectionStatus.setText("Connection saved. Checking network status...");
+                          main.postDelayed(() -> queryNetworkStatus(0),1500);
+                      } catch(Exception e) {
+                          internetReady=false;
+                          progress("Internet connection",false,safeError(e));
+                          failStatus("Network mode save failed",safeError(e));
+                          updateButtons();
+                      }
+                  });
+              }
+
+              private void checkInternetConnection() {
+                  if (!authenticated) {
+                      toast("Authenticate charger first.");
+                      return;
+                  }
+
+                  expectedNetworkMode=connectionType.getSelectedItemPosition()==0
+                          ?NET_WIFI
+                          :NET_ETHERNET;
+
+                  connectionStatus.setText("Checking charger internet status...");
+                  queryNetworkStatus(0);
+              }
+
+              private void queryNetworkStatus(int attempt) {
+                  sendEncrypted(CMD_NETWORK_STATUS,new byte[0],p -> {
+                      try {
+                          requirePacketOk(p,"Network status");
+
+                          if (p.payload==null || p.payload.length<4)
+                              throw new Exception("Network status payload too short: "+hex(p.payload));
+
+                          int networkResult=p.payload[0]&0xff;
+                          int mode=p.payload[1]&0xff;
+                          int detail=(p.payload[2]&0xff)|((p.payload[3]&0xff)<<8);
+                          String detailText=networkDetailText(detail);
+
+                          appendLog("RX D3 networkResult="+networkResult
+                                  +" mode="+mode
+                                  +" detail=0x"+String.format(Locale.US,"%04X",detail)
+                                  +" ("+detailText+")");
+
+                          boolean success=detail==0x0200;
+                          boolean modeMatches=expectedNetworkMode==0 || mode==expectedNetworkMode;
+
+                          if (success && modeMatches) {
+                              internetReady=true;
+                              String modeName=mode==NET_WIFI?"Wi-Fi":mode==NET_ETHERNET?"Ethernet":"mode "+mode;
+                              progress("Internet connection",true,modeName+" ready");
+                              connectionStatus.setText("✓ INTERNET READY • "+modeName);
+                              connectionStatus.setTextColor(Color.rgb(44,220,199));
+                              progress("OCPP configuration",false,"Ready for custom OCPP");
+                              setOcppUiEnabled(true);
+                              setStatus("INTERNET READY","Now enter OCPP URL, Charger ID and AuthKey.");
+                              updateButtons();
+                              return;
+                          }
+
+                          if (!success && !isHardNetworkError(detail) && attempt<5) {
+                              connectionStatus.setText("Waiting for network... "+(attempt+1)+"/6 • "+detailText);
+                              main.postDelayed(() -> queryNetworkStatus(attempt+1),2000);
+                              return;
+                          }
+
+                          internetReady=false;
+                          setOcppUiEnabled(false);
+                          progress("Internet connection",false,detailText);
+                          connectionStatus.setText("✕ "+detailText+" • mode="+mode);
+                          connectionStatus.setTextColor(Color.rgb(255,160,160));
+                          failStatus("Internet connection not ready",detailText);
+                          updateButtons();
+
+                      } catch(Exception e) {
+                          if (attempt<5) {
+                              main.postDelayed(() -> queryNetworkStatus(attempt+1),1800);
+                          } else {
+                              internetReady=false;
+                              setOcppUiEnabled(false);
+                              progress("Internet connection",false,safeError(e));
+                              failStatus("Network status check failed",safeError(e));
+                              updateButtons();
+                          }
+                      }
+                  });
+              }
+
+              private boolean isHardNetworkError(int detail) {
+                  return detail==0x1001 || detail==0x1002 || detail==0x1003
+                          || detail==0x1005 || detail==0x1006
+                          || detail==0x1401 || detail==0x1502
+                          || detail==0x5023;
+              }
+
+              private String networkDetailText(int detail) {
+                  switch(detail) {
+                      case 0x0200: return "Success / internet ready";
+                      case 0x0400: return "Client/network problem";
+                      case 0x0500: return "Server/internet problem";
+                      case 0x1001: return "Wi-Fi module not found";
+                      case 0x1002: return "Wi-Fi module not supported";
+                      case 0x1003: return "Wi-Fi hardware switch could not be enabled";
+                      case 0x1005: return "Invalid Wi-Fi SSID";
+                      case 0x1006: return "Invalid Wi-Fi password";
+                      case 0x1401: return "DHCP failed";
+                      case 0x1502: return "Set IP failed";
+                      case 0x5023: return "Unknown Wi-Fi error";
+                      default: return "Network detail 0x"+String.format(Locale.US,"%04X",detail);
+                  }
+              }
+
+              private void setOcppUiEnabled(boolean enabled) {
+                  if (chargePointId!=null) chargePointId.setEnabled(enabled);
+                  if (serverUrl!=null) serverUrl.setEnabled(enabled);
+                  if (authKey!=null) authKey.setEnabled(enabled);
+                  if (requiresPassword!=null) requiresPassword.setEnabled(enabled);
+                  if (saveBtn!=null) saveBtn.setEnabled(enabled && authenticated && internetReady);
+                  if (ocppCard!=null) ocppCard.setAlpha(enabled?1.0f:0.48f);
+              }
+
               private void configureCharger() {
                   if (!authenticated) { toast("Authenticate charger first."); return; }
+                  if (!internetReady) { toast("Save and verify internet connection first."); return; }
 
                   String cp=chargePointId.getText().toString().trim();
                   String url=serverUrl.getText().toString().trim();
@@ -871,10 +1149,6 @@ jobs:
                   }
                   if (requiresPassword.isChecked()) {
                       if (key.isEmpty()) { toast("AuthKey is required."); return; }
-                      if ((key.length()&1)==1 || !key.matches("[0-9A-Fa-f]+")) {
-                          toast("ABB securityKey expects hexadecimal AuthKey with an even number of characters.");
-                          return;
-                      }
                   } else key="";
 
                   try {
@@ -882,17 +1156,27 @@ jobs:
                       progress("OCPP configuration",false,"Writing D6 configuration...");
                       progress("Verification",false,"Waiting");
                       saveBtn.setEnabled(false);
-                      appendLog("TX OCPP D6 id="+cp+" url="+url+" auth="+(key.isEmpty()?"off":"on"));
+                      appendLog("TX OCPP D6 id="+cp+" url="+url+" auth="+(key.isEmpty()?"off":"on")+" internet=ready");
 
                       sendEncrypted(CMD_OCPP,payload,p -> {
                           try {
                               requirePacketOk(p,"OCPP configure");
-                              int result=(p.payload!=null && p.payload.length>0)?(p.payload[0]&0xff):1;
-                              if (result==0) throw new Exception("Charger reported OCPP configuration failure.");
-                              if (result==2) throw new Exception("Charger reported security identity failure.");
+                              if (p.payload==null || p.payload.length<1)
+                                  throw new Exception("D6 response payload is empty.");
+
+                              int result=p.payload[0]&0xff;
+                              if (result==2) {
+                                  int fault=(p.payload.length>1)?(p.payload[1]&0xff):-1;
+                                  throw new Exception("OCPP D6 rejected, faultCause="
+                                          +(fault<0?"unknown":String.valueOf(fault)));
+                              }
+                              if (result!=1)
+                                  throw new Exception("Unexpected OCPP D6 result="+result
+                                          +" payload="+hex(p.payload));
+
                               progress("OCPP configuration",true,"Accepted by charger");
                               setStatus("CONFIGURATION SAVED","Charger accepted custom OCPP configuration.");
-                              appendLog("OCPP D6 accepted result="+result);
+                              appendLog("OCPP D6 accepted result=1 payload="+hex(p.payload));
                               main.postDelayed(this::verifyOcpp,700);
                           } catch(Exception e) {
                               progress("OCPP configuration",false,safeError(e));
@@ -905,7 +1189,7 @@ jobs:
                   }
               }
 
-              private byte[] buildOcppPayload(String fullUrl,String chargerId,String securityKeyHex) throws Exception {
+              private byte[] buildOcppPayload(String fullUrl,String chargerId,String securityKeyText) throws Exception {
                   java.net.URI uri=new java.net.URI(fullUrl);
                   String scheme=uri.getScheme();
                   String host=uri.getHost();
@@ -915,15 +1199,16 @@ jobs:
                   int port=uri.getPort();
                   if (port<=0) port=tls?443:80;
 
-                  StringBuilder domain=new StringBuilder();
-                  domain.append(scheme.toLowerCase(Locale.US)).append("://").append(host);
-                  String path=uri.getRawPath();
-                  if (path!=null && !path.isEmpty()) domain.append(path);
-                  String query=uri.getRawQuery();
-                  if (query!=null && !query.isEmpty()) domain.append("?").append(query);
+                  // TerraConfig uses String.valueOf(parsed URI) for domainUrl,
+                  // so an explicit :port remains in domainUrl as well as in the port field.
+                  byte[] domainBytes=fullUrl.getBytes(StandardCharsets.UTF_8);
 
-                  byte[] domainBytes=domain.toString().getBytes(StandardCharsets.UTF_8);
-                  byte[] keyBytes=securityKeyHex.isEmpty()?new byte[0]:unhex(securityKeyHex);
+                  // Custom server password flow in TerraConfig:
+                  // plain text -> UTF-8 -> hex string -> RequestBodyFactory.stringToBytes()
+                  // Therefore the bytes written to D6 are the original UTF-8 text bytes.
+                  byte[] keyBytes=securityKeyText.isEmpty()
+                          ?new byte[0]
+                          :securityKeyText.getBytes(StandardCharsets.UTF_8);
                   byte[] tag=chargerId.getBytes(StandardCharsets.UTF_8);
 
                   if (domainBytes.length>255 || keyBytes.length>255 || tag.length>255)
@@ -1344,6 +1629,8 @@ jobs:
                   transportReady=false;
                   authenticated=false;
                   encryptedMode=false;
+                  internetReady=false;
+                  expectedNetworkMode=0;
                   tx=null;rx=null;
                   encryptionKey=null;
                   cipherInfo=null;
@@ -1475,8 +1762,10 @@ jobs:
                   runOnUiThread(() -> {
                       disconnectBtn.setEnabled(gatt!=null);
                       authBtn.setEnabled(transportReady && !authenticated);
-                      saveBtn.setEnabled(authenticated);
+                      if (saveConnectionBtn!=null) saveConnectionBtn.setEnabled(authenticated);
+                      if (checkConnectionBtn!=null) checkConnectionBtn.setEnabled(authenticated);
                       verifyBtn.setEnabled(authenticated);
+                      setOcppUiEnabled(authenticated && internetReady);
                   });
               }
 
@@ -1727,14 +2016,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-3.2.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-3.3.apk
           cd artifact
-          sha256sum ABB-Terra-Direct-Secure-3.2.apk | tee ABB-Terra-Direct-Secure-3.2.apk.sha256
+          sha256sum ABB-Terra-Direct-Secure-3.3.apk | tee ABB-Terra-Direct-Secure-3.3.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ABB-Terra-Direct-Secure-3.2
+          name: ABB-Terra-Direct-Secure-3.3
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
