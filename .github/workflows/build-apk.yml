@@ -1,4 +1,4 @@
-name: Build ABB Terra Direct Secure
+name: Build ABB Terra Direct Secure FIX
 
 on:
   workflow_dispatch:
@@ -79,8 +79,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 300
-                  versionName '3.0-direct-secure'
+                  versionCode 310
+                  versionName '3.1-direct-secure'
               }
 
               buildTypes {
@@ -355,8 +355,8 @@ jobs:
                   requestPerms();
 
                   updateAdminState();
-                  appendLog("ABB Terra Direct Secure 3.0 started");
-                  appendLog("Daily operation: PIN + direct BLE. ABB account is only used once to create a saved authorization token.");
+                  appendLog("ABB Terra Direct Secure 3.1 started");
+                  appendLog("Daily operation: PIN + direct secure BLE. Secure 0xFE authentication is AES-GCM from handshake step 1.");
               }
 
               private void buildUi() {
@@ -658,6 +658,8 @@ jobs:
                           runOnUiThread(() -> {
                               progress("Authorization",true,"PIN authorized");
                               progress("Secure session",true,"Cipher loaded");
+                              // Secure Terra AC firmware encrypts the 0xFE handshake itself.
+                              encryptedMode=true;
                               startHandshake1();
                           });
                       } catch(Exception e) {
@@ -724,22 +726,29 @@ jobs:
                   try {
                       clientNonce=new byte[16];
                       rng.nextBytes(clientNonce);
-                      progress("Authentication",false,"Handshake 1/3");
-                      sendPlain(CMD_AUTH,concat(new byte[]{1},clientNonce),p -> {
+                      sessionToken=new byte[8];
+
+                      progress("Authentication",false,"Secure handshake 1/3");
+                      appendLog("Handshake 1: encrypted 0xFE request");
+
+                      sendEncrypted(CMD_AUTH,concat(new byte[]{1},clientNonce),p -> {
                           try {
                               requirePacketOk(p,"Handshake 1");
-                              if (p.payload==null || p.payload.length<34) throw new Exception("Handshake 1 payload too short.");
+                              if (p.payload==null || p.payload.length<34)
+                                  throw new Exception("Handshake 1 payload too short: "+(p.payload==null?0:p.payload.length));
+
                               int idx=p.payload[0]&0xff;
+                              int result=p.payload[1]&0xff;
                               if (idx!=1) throw new Exception("Unexpected handshake index "+idx);
+                              if (result==0) throw new Exception("Handshake 1 rejected.");
 
                               byte[] echoed=Arrays.copyOfRange(p.payload,2,18);
                               byte[] serverNonce=Arrays.copyOfRange(p.payload,18,34);
-                              if (!Arrays.equals(echoed,clientNonce)) throw new Exception("Client nonce mismatch.");
-                              if (isAllZero(serverNonce)) throw new Exception("Server nonce missing.");
 
-                              byte[] aad=lastBytes(p.payload,22);
-                              if (aad.length==22 && !Arrays.equals(aad,buildAad()))
-                                  throw new Exception("AAD mismatch; detected firmware/device identity differs.");
+                              if (!Arrays.equals(echoed,clientNonce))
+                                  throw new Exception("Handshake 1 client nonce mismatch.");
+                              if (isAllZero(serverNonce))
+                                  throw new Exception("Handshake 1 server nonce missing.");
 
                               appendLog("Handshake 1 OK");
                               startHandshake2(serverNonce);
@@ -749,22 +758,24 @@ jobs:
               }
 
               private void startHandshake2(byte[] serverNonce) {
-                  progress("Authentication",false,"Handshake 2/3");
-                  sendPlain(CMD_AUTH,concat(new byte[]{2},serverNonce),p -> {
+                  progress("Authentication",false,"Secure handshake 2/3");
+                  appendLog("Handshake 2: encrypted 0xFE request");
+
+                  sendEncrypted(CMD_AUTH,concat(new byte[]{2},serverNonce),p -> {
                       try {
                           requirePacketOk(p,"Handshake 2");
-                          if (p.payload==null || p.payload.length<10) throw new Exception("Handshake 2 payload too short.");
+                          if (p.payload==null || p.payload.length<2)
+                              throw new Exception("Handshake 2 payload too short: "+(p.payload==null?0:p.payload.length));
+
                           int idx=p.payload[0]&0xff;
                           int result=p.payload[1]&0xff;
-                          if (idx!=2 || result!=1) throw new Exception("Handshake 2 rejected. result="+result);
+                          if (idx!=2 || result!=1)
+                              throw new Exception("Handshake 2 rejected. idx="+idx+" result="+result);
 
-                          sessionToken=Arrays.copyOfRange(p.payload,2,10);
-                          if (isAllZero(sessionToken)) throw new Exception("Session token missing.");
+                          if (p.token==null || p.token.length!=8 || isAllZero(p.token))
+                              throw new Exception("Handshake 2 session token missing.");
 
-                          byte[] aad=lastBytes(p.payload,22);
-                          if (aad.length==22 && !Arrays.equals(aad,buildAad()))
-                              throw new Exception("Handshake 2 AAD mismatch.");
-
+                          sessionToken=Arrays.copyOf(p.token,8);
                           appendLog("Handshake 2 OK; session token received.");
                           startHandshake3();
                       } catch(Exception e) { authFailed(e); }
@@ -772,7 +783,8 @@ jobs:
               }
 
               private void startHandshake3() throws Exception {
-                  progress("Authentication",false,"Handshake 3/3");
+                  progress("Authentication",false,"Secure handshake 3/3");
+
                   byte[] block=new byte[48];
                   byte[] dn=deviceNumber.replace("-","").getBytes(StandardCharsets.UTF_8);
                   System.arraycopy(dn,0,block,0,Math.min(20,dn.length));
@@ -782,16 +794,22 @@ jobs:
                   byte[] uid=String.valueOf(userId).getBytes(StandardCharsets.UTF_8);
                   System.arraycopy(uid,0,block,22,Math.min(15,uid.length));
 
-                  sendPlain(CMD_AUTH,concat(new byte[]{3},block),p -> {
+                  appendLog("Handshake 3: encrypted 0xFE identity request");
+                  sendEncrypted(CMD_AUTH,concat(new byte[]{3},block),p -> {
                       try {
                           requirePacketOk(p,"Handshake 3");
-                          if (p.payload!=null && p.payload.length>=2) {
-                              int idx=p.payload[0]&0xff;
-                              int result=p.payload[1]&0xff;
-                              if (idx==3 && result==0) throw new Exception("Handshake 3 rejected.");
-                          }
-                          encryptedMode=true;
-                          appendLog("Handshake 3 OK; AES-GCM mode enabled.");
+                          if (p.payload==null || p.payload.length<2)
+                              throw new Exception("Handshake 3 payload too short.");
+
+                          int idx=p.payload[0]&0xff;
+                          int result=p.payload[1]&0xff;
+                          if (idx!=3 || result!=1)
+                              throw new Exception("Handshake 3 rejected. idx="+idx+" result="+result);
+
+                          if (p.token!=null && p.token.length==8 && !isAllZero(p.token))
+                              sessionToken=Arrays.copyOf(p.token,8);
+
+                          appendLog("Handshake 3 OK; secure application session established.");
                           querySysInfo();
                       } catch(Exception e) { authFailed(e); }
                   });
@@ -1043,7 +1061,12 @@ jobs:
                   byte[] cipherText=Arrays.copyOfRange(encrypted,0,cipherLen);
                   byte[] tag=Arrays.copyOfRange(encrypted,cipherLen,encrypted.length);
 
-                  byte[] body=concat(cipherText,aad,iv,tag,cipherInfo);
+                  // Captured TerraConfig 3.5.0 framing:
+                  // 0xFE authentication request = ciphertext + AAD(22) + IV(12) + TAG(16) + cipherInfo(16)
+                  // normal secure request        = ciphertext + IV(12) + TAG(16)
+                  byte[] body=(cmd==CMD_AUTH)
+                          ? concat(cipherText,aad,iv,tag,cipherInfo)
+                          : concat(cipherText,iv,tag);
                   byte[] frame=new byte[8+body.length];
                   frame[0]=(byte)((cmd==0xBA || cmd==0xD9)?0xAA:0xFE);
                   frame[1]=(byte)cmd;
@@ -1057,6 +1080,8 @@ jobs:
                   for(int i=0;i<7;i++) xor^=frame[i]&0xff;
                   for(byte b:body) xor^=b&0xff;
                   frame[7]=(byte)xor;
+                  appendLog("SECURE FRAME cmd=0x"+hexByte(cmd)+" body="+body.length
+                          +(cmd==CMD_AUTH?" auth-layout":" normal-layout"));
                   return frame;
               }
 
@@ -1109,7 +1134,8 @@ jobs:
                       int xor=0;
                       for(int i=0;i<7;i++) xor^=frame[i]&0xff;
                       for(int i=8;i<frame.length;i++) xor^=frame[i]&0xff;
-                      if ((frame[7]&0xff)!=(xor&0xff)) throw new Exception("Checksum mismatch.");
+                      if ((frame[7]&0xff)!=(xor&0xff))
+                          throw new Exception("Checksum mismatch.");
 
                       if (!encrypted) {
                           if (frame.length<16+len) throw new Exception("Plain frame incomplete.");
@@ -1118,31 +1144,54 @@ jobs:
                           return p;
                       }
 
+                      // Even an error response can have no decryptable body.
                       if (p.code!=0) {
-                          p.payload=Arrays.copyOfRange(frame,8,frame.length);
+                          p.payload=Arrays.copyOfRange(frame,8,Math.min(frame.length,8+len));
                           return p;
                       }
 
                       byte[] body=Arrays.copyOfRange(frame,8,8+len);
-                      if (body.length<66) throw new Exception("Encrypted body too short.");
-
-                      int cipherLen=body.length-66;
-                      byte[] cipherText=Arrays.copyOfRange(body,0,cipherLen);
-                      byte[] receivedAad=Arrays.copyOfRange(body,cipherLen,cipherLen+22);
-                      byte[] iv=Arrays.copyOfRange(body,cipherLen+22,cipherLen+34);
-                      byte[] tag=Arrays.copyOfRange(body,cipherLen+34,cipherLen+50);
-                      byte[] info=Arrays.copyOfRange(body,cipherLen+50,cipherLen+66);
-
                       byte[] aad=buildAad();
-                      if (!Arrays.equals(receivedAad,aad)) throw new Exception("Encrypted response AAD mismatch.");
-                      if (cipherInfo!=null && cipherInfo.length==16 && !Arrays.equals(info,cipherInfo))
-                          appendLog("WARN: response cipher info differs.");
+                      byte[] cipherText;
+                      byte[] iv;
+                      byte[] tag;
+
+                      if (p.cmd==CMD_AUTH) {
+                          // TerraConfig secure-auth response:
+                          // ciphertext + AAD(22) + IV(12) + TAG(16)
+                          final int overhead=50;
+                          if (body.length<overhead)
+                              throw new Exception("Secure auth response too short: "+body.length);
+
+                          int cipherLen=body.length-overhead;
+                          cipherText=Arrays.copyOfRange(body,0,cipherLen);
+                          byte[] receivedAad=Arrays.copyOfRange(body,cipherLen,cipherLen+22);
+                          iv=Arrays.copyOfRange(body,cipherLen+22,cipherLen+34);
+                          tag=Arrays.copyOfRange(body,cipherLen+34,cipherLen+50);
+
+                          if (!Arrays.equals(receivedAad,aad))
+                              throw new Exception("Secure auth AAD mismatch.");
+                      } else {
+                          // Normal secure response:
+                          // ciphertext + IV(12) + TAG(16)
+                          final int overhead=28;
+                          if (body.length<overhead)
+                              throw new Exception("Secure response too short: "+body.length);
+
+                          int cipherLen=body.length-overhead;
+                          cipherText=Arrays.copyOfRange(body,0,cipherLen);
+                          iv=Arrays.copyOfRange(body,cipherLen,cipherLen+12);
+                          tag=Arrays.copyOfRange(body,cipherLen+12,cipherLen+28);
+                      }
 
                       Cipher c=Cipher.getInstance("AES/GCM/NoPadding");
-                      c.init(Cipher.DECRYPT_MODE,new SecretKeySpec(encryptionKey,"AES"),new GCMParameterSpec(128,iv));
+                      c.init(Cipher.DECRYPT_MODE,new SecretKeySpec(encryptionKey,"AES"),
+                              new GCMParameterSpec(128,iv));
                       c.updateAAD(aad);
+
                       byte[] plain=c.doFinal(concat(cipherText,tag));
-                      if (plain.length<8) throw new Exception("Decrypted payload shorter than token.");
+                      if (plain.length<8)
+                          throw new Exception("Decrypted payload shorter than session token.");
 
                       p.token=Arrays.copyOfRange(plain,0,8);
                       p.payload=Arrays.copyOfRange(plain,8,plain.length);
@@ -1174,7 +1223,17 @@ jobs:
               private void requirePacketOk(Packet p,String step) throws Exception {
                   if (p==null) throw new Exception(step+": no response.");
                   if (p.error!=null) throw new Exception(step+": "+p.error);
-                  if (p.code!=0) throw new Exception(step+": response code "+p.code);
+                  if (p.code!=0) {
+                      String meaning=p.code==17?"parse error":
+                              p.code==18?"no permission":
+                              p.code==19?"service refused":
+                              p.code==20?"command does not exist":
+                              p.code==21?"command not supported":
+                              p.code==22?"token timeout":
+                              p.code==80?"device internal error":
+                              p.code==81?"command execution failed":"unknown";
+                      throw new Exception(step+": response code "+p.code+" ("+meaning+")");
+                  }
               }
 
               private void queuePacket(byte[] packet) {
@@ -1667,14 +1726,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-3.1.apk
           cd artifact
-          sha256sum ABB-Terra-Direct-Secure.apk | tee ABB-Terra-Direct-Secure.apk.sha256
+          sha256sum ABB-Terra-Direct-Secure-3.1.apk | tee ABB-Terra-Direct-Secure-3.1.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ABB-Terra-Direct-Secure
+          name: ABB-Terra-Direct-Secure-3.1
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
