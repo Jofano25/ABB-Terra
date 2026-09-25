@@ -1,4 +1,4 @@
-name: Build ABB Terra Direct Secure 3.9 WIFI-FIX
+name: Build ABB Terra Direct Secure 4.0 WIFI-ROLLBACK-FIX
 
 on:
   workflow_dispatch:
@@ -79,8 +79,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 390
-                  versionName '3.9-wifi-fix-fw210'
+                  versionCode 400
+                  versionName '4.0-wifi-rollback-fix-fw210'
               }
 
               buildTypes {
@@ -180,6 +180,7 @@ jobs:
               private static final int CMD_WIFI_CONFIG = 0xD2;
               private static final int CMD_NETWORK_STATUS = 0xD3;
               private static final int CMD_READ_CONFIGURATION = 0xC5;
+              private static final int CMD_WIFI_NETWORK_CONFIG = 0xC7; // newer Wi-Fi config/read family
               private static final int CMD_OCPP = 0xD6;
               private static final int CMD_QUERY_DEVICE_NET_CONFIG = 0xDB;
               private static final int CMD_QUERY_WIFI_INFO = 0xE4;
@@ -331,7 +332,9 @@ jobs:
                               autoReconnectEnabled=true;
                               setStatus("CHARGER REBOOTING","Waiting for "+target+" to return...");
                               appendLog("Expected reboot detected. Auto reconnect armed for "+target);
-                              main.postDelayed(() -> startScan(),3500);
+                              // FW 2.1.0 advertises again before its FFF0 service is always ready.
+                              // Give the charger more time to finish the network/BLE restart.
+                              main.postDelayed(() -> startScan(),8000);
                           } else {
                               setStatus("Disconnected", "Scan and select charger.");
                           }
@@ -346,7 +349,20 @@ jobs:
 
                   @Override public void onServicesDiscovered(BluetoothGatt gg, int status) {
                       BluetoothGattService service = gg.getService(FFF0);
-                      if (service == null) { failStatus("Terra BLE service not found", "FFF0 missing"); return; }
+                      if (service == null) {
+                          appendLog("FFF0 missing after reconnect; charger may still be booting.");
+                          if (autoReconnectDeviceNumber!=null && !autoReconnectDeviceNumber.isEmpty()) {
+                              String target=autoReconnectDeviceNumber;
+                              try { gg.disconnect(); } catch(Exception ignored) {}
+                              autoReconnectDeviceNumber=target;
+                              autoReconnectEnabled=true;
+                              setStatus("CHARGER STILL BOOTING","FFF0 not ready; retrying automatically...");
+                              main.postDelayed(() -> startScan(),5000);
+                          } else {
+                              failStatus("Terra BLE service not found", "FFF0 missing");
+                          }
+                          return;
+                      }
                       tx = service.getCharacteristic(FFF3);
                       rx = service.getCharacteristic(FFF4);
                       if (tx == null || rx == null) { failStatus("Terra BLE channel incomplete", "FFF3/FFF4 missing"); return; }
@@ -416,7 +432,7 @@ jobs:
 
                   if (hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("ABB Terra Direct Secure 3.9 started");
+                      appendLog("ABB Terra Direct Secure 4.0 started");
                       appendLog("Saved authorization found. Opening commissioning screen.");
                   } else {
                       showLoginScreen();
@@ -694,7 +710,7 @@ jobs:
                           runOnUiThread(() -> {
                               adminPassword.setText("");
                               buildUi();
-                              appendLog("ABB Terra Direct Secure 3.9 started");
+                              appendLog("ABB Terra Direct Secure 4.0 started");
                               appendLog("LOGIN SUCCESS. Authorization stored securely; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -1247,6 +1263,32 @@ jobs:
                       return;
                   }
 
+                  if (connectionPosition==0) {
+                      int passLen=wifiPass.length();
+                      appendLog("WIFI PREFLIGHT ssid="+ssid+" passwordLength="+passLen);
+
+                      // A secured WPA/WPA2 PSK network normally requires 8..63 characters
+                      // (or exactly 64 hexadecimal characters). A 1..7 character value
+                      // causes many APs/clients to reject association; do not let the charger
+                      // reboot and silently roll back to its old SSID in that case.
+                      if (passLen>0 && passLen<8) {
+                          String m="Wi-Fi password is only "+passLen
+                                  +" characters. For WPA/WPA2 PSK use 8-63 characters. "
+                                  +"If the SSID is open, clear the password field.";
+                          appendLog("WIFI PREFLIGHT BLOCKED: "+m);
+                          failStatus("WI-FI PASSWORD INVALID",m);
+                          toast(m);
+                          return;
+                      }
+                      if (passLen>63 && !(passLen==64 && wifiPass.matches("[0-9A-Fa-f]{64}"))) {
+                          String m="Wi-Fi password is too long. Use 8-63 characters or a 64-digit hex PSK.";
+                          appendLog("WIFI PREFLIGHT BLOCKED: "+m);
+                          failStatus("WI-FI PASSWORD INVALID",m);
+                          toast(m);
+                          return;
+                      }
+                  }
+
                   saveBtn.setEnabled(false);
                   lastOcppApplyOk=false;
                   lastOcppApplyMessage="Not applied";
@@ -1436,14 +1478,15 @@ jobs:
                   loadLocalProfile();
                   progress("Current configuration",false,"READ ALL in progress...");
                   setStatus("READING ALL CONFIGURATION",
-                          "E4/AA/D3/DB/C5 • Wi-Fi, DHCP/static and OCPP");
-                  appendLog("READ ALL START: E4 -> AA -> D3 -> DB -> C5");
+                          "E4/C7/AA/D3/DB/C5 • Wi-Fi, DHCP/static and OCPP");
+                  appendLog("READ ALL START: E4 -> C7 -> AA -> D3 -> DB -> C5");
 
                   queryWifiInfo(() ->
-                          queryTcpIpConfig(() ->
-                              queryNetworkStatusForRead(() ->
-                                  queryDeviceNetConfigForRead(() ->
-                                      queryGenericConfigForRead()))));
+                          queryWifiNetworkConfigForRead(() ->
+                              queryTcpIpConfig(() ->
+                                  queryNetworkStatusForRead(() ->
+                                      queryDeviceNetConfigForRead(() ->
+                                          queryGenericConfigForRead())))));
               }
 
               private void queryWifiInfo(Runnable next) {
@@ -1459,9 +1502,13 @@ jobs:
                                   +" password=<hidden>");
 
                           if (!ssid.isEmpty()) wifiSsid.setText(ssid);
-                          if (!password.isEmpty()) wifiPassword.setText(password);
 
-                          if (!ssid.isEmpty()) {
+                          // Do NOT silently replace the editable password with the charger's
+                          // previous Wi-Fi password during a failed post-write verification.
+                          // That can make the next attempt combine a new SSID with an old key.
+                          if (!wifiWritePending && !password.isEmpty()) wifiPassword.setText(password);
+
+                          if (!ssid.isEmpty() && !wifiWritePending) {
                               writeSecure(profileKey("wifi_ssid"),ssid);
                               if (!password.isEmpty()) writeSecure(profileKey("wifi_password"),password);
                           }
@@ -1477,8 +1524,15 @@ jobs:
                                   appendLog("WIFI VERIFY FAILED desired="+pendingDesiredSsid+" actual="+ssid);
                                   progress("Internet connection",false,"Wi-Fi NOT saved; charger still reports "+ssid);
                                   connectionStatus.setText("✕ Wi-Fi not changed. Charger actual SSID: "+ssid);
-                                  setStatus("WI-FI NOT SAVED",
-                                          "Requested "+pendingDesiredSsid+" but charger still reports "+ssid+". Check AP/password/2.4 GHz and log AB/D4/D2.");
+                                  int desiredPasswordLength=wifiPassword.getText().toString().length();
+                                  setStatus("WI-FI ROLLED BACK",
+                                          "Requested "+pendingDesiredSsid+" but charger returned to "+ssid+". "
+                                          +"Check 2.4 GHz availability and Wi-Fi credentials. Password length sent="
+                                          +desiredPasswordLength+".");
+                                  appendLog("WIFI ROLLBACK CONFIRMED desired="+pendingDesiredSsid
+                                          +" actual="+ssid+" sentPasswordLength="+desiredPasswordLength);
+                                  // Keep the requested password in the input field for correction/retry;
+                                  // do not overwrite it with the old charger's password.
                                   wifiWritePending=false;
                                   pendingDesiredSsid="";
                               }
@@ -1490,6 +1544,36 @@ jobs:
 
                       if (next!=null) next.run();
                   });
+              }
+
+              private void queryWifiNetworkConfigForRead(Runnable next) {
+                  // Public reverse-engineering of the Terra AC protocol identifies 0xC7
+                  // as NETWORK_OF_WIFI_CONFIGURATION. A payload of 0x01 is used as a
+                  // read request. This is diagnostic/read-only here; E4 remains the
+                  // authoritative SSID field until the C7 response layout is confirmed.
+                  sendEncrypted(CMD_WIFI_NETWORK_CONFIG,new byte[]{0x01},p -> {
+                      try {
+                          requirePacketOk(p,"Query Wi-Fi network configuration (C7)");
+                          String ascii=printableAscii(p.payload);
+                          appendLog("READ C7 WIFI_NETWORK payload="+hex(p.payload)
+                                  +(ascii.isEmpty()?"":" text="+ascii));
+                      } catch(Exception e) {
+                          appendLog("C7 Wi-Fi network read warning: "+safeError(e));
+                      }
+                      if (next!=null) next.run();
+                  });
+              }
+
+              private String printableAscii(byte[] b) {
+                  if (b==null || b.length==0) return "";
+                  StringBuilder s=new StringBuilder();
+                  for (byte x:b) {
+                      int v=x&0xff;
+                      if (v>=32 && v<=126) s.append((char)v);
+                      else if (v==10 || v==13 || v==9) s.append(' ');
+                      else if (s.length()>0) s.append(' ');
+                  }
+                  return s.toString().trim().replaceAll("\\s+"," ");
               }
 
               private String[] parseWifiInfo(byte[] payload) {
@@ -2710,14 +2794,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-3.9.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-4.0.apk
           cd artifact
-          sha256sum ABB-Terra-Direct-Secure-3.9.apk | tee ABB-Terra-Direct-Secure-3.9.apk.sha256
+          sha256sum ABB-Terra-Direct-Secure-4.0.apk | tee ABB-Terra-Direct-Secure-4.0.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ABB-Terra-Direct-Secure-3.9
+          name: ABB-Terra-Direct-Secure-4.0
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
