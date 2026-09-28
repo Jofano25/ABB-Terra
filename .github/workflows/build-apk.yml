@@ -1,4 +1,4 @@
-name: Build EMOS 5.4 OCPP Auth Provision Test
+name: Build EMOS 5.4.1 OCPP Auth Provision Test
 
 on:
   workflow_dispatch:
@@ -216,8 +216,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 540
-                  versionName '5.4-ocpp-auth-provision-test'
+                  versionCode 541
+                  versionName '5.4.1-ocpp-auth-provision-test'
               }
 
               buildTypes {
@@ -2693,12 +2693,11 @@ jobs:
                       String header=readHttpHeader(in,16384);
                       if (header.isEmpty()) return;
 
-                      String requestLine="";
+                      String[] lines=header.split("\\r?\\n");
+                      final String requestLine=lines.length>0 ? lines[0] : "";
                       String authorization="";
                       String wsKey="";
                       String wsProtocol="";
-                      String[] lines=header.split("\\r?\\n");
-                      if (lines.length>0) requestLine=lines[0];
                       for(String line:lines) {
                           int c=line.indexOf(':');
                           if (c<=0) continue;
@@ -4269,14 +4268,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.4-ocpp-auth-provision-test.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.4.1-ocpp-auth-provision-test.apk
           cd artifact
-          sha256sum EMOS-5.4-ocpp-auth-provision-test.apk | tee EMOS-5.4-ocpp-auth-provision-test.apk.sha256
+          sha256sum EMOS-5.4.1-ocpp-auth-provision-test.apk | tee EMOS-5.4.1-ocpp-auth-provision-test.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: EMOS-5.4-ocpp-auth-provision-test
+          name: EMOS-5.4.1-ocpp-auth-provision-test
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
