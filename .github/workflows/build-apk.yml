@@ -1,4 +1,4 @@
-name: Build ABB Terra Direct Secure 4.6 FINAL-STABLE-FW210
+name: Build ABB Terra Direct Secure 4.7 FINAL-AUTH-HEX
 
 on:
   workflow_dispatch:
@@ -80,7 +80,7 @@ jobs:
                   minSdk 23
                   targetSdk 35
                   versionCode 430
-                  versionName '4.6-final-stable-fw210'
+                  versionName '4.7-final-auth-hex'
               }
 
               buildTypes {
@@ -435,7 +435,7 @@ jobs:
 
                   if (hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("ABB Terra Direct Secure 4.6 FINAL started");
+                      appendLog("ABB Terra Direct Secure 4.7 FINAL AUTH-HEX started");
                       appendLog("Saved authorization found. Opening commissioning screen.");
                   } else {
                       showLoginScreen();
@@ -572,7 +572,7 @@ jobs:
                   ocppCard.addView(section("CUSTOM OCPP SERVER • STAGED", ACCENT));
                   chargePointId = input("ABB-V2-NEW", WHITE, MUTED);
                   serverUrl = input("ws://192.168.10.186:9220", WHITE, MUTED);
-                  authKey = input("AuthorizationKey / password (plain text)", WHITE, MUTED);
+                  authKey = input("AuthorizationKey / password (plain; auto HEX for ABB)", WHITE, MUTED);
                   authKey.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
                   requiresPassword = new CheckBox(this);
                   requiresPassword.setText("Server requires password / AuthKey");
@@ -714,7 +714,7 @@ jobs:
                           runOnUiThread(() -> {
                               adminPassword.setText("");
                               buildUi();
-                              appendLog("ABB Terra Direct Secure 4.6 FINAL started");
+                              appendLog("ABB Terra Direct Secure 4.7 FINAL AUTH-HEX started");
                               appendLog("LOGIN SUCCESS. Authorization stored securely; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -1299,7 +1299,7 @@ jobs:
                   if (requiresPassword.isChecked()) {
                       int authBytes=key.getBytes(StandardCharsets.UTF_8).length;
                       if (authBytes<16 || authBytes>20) {
-                          String m="ABB Terra AuthorizationKey must be 16-20 bytes for this firmware. Current length="+authBytes;
+                          String m="ABB Terra AuthorizationKey plain password must be 16-20 bytes. It will be converted to 32-40 HEX characters automatically. Current plain length="+authBytes;
                           appendLog("BASIC AUTH PREFLIGHT BLOCKED: "+m);
                           failStatus("AUTHKEY INVALID",m);
                           toast(m);
@@ -1341,9 +1341,9 @@ jobs:
                   lastOcppApplyOk=false;
                   lastOcppApplyMessage="Not applied";
                   setStatus("APPLYING FINAL CONFIGURATION",
-                          "Using proven FW 2.1.0 OCPP D6 variant 2, then network configuration");
+                          "Using persistent D6 variant 2 with ABB/OCPP AuthKey HEX encoding, then network configuration");
                   progress("OCPP configuration",false,"Applying fixed D6 variant 2...");
-                  appendLog("APPLY ALL FINAL: fixed OCPP D6 variant=2 only (serverEnable=0, ocpp1.6j, Charger ID tag). Unsafe variants 0/1 are disabled to prevent rollback to ABB Cloud.");
+                  appendLog("APPLY ALL FINAL AUTH-HEX: fixed OCPP D6 variant=2 only. When AuthKey is enabled, the plain password is converted to the same HEX representation observed in SteVe ChangeConfiguration before being inserted into D6.");
 
                   tryOcppVariant(url,cp,requiresPassword.isChecked()?key:"",
                           connectionPosition,ssid,wifiPass,0);
@@ -1425,18 +1425,16 @@ jobs:
                           +" authKeyBytes="+(enable?key.getBytes(StandardCharsets.UTF_8).length:0)
                           +" username="+chargePointId.getText().toString().trim());
 
-                  // FINAL FW 2.1.0 behavior:
-                  // - D6 variant 2 is the only proven persistent local-CSMS layout.
-                  // - The security key is carried in D6 when enable=true.
-                  // - BLE C5 guesses for HTTPBasicAuthEnable are intentionally disabled.
-                  // - Enabling the HTTP Authorization header itself must be bootstrapped once
-                  //   through OCPP ChangeConfiguration while the station is online on SteVe
-                  //   Security Profile 0: AuthorizationKey=<same key>, HTTPBasicAuthEnable=true.
-                  //   Then SteVe can be switched to Security Profile 1.
-                  appendLog("BASIC AUTH FINAL: AuthorizationKey "+(enable?"staged":"cleared")+" using persistent D6 variant 2.");
+                  // FINAL AUTH-HEX behavior, derived from a successful SteVe ChangeConfiguration test:
+                  // Plain password 1234567890123456 is transmitted by SteVe as the ASCII hex string
+                  // 31323334353637383930313233343536. The D6 builder below now performs the same
+                  // UTF-8 -> HEX conversion automatically before putting the security key in D6.
+                  // The UI/local profile continue to store the user's plain password (encrypted locally).
+                  appendLog("BASIC AUTH FINAL AUTH-HEX: AuthorizationKey "+(enable?"enabled":"cleared")+" using persistent D6 variant 2.");
                   if (enable) {
-                      appendLog("BASIC AUTH FINAL: FW 2.1.0 still requires one-time OCPP ChangeConfiguration: AuthorizationKey=<same key>, then HTTPBasicAuthEnable=true while SteVe is temporarily Security Profile 0. After Accepted, switch SteVe to Profile 1.");
-                      progress("OCPP Basic Auth",true,"AuthKey staged; HTTPBasicAuthEnable requires one-time OCPP bootstrap");
+                      int rawLen=key.getBytes(StandardCharsets.UTF_8).length;
+                      appendLog("BASIC AUTH ENCODING: plainBytes="+rawLen+" -> hexChars="+(rawLen*2)+" (secret hidden)");
+                      progress("OCPP Basic Auth",true,"AuthKey converted to ABB/OCPP hex format and staged in D6");
                   } else {
                       progress("OCPP Basic Auth",true,"AuthKey disabled in D6");
                   }
@@ -2128,9 +2126,17 @@ jobs:
                   boolean includeTag=(variant==0 || variant==2);
 
                   byte[] domainBytes=fullUrl.getBytes(StandardCharsets.UTF_8);
-                  byte[] keyBytes=securityKeyText.isEmpty()
+
+                  // ABB/OCPP AuthorizationKey is represented as a hexadecimal string.
+                  // Example observed from SteVe:
+                  //   plain  : 1234567890123456
+                  //   OCPP   : 31323334353637383930313233343536
+                  // Keep accepting a normal password in the UI and perform the conversion here.
+                  byte[] plainKeyBytes=securityKeyText.isEmpty()
                           ?new byte[0]
                           :securityKeyText.getBytes(StandardCharsets.UTF_8);
+                  String keyHex=plainKeyBytes.length==0?"":bytesToHexAscii(plainKeyBytes);
+                  byte[] keyBytes=keyHex.getBytes(StandardCharsets.US_ASCII);
                   byte[] tag=chargerId.getBytes(StandardCharsets.UTF_8);
 
                   appendLog("D6 STRUCT variant="+variant
@@ -2139,7 +2145,8 @@ jobs:
                           +" port="+port
                           +" protocolType=1"
                           +" protocolVersion="+protocolVersion
-                          +" keyLen="+keyBytes.length
+                          +" keyPlainBytes="+plainKeyBytes.length
+                          +" keyHexChars="+keyBytes.length
                           +" tls="+(tls?1:0)
                           +" includeTag="+includeTag
                           +(includeTag?" tagLen="+tag.length+" tag="+chargerId:""));
@@ -2174,6 +2181,18 @@ jobs:
                       out.write(tag);
                   }
                   return out.toByteArray();
+              }
+
+              private String bytesToHexAscii(byte[] data) {
+                  if (data==null || data.length==0) return "";
+                  final char[] HEX="0123456789ABCDEF".toCharArray();
+                  char[] out=new char[data.length*2];
+                  for (int i=0;i<data.length;i++) {
+                      int v=data[i]&0xff;
+                      out[i*2]=HEX[v>>>4];
+                      out[i*2+1]=HEX[v&0x0f];
+                  }
+                  return new String(out);
               }
 
               private void verifySession() {
@@ -2964,14 +2983,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-4.6-FINAL.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-4.7-FINAL-AUTH-HEX.apk
           cd artifact
-          sha256sum ABB-Terra-Direct-Secure-4.6-FINAL.apk | tee ABB-Terra-Direct-Secure-4.6-FINAL.apk.sha256
+          sha256sum ABB-Terra-Direct-Secure-4.7-FINAL-AUTH-HEX.apk | tee ABB-Terra-Direct-Secure-4.7-FINAL-AUTH-HEX.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ABB-Terra-Direct-Secure-4.6-FINAL
+          name: ABB-Terra-Direct-Secure-4.7-FINAL-AUTH-HEX
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
