@@ -1,4 +1,4 @@
-name: Build EMOS 5.4.1 OCPP Auth Provision Test
+name: Build EMOS 5.4.2 OCPP Auth Provision Test
 
 on:
   workflow_dispatch:
@@ -216,8 +216,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 541
-                  versionName '5.4.1-ocpp-auth-provision-test'
+                  versionCode 542
+                  versionName '5.4.2-ocpp-auth-provision-test'
               }
 
               buildTypes {
@@ -402,6 +402,12 @@ jobs:
               // 4 = both Accepted; waiting for reconnect carrying HTTP Basic Authorization
               // 90 = provisioning rejected/failed
               private volatile int authProvisionStage = 0;
+              // FW 2.2.2 may restart the WebSocket immediately after applying
+              // HTTPBasicAuthEnable, before its CALLRESULT reaches the CSMS.
+              // Track that separately so an authenticated reconnect can be used
+              // as effect verification instead of leaving the UI stuck at Step 3/4.
+              private volatile boolean authProvisionHttpBasicResultAccepted = false;
+              private volatile boolean authProvisionHttpBasicResultLost = false;
               private volatile String authProvisionRequestId = "";
               private volatile int authProvisionUnauthReconnects = 0;
               private boolean autoReconnectEnabled = false;
@@ -624,7 +630,7 @@ jobs:
                   // launch always asks for login again. Charger profiles remain saved.
                   if (appSessionAuthorized && hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("EMOS 5.4 started");
+                      appendLog("EMOS 5.4.2 started");
                       appendLog("Installer session active for this app session.");
                   } else {
                       clearAuthorizationTokensOnly();
@@ -795,7 +801,7 @@ jobs:
                   ocppCard.addView(requiresPassword);
 
                   TextView hint = text(
-                          "READ ALL shows values actually stored in charger. EMOS 5.4 writes the OCPP endpoint with the proven D6 variant 2 layout. "
+                          "READ ALL shows values actually stored in charger. EMOS 5.4.2 writes the OCPP endpoint with the proven D6 variant 2 layout. "
                           +"If Server requires password / AuthKey is checked, the PLAIN AuthKey is written directly into D6 (keyLen = actual UTF-8 byte length), matching the earlier working ABB trace; it is NOT HEX-encoded and is NOT cleared to keyLen=0. "
                           +"EMOS also sends best-effort HTTPBasicAuthEnable=true through the charger configuration channel. No Node/SteVe provisioning API is required by APPLY ALL. Unchecked = no AuthKey in D6.",
                           11,false,MUTED);
@@ -1008,7 +1014,7 @@ jobs:
                               adminPassword.setText("");
                               appSessionAuthorized=true;
                               buildUi();
-                              appendLog("EMOS 5.4 started");
+                              appendLog("EMOS 5.4.2 started");
                               appendLog("LOGIN SUCCESS. Authorization is valid for this app session only; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -2609,6 +2615,8 @@ jobs:
                       authDiagConnectionCount=0;
                       authDiagChallengeCount=0;
                       authProvisionStage=0;
+                      authProvisionHttpBasicResultAccepted=false;
+                      authProvisionHttpBasicResultLost=false;
                       authProvisionRequestId="";
                       authProvisionUnauthReconnects=0;
                       writeSecure(profileKey("auth_diag_original_url"),original);
@@ -2736,7 +2744,12 @@ jobs:
 
                               runOnUiThread(() -> {
                                   if (authDiagStatus!=null) authDiagStatus.setText(
-                                          "PROVISION COMMANDS: ACCEPTED\n"
+                                          "AUTHORIZATIONKEY: ACCEPTED\n"
+                                          +(authProvisionHttpBasicResultAccepted
+                                              ?"HTTPBASICAUTHENABLE: ACCEPTED\n"
+                                              :(authProvisionHttpBasicResultLost
+                                                  ?"HTTPBASICAUTHENABLE: CALLRESULT LOST; VERIFYING EFFECT\n"
+                                                  :"HTTPBASICAUTHENABLE: UNKNOWN\n"))
                                           +"RECONNECT #"+unauth+" HAS NO AUTHORIZATION HEADER\n"
                                           +"Remote: "+remote+"\n"
                                           +"Request: "+requestLine+"\n\n"
@@ -2768,8 +2781,13 @@ jobs:
 
                           if (authDiagBaselinePassword==null) authDiagBaselinePassword=auth.password;
                           final String finalVerdict=verdict;
+                          final String httpBasicResult=authProvisionHttpBasicResultAccepted
+                                  ?"Accepted"
+                                  :(authProvisionHttpBasicResultLost
+                                      ?"CALLRESULT_LOST / EFFECT VERIFIED BY RECONNECT"
+                                      :"UNKNOWN");
                           final String display="CAPTURE #"+capture+" • "+finalVerdict
-                                  +"\nPROVISION RESULT: AuthorizationKey=Accepted, HTTPBasicAuthEnable=Accepted"
+                                  +"\nPROVISION RESULT: AuthorizationKey=Accepted, HTTPBasicAuthEnable="+httpBasicResult
                                   +"\nRemote: "+remote
                                   +"\nRequest: "+requestLine
                                   +"\nUsername: "+(auth.username.isEmpty()?"<empty>":auth.username)
@@ -2905,6 +2923,8 @@ jobs:
                                       continue;
                                   }
 
+                                  authProvisionHttpBasicResultAccepted=true;
+                                  authProvisionHttpBasicResultLost=false;
                                   authProvisionStage=4;
                                   authProvisionRequestId="";
                                   appendLog("AUTH PROVISION BOTH ACCEPTED. Closing WebSocket to force authenticated reconnect.");
@@ -2940,18 +2960,33 @@ jobs:
                   } catch(Exception e) {
                       if (authDiagRunning) appendLog("AUTH PROVISION client closed: "+safeError(e));
                   } finally {
-                      // If ABB restarts the socket while applying a setting before EMOS receives
-                      // the CALLRESULT, resend the same idempotent ChangeConfiguration on the next
-                      // BootNotification rather than becoming stuck in a waiting stage.
+                      // ABB can restart the socket while applying a security setting before EMOS
+                      // receives the CALLRESULT. AuthorizationKey is retried if needed. For
+                      // HTTPBasicAuthEnable, an immediate restart is itself expected behavior on
+                      // FW 2.2.2, so the next HTTP handshake is used as effect verification.
                       if (authDiagRunning) {
                           if (authProvisionStage==1) {
                               authProvisionStage=0;
                               authProvisionRequestId="";
                               appendLog("AUTH PROVISION connection ended while waiting AuthorizationKey result; will resend on next BootNotification.");
                           } else if (authProvisionStage==3) {
-                              authProvisionStage=2;
+                              // ABB FW 2.2.2 has been observed to close/restart the socket
+                              // immediately after HTTPBasicAuthEnable is sent. In that case the
+                              // CALLRESULT can be lost even though the setting has taken effect.
+                              // Do NOT fall back to stage 2 and wait for another BootNotification:
+                              // the reconnect may start with StatusNotification only. Treat the
+                              // next HTTP handshake as the authoritative effect verification.
+                              authProvisionHttpBasicResultLost=true;
+                              authProvisionStage=4;
                               authProvisionRequestId="";
-                              appendLog("AUTH PROVISION connection ended while waiting HTTPBasicAuthEnable result; will resend on next BootNotification.");
+                              appendLog("AUTH PROVISION HTTPBasicAuthEnable CALLRESULT lost because socket restarted; advancing to Step 4/4 and verifying the NEXT HTTP Authorization header instead of waiting for BootNotification.");
+                              runOnUiThread(() -> {
+                                  if (authDiagStatus!=null) authDiagStatus.setText(
+                                          "AuthorizationKey: ACCEPTED\n"
+                                          +"HTTPBasicAuthEnable: command sent; socket restarted before CALLRESULT\n"
+                                          +"Step 4/4: waiting for authenticated reconnect...\n\n"
+                                          +"This firmware may apply the setting before it can return the OCPP CALLRESULT. The next WebSocket Authorization header is now the proof.");
+                              });
                           }
                       }
                   }
@@ -4268,14 +4303,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.4.1-ocpp-auth-provision-test.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.4.2-ocpp-auth-provision-test.apk
           cd artifact
-          sha256sum EMOS-5.4.1-ocpp-auth-provision-test.apk | tee EMOS-5.4.1-ocpp-auth-provision-test.apk.sha256
+          sha256sum EMOS-5.4.2-ocpp-auth-provision-test.apk | tee EMOS-5.4.2-ocpp-auth-provision-test.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: EMOS-5.4.1-ocpp-auth-provision-test
+          name: EMOS-5.4.2-ocpp-auth-provision-test
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
