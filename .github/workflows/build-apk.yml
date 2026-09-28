@@ -1,4 +1,4 @@
-name: Build EMOS 5.4.2 OCPP Auth Provision Test
+name: Build EMOS 5.5 ABB Plain Auth Test
 
 on:
   workflow_dispatch:
@@ -216,8 +216,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 542
-                  versionName '5.4.2-ocpp-auth-provision-test'
+                  versionCode 550
+                  versionName '5.5-abb-plain-auth-test'
               }
 
               buildTypes {
@@ -410,6 +410,10 @@ jobs:
               private volatile boolean authProvisionHttpBasicResultLost = false;
               private volatile String authProvisionRequestId = "";
               private volatile int authProvisionUnauthReconnects = 0;
+              // EMOS 5.5 default: ABB FW 2.2.2 compatibility uses the plain password
+              // in ChangeConfiguration AuthorizationKey. Position 1 is retained only
+              // as an OCPP-standard HEX diagnostic comparison mode.
+              private volatile boolean authProvisionUseHex = false;
               private boolean autoReconnectEnabled = false;
               private String autoReconnectDeviceNumber = "";
               private String deviceNumber = "";
@@ -438,7 +442,7 @@ jobs:
               private View mainContent;
               private EditText chargerPin, wifiSsid, wifiPassword, chargePointId, serverUrl, authKey, adminEmail, adminPassword;
               private CheckBox requiresPassword;
-              private Spinner connectionType, serverUrlSpinner;
+              private Spinner connectionType, serverUrlSpinner, authProvisionModeSpinner;
               private Button scanBtn, authBtn, readConfigBtn, saveBtn, verifyBtn,
                       disconnectBtn, adminToggle, adminLogin, adminClear,
                       basicAuthVerifyBtn, authDiagStartBtn, authDiagRestoreBtn, authDiagStopBtn;
@@ -630,7 +634,7 @@ jobs:
                   // launch always asks for login again. Charger profiles remain saved.
                   if (appSessionAuthorized && hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("EMOS 5.4.2 started");
+                      appendLog("EMOS 5.5 started");
                       appendLog("Installer session active for this app session.");
                   } else {
                       clearAuthorizationTokensOnly();
@@ -801,7 +805,7 @@ jobs:
                   ocppCard.addView(requiresPassword);
 
                   TextView hint = text(
-                          "READ ALL shows values actually stored in charger. EMOS 5.4.2 writes the OCPP endpoint with the proven D6 variant 2 layout. "
+                          "READ ALL shows values actually stored in charger. EMOS 5.5 writes the OCPP endpoint with the proven D6 variant 2 layout and uses plain AuthKey bytes for ABB compatibility. "
                           +"If Server requires password / AuthKey is checked, the PLAIN AuthKey is written directly into D6 (keyLen = actual UTF-8 byte length), matching the earlier working ABB trace; it is NOT HEX-encoded and is NOT cleared to keyLen=0. "
                           +"EMOS also sends best-effort HTTPBasicAuthEnable=true through the charger configuration channel. No Node/SteVe provisioning API is required by APPLY ALL. Unchecked = no AuthKey in D6.",
                           11,false,MUTED);
@@ -841,14 +845,33 @@ jobs:
                   authDiagCard.addView(section("OCPP AUTH PROVISION TEST • LOCAL APK", ACCENT));
                   TextView authDiagInfo = text(
                           "Tidak mengubah server ICON/SteVe. EMOS menjadi mini CSMS OCPP 1.6 di HP port 9221. "
-                          +"Charger sementara diarahkan ke HP TANPA AuthKey agar koneksi awal pasti masuk. Setelah BootNotification Accepted, "
-                          +"EMOS sendiri mengirim ChangeConfiguration AuthorizationKey=<HEX dari password plain>, menunggu status Accepted, "
-                          +"lalu mengirim ChangeConfiguration HTTPBasicAuthEnable=true dan menunggu Accepted. Setelah kedua command Accepted, "
-                          +"EMOS memutus WebSocket agar ABB reconnect. Reconnect itulah yang diperiksa apakah benar membawa Authorization: Basic. "
+                          +"Charger sementara diarahkan ke HP tanpa AuthKey agar koneksi awal pasti masuk. Setelah BootNotification Accepted, "
+                          +"EMOS mengirim ChangeConfiguration AuthorizationKey lalu HTTPBasicAuthEnable=true. "
+                          +"EMOS 5.5 default memakai ABB COMPATIBILITY / PLAIN karena FW 2.2.2 sudah terbukti mengirim nilai HEX sebagai password literal bila HEX diprovision. "
+                          +"Mode OCPP STANDARD HEX tetap tersedia hanya untuk pembanding diagnostik. Setelah provisioning, ABB dipaksa reconnect dan header Authorization ditangkap langsung oleh APK. "
                           +"HP dan charger harus berada pada Wi-Fi/LAN yang sama dan AP client isolation harus OFF.",
                           11,false,MUTED);
                   authDiagInfo.setPadding(0,0,0,dp(8));
                   authDiagCard.addView(authDiagInfo);
+
+                  authProvisionModeSpinner = new Spinner(this);
+                  ArrayAdapter<String> authProvisionModeAdapter = new ArrayAdapter<>(
+                          this,
+                          android.R.layout.simple_spinner_dropdown_item,
+                          new String[]{
+                                  "ABB COMPATIBILITY • PLAIN PASSWORD (recommended)",
+                                  "OCPP STANDARD • HEX (diagnostic comparison)"
+                          });
+                  authProvisionModeSpinner.setAdapter(authProvisionModeAdapter);
+                  authProvisionModeSpinner.setSelection(0);
+                  authDiagCard.addView(labeled("AuthorizationKey provisioning mode", authProvisionModeSpinner, MUTED));
+
+                  TextView modeHint = text(
+                          "PLAIN sends exactly the password you typed, e.g. 1234567890123456. "
+                          +"HEX sends 31323334353637383930313233343536. Use PLAIN for ABB FW 2.2.2 unless specifically comparing behavior.",
+                          10,false,MUTED);
+                  modeHint.setPadding(0,dp(3),0,dp(8));
+                  authDiagCard.addView(modeHint);
 
                   authDiagStatus = text("Provision test stopped. Authenticate charger and READ ALL first.",11,true,MUTED);
                   authDiagStatus.setTextIsSelectable(true);
@@ -1014,7 +1037,7 @@ jobs:
                               adminPassword.setText("");
                               appSessionAuthorized=true;
                               buildUi();
-                              appendLog("EMOS 5.4.2 started");
+                              appendLog("EMOS 5.5 started");
                               appendLog("LOGIN SUCCESS. Authorization is valid for this app session only; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -1676,7 +1699,7 @@ jobs:
                                   ?"Writing OCPP endpoint + plain AuthKey directly to ABB"
                                   :"Applying OCPP endpoint without Basic Auth");
                   progress("OCPP configuration",false,"Applying fixed D6 variant 2 with keyLen="+d6KeyBytes+"...");
-                  appendLog("APPLY ALL AUTH-DIRECT v5.2: D6 variant=2; AuthKey="
+                  appendLog("APPLY ALL ABB-COMPAT v5.5: D6 variant=2; AuthKey="
                           +(d6Key.isEmpty()?"OFF":"ON")+" keyLen="+d6KeyBytes
                           +"; value is plain UTF-8 and secret is not logged.");
 
@@ -1764,7 +1787,7 @@ jobs:
 
                   if (enable) {
                       int rawLen=key.getBytes(StandardCharsets.UTF_8).length;
-                      appendLog("BASIC AUTH METHOD v5.2: D6 carries PLAIN AuthKey bytes="+rawLen
+                      appendLog("BASIC AUTH METHOD v5.5: D6 carries PLAIN AuthKey bytes="+rawLen
                               +"; then best-effort C5 HTTPBasicAuthEnable=1. No gateway :3000 required.");
                       tryBasicAuthC5Variant(true,key,connectionPosition,ssid,wifiPass,0);
                   } else {
@@ -2605,6 +2628,8 @@ jobs:
                       String ip=getActiveWifiIpv4();
                       authDiagOriginalUrl=original;
                       authDiagExpectedPlain=authKey.getText().toString();
+                      authProvisionUseHex = authProvisionModeSpinner!=null
+                              && authProvisionModeSpinner.getSelectedItemPosition()==1;
                       int plainBytes=authDiagExpectedPlain.getBytes(StandardCharsets.UTF_8).length;
                       if (authDiagExpectedPlain.isEmpty())
                           throw new Exception("Enter the plain AuthKey/password first.");
@@ -2623,12 +2648,15 @@ jobs:
                       startAuthDiagServer();
 
                       final String tempUrl="ws://"+ip+":"+AUTH_DIAG_PORT;
+                      final String provisionMode=authProvisionUseHex?"OCPP_STANDARD_HEX":"ABB_COMPAT_PLAIN";
                       appendLog("AUTH PROVISION START localEndpoint="+tempUrl
                               +" original="+original
+                              +" mode="+provisionMode
                               +" expectedPlainBytes="+plainBytes
                               +" expectedHexChars="+(plainBytes*2)
                               +" (secret hidden)");
                       authDiagStatus.setText("LOCAL MINI-CSMS STARTING: "+tempUrl
+                              +"\nMode: "+(authProvisionUseHex?"OCPP STANDARD HEX":"ABB COMPATIBILITY PLAIN")
                               +"\nStep 1/4: writing temporary endpoint with keyLen=0 so ABB can connect without authentication."
                               +"\nOriginal URL saved: "+authDiagOriginalUrl);
 
@@ -2637,9 +2665,11 @@ jobs:
                       // provision AuthorizationKey through real OCPP ChangeConfiguration.
                       writeOcppEndpointOnly(tempUrl,cp,"",() -> {
                           authDiagStatus.setText("LOCAL MINI-CSMS ACTIVE: "+tempUrl
+                                  +"\nMode: "+(authProvisionUseHex?"OCPP STANDARD HEX":"ABB COMPATIBILITY PLAIN")
                                   +"\nWaiting for ABB BootNotification WITHOUT Basic Auth."
                                   +"\nThen EMOS will send:"
-                                  +"\n1) ChangeConfiguration AuthorizationKey=<HEX>"
+                                  +"\n1) ChangeConfiguration AuthorizationKey="
+                                  +(authProvisionUseHex?"<HEX>":"<PLAIN>")
                                   +"\n2) ChangeConfiguration HTTPBasicAuthEnable=true"
                                   +"\n3) force WebSocket reconnect"
                                   +"\n4) capture Authorization header"
@@ -2787,6 +2817,7 @@ jobs:
                                       ?"CALLRESULT_LOST / EFFECT VERIFIED BY RECONNECT"
                                       :"UNKNOWN");
                           final String display="CAPTURE #"+capture+" • "+finalVerdict
+                                  +"\nProvision mode: "+(authProvisionUseHex?"OCPP STANDARD HEX":"ABB COMPATIBILITY PLAIN")
                                   +"\nPROVISION RESULT: AuthorizationKey=Accepted, HTTPBasicAuthEnable="+httpBasicResult
                                   +"\nRemote: "+remote
                                   +"\nRequest: "+requestLine
@@ -2868,12 +2899,17 @@ jobs:
 
                               if ("BootNotification".equals(action)) {
                                   if (authProvisionStage==0) {
+                                      final String provisionedAuthKey = authProvisionUseHex
+                                              ? bytesToHexAscii(authDiagExpectedPlain.getBytes(StandardCharsets.UTF_8))
+                                              : authDiagExpectedPlain;
                                       sendAuthProvisionChangeConfiguration(out,"AuthorizationKey",
-                                              bytesToHexAscii(authDiagExpectedPlain.getBytes(StandardCharsets.UTF_8)),1);
+                                              provisionedAuthKey,1);
                                       runOnUiThread(() -> {
                                           if (authDiagStatus!=null) authDiagStatus.setText(
                                                   "BOOTNOTIFICATION: ACCEPTED\n"
-                                                  +"Step 2/4: ChangeConfiguration AuthorizationKey=<HEX> sent.\n"
+                                                  +"Mode: "+(authProvisionUseHex?"OCPP STANDARD HEX":"ABB COMPATIBILITY PLAIN")+"\n"
+                                                  +"Step 2/4: ChangeConfiguration AuthorizationKey="
+                                                  +(authProvisionUseHex?"<HEX>":"<PLAIN>")+" sent.\n"
                                                   +"Waiting for charger CALLRESULT status...");
                                       });
                                   } else if (authProvisionStage==2) {
@@ -3008,7 +3044,10 @@ jobs:
                   writeWsFrame(out,0x1,call.toString().getBytes(StandardCharsets.UTF_8));
 
                   if ("AuthorizationKey".equals(key)) {
-                      appendLog("AUTH PROVISION OCPP TX ChangeConfiguration AuthorizationKey=<hidden HEX> hexChars="+value.length()+" id="+id);
+                      appendLog("AUTH PROVISION OCPP TX ChangeConfiguration AuthorizationKey=<hidden "
+                              +(authProvisionUseHex?"HEX":"PLAIN")+"> valueChars="+value.length()
+                              +" mode="+(authProvisionUseHex?"OCPP_STANDARD_HEX":"ABB_COMPAT_PLAIN")
+                              +" id="+id);
                   } else {
                       appendLog("AUTH PROVISION OCPP TX ChangeConfiguration "+key+"="+value+" id="+id);
                   }
@@ -4303,14 +4342,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.4.2-ocpp-auth-provision-test.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.5-abb-plain-auth-test.apk
           cd artifact
-          sha256sum EMOS-5.4.2-ocpp-auth-provision-test.apk | tee EMOS-5.4.2-ocpp-auth-provision-test.apk.sha256
+          sha256sum EMOS-5.5-abb-plain-auth-test.apk | tee EMOS-5.5-abb-plain-auth-test.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: EMOS-5.4.2-ocpp-auth-provision-test
+          name: EMOS-5.5-abb-plain-auth-test
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
