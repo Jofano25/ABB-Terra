@@ -1,4 +1,4 @@
-name: Build EMOS 5.2 Auth Diagnostic
+name: Build EMOS 5.3 Basic Auth Verify
 
 on:
   workflow_dispatch:
@@ -216,8 +216,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 520
-                  versionName '5.2-emos-authdirect'
+                  versionCode 530
+                  versionName '5.3-basic-auth-verify'
               }
 
               buildTypes {
@@ -414,7 +414,7 @@ jobs:
 
               private SharedPreferences prefs;
 
-              private TextView statusTitle, statusDetail, selectedDevice, logText, adminStatus, connectionStatus, authDiagStatus;
+              private TextView statusTitle, statusDetail, selectedDevice, logText, adminStatus, connectionStatus, authDiagStatus, basicAuthVerifyStatus;
               private ProgressBar adminLoginProgress;
               private volatile boolean adminLoginInProgress = false;
               private LinearLayout deviceList, progressBox, adminFields, wifiFields, ocppCard;
@@ -424,7 +424,7 @@ jobs:
               private Spinner connectionType, serverUrlSpinner;
               private Button scanBtn, authBtn, readConfigBtn, saveBtn, verifyBtn,
                       disconnectBtn, adminToggle, adminLogin, adminClear,
-                      authDiagStartBtn, authDiagRestoreBtn, authDiagStopBtn;
+                      basicAuthVerifyBtn, authDiagStartBtn, authDiagRestoreBtn, authDiagStopBtn;
 
               interface PacketCallback { void onPacket(Packet p); }
 
@@ -613,7 +613,7 @@ jobs:
                   // launch always asks for login again. Charger profiles remain saved.
                   if (appSessionAuthorized && hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("EMOS 5.2 started");
+                      appendLog("EMOS 5.3 started");
                       appendLog("Installer session active for this app session.");
                   } else {
                       clearAuthorizationTokensOnly();
@@ -798,6 +798,28 @@ jobs:
                   root.addView(ocppCard, cardLp());
                   setOcppUiEnabled(false);
 
+                  LinearLayout basicVerifyCard = card(CARD);
+                  basicVerifyCard.addView(section("BASIC AUTH INTERNAL VERIFY • READ ONLY", ACCENT));
+                  TextView basicVerifyInfo = text(
+                          "Membaca ulang konfigurasi internal charger melalui secure BLE tanpa mengubah server dan tanpa menulis AuthKey. "
+                          +"EMOS memeriksa HTTPBasicAuthEnable, SecurityProfile (jika firmware mengeksposnya), socket/encryption flags, OCPP endpoint/Charger ID, dan apakah AuthorizationKey dapat dibaca kembali. "
+                          +"Catatan: pada banyak firmware ABB AuthorizationKey bersifat write-only, sehingga status 'NOT EXPOSED' bukan berarti key kosong.",
+                          11,false,MUTED);
+                  basicVerifyInfo.setPadding(0,0,0,dp(8));
+                  basicVerifyCard.addView(basicVerifyInfo);
+
+                  basicAuthVerifyStatus = text(
+                          "Belum diperiksa. Authenticate charger lalu tekan READ / VERIFY BASIC AUTH.",
+                          11,true,MUTED);
+                  basicAuthVerifyStatus.setTextIsSelectable(true);
+                  basicAuthVerifyStatus.setPadding(0,0,0,dp(8));
+                  basicVerifyCard.addView(basicAuthVerifyStatus);
+
+                  basicAuthVerifyBtn = button("READ / VERIFY BASIC AUTH", SECONDARY, WHITE);
+                  basicVerifyCard.addView(basicAuthVerifyBtn,new LinearLayout.LayoutParams(-1,dp(52)));
+                  basicAuthVerifyBtn.setOnClickListener(v -> runBasicAuthInternalVerify());
+                  root.addView(basicVerifyCard, cardLp());
+
                   LinearLayout authDiagCard = card(CARD);
                   authDiagCard.addView(section("AUTHKEY REBOOT DIAGNOSTIC • LOCAL APK", ACCENT));
                   TextView authDiagInfo = text(
@@ -974,7 +996,7 @@ jobs:
                               adminPassword.setText("");
                               appSessionAuthorized=true;
                               buildUi();
-                              appendLog("EMOS 5.2 started");
+                              appendLog("EMOS 5.3 started");
                               appendLog("LOGIN SUCCESS. Authorization is valid for this app session only; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -2379,6 +2401,163 @@ jobs:
                   }).start();
               }
 
+              private void runBasicAuthInternalVerify() {
+                  if (!authenticated) {
+                      toast("Authenticate charger first.");
+                      return;
+                  }
+                  if (basicAuthVerifyBtn!=null) basicAuthVerifyBtn.setEnabled(false);
+                  if (basicAuthVerifyStatus!=null)
+                      basicAuthVerifyStatus.setText("Reading charger internal configuration...");
+
+                  final String expectedPlain=authKey==null?"":authKey.getText().toString();
+                  final int expectedBytes=expectedPlain.getBytes(StandardCharsets.UTF_8).length;
+                  appendLog("BASIC AUTH VERIFY START expectedPlainBytes="+expectedBytes
+                          +" (secret hidden; read-only diagnostic)");
+
+                  sendEncrypted(CMD_READ_CONFIGURATION,new byte[]{0x01},p -> {
+                      final StringBuilder report=new StringBuilder();
+                      try {
+                          requirePacketOk(p,"Basic Auth generic configuration read");
+                          String ascii=printableUtf8(p.payload);
+                          appendLog("BASIC AUTH VERIFY C5 raw="+hex(p.payload)
+                                  +(ascii.isEmpty()?"":" text="+compactLong(ascii,1200)));
+
+                          JSONObject j=null;
+                          if (!ascii.isEmpty()) {
+                              int brace=ascii.indexOf('{');
+                              if (brace>=0) {
+                                  try { j=new JSONObject(ascii.substring(brace)); }
+                                  catch(Exception parse) {
+                                      appendLog("BASIC AUTH VERIFY C5 JSON parse warning: "+safeError(parse));
+                                  }
+                              }
+                          }
+
+                          String httpBasic=findConfigValueAnyCase(j,
+                                  "HTTPBasicAuthEnable","http_basic_auth_enable","httpBasicAuthEnable");
+                          String secProfile=findConfigValueAnyCase(j,
+                                  "SecurityProfile","security_profile","securityProfile","ocpp_security_profile");
+                          String authReadable=findConfigValueAnyCase(j,
+                                  "AuthorizationKey","authorization_key","authorizationKey","ocpp_authorization_key");
+                          String socketEnable=findConfigValueAnyCase(j,"socket_a_enable","socketAEnable");
+                          String encrypted=findConfigValueAnyCase(j,"encrypted_a","encryptedA");
+
+                          report.append("C5 HTTPBasicAuthEnable : ")
+                                  .append(httpBasic.isEmpty()?"NOT EXPOSED":httpBasic).append("\n");
+                          report.append("C5 SecurityProfile     : ")
+                                  .append(secProfile.isEmpty()?"NOT EXPOSED":secProfile).append("\n");
+                          report.append("C5 socket_a_enable     : ")
+                                  .append(socketEnable.isEmpty()?"NOT EXPOSED":socketEnable).append("\n");
+                          report.append("C5 encrypted_a         : ")
+                                  .append(encrypted.isEmpty()?"NOT EXPOSED":encrypted).append("\n");
+                          report.append("AuthorizationKey read : ")
+                                  .append(authReadable.isEmpty()?"NOT EXPOSED / LIKELY WRITE-ONLY":"EXPOSED (value hidden)")
+                                  .append("\n");
+                          report.append("Expected plain length  : ").append(expectedBytes).append(" bytes\n");
+
+                          if (!httpBasic.isEmpty()) {
+                              boolean on="1".equals(httpBasic)
+                                      || "true".equalsIgnoreCase(httpBasic)
+                                      || "on".equalsIgnoreCase(httpBasic)
+                                      || "enabled".equalsIgnoreCase(httpBasic);
+                              report.append("HTTP Basic Auth flag   : ")
+                                      .append(on?"ON":"OFF / UNKNOWN VALUE").append("\n");
+                          } else {
+                              report.append("HTTP Basic Auth flag   : cannot prove from generic C5 read\n");
+                          }
+
+                      } catch(Exception e) {
+                          appendLog("BASIC AUTH VERIFY C5 warning: "+safeError(e));
+                          report.append("C5 read                : ERROR ").append(safeError(e)).append("\n");
+                      }
+
+                      sendEncrypted(CMD_QUERY_DEVICE_NET_CONFIG,new byte[0],db -> {
+                          try {
+                              requirePacketOk(db,"Basic Auth DB read");
+                              String[] info=parseDbForVerify(db.payload);
+                              String domain=info[0];
+                              String port=info[1];
+                              String tls=info[2];
+                              String tag=info[3];
+                              report.append("DB OCPP endpoint        : ").append(domain)
+                                      .append(port.isEmpty()?"":":"+port).append("\n");
+                              report.append("DB TLS flag             : ").append(tls.isEmpty()?"?":tls).append("\n");
+                              report.append("DB Charger ID           : ").append(tag.isEmpty()?"NOT EXPOSED":tag).append("\n");
+                              report.append("DB AuthKey field        : NOT PRESENT IN READ-BACK\n");
+                              appendLog("BASIC AUTH VERIFY DB domain="+domain+" port="+port
+                                      +" tls="+tls+" tag="+tag);
+                          } catch(Exception e) {
+                              appendLog("BASIC AUTH VERIFY DB warning: "+safeError(e));
+                              report.append("DB read                 : ERROR ").append(safeError(e)).append("\n");
+                          }
+
+                          report.append("\nInterpretation:\n")
+                                  .append("• If HTTPBasicAuthEnable reads ON but server/local capture still sees NO Authorization header, the problem is after configuration storage: charger HTTP/WebSocket auth generation or firmware behavior.\n")
+                                  .append("• AuthorizationKey NOT EXPOSED is expected for a write-only secret and does not prove that the password is empty.\n")
+                                  .append("• Final proof remains the actual WebSocket Authorization header capture.");
+
+                          final String textReport=report.toString();
+                          if (basicAuthVerifyStatus!=null) basicAuthVerifyStatus.setText(textReport);
+                          appendLog("BASIC AUTH VERIFY COMPLETE");
+                          if (basicAuthVerifyBtn!=null) basicAuthVerifyBtn.setEnabled(true);
+                      });
+                  });
+              }
+
+              private String[] parseDbForVerify(byte[] payload) throws Exception {
+                  if (payload==null || payload.length<8) throw new Exception("DB payload too short: "+hex(payload));
+                  int pos=0;
+                  pos++; // protocol type
+                  pos++; // protocol version
+                  int domainLen=payload[pos++]&0xff;
+                  if (pos+domainLen+5>payload.length) throw new Exception("DB domain length invalid");
+                  String domain=new String(payload,pos,domainLen,StandardCharsets.UTF_8);
+                  pos+=domainLen;
+                  int port=(payload[pos]&0xff)|((payload[pos+1]&0xff)<<8); pos+=2;
+                  pos++; // original/external
+                  int tls=payload[pos++]&0xff;
+                  pos++; // expand
+                  String tag="";
+                  if (pos<payload.length) {
+                      int tagLen=payload[pos++]&0xff;
+                      if (tagLen>0 && pos+tagLen<=payload.length)
+                          tag=new String(payload,pos,tagLen,StandardCharsets.UTF_8);
+                  }
+                  return new String[]{domain,String.valueOf(port),String.valueOf(tls),tag};
+              }
+
+              private String findConfigValueAnyCase(JSONObject j,String... keys) {
+                  if (j==null || keys==null) return "";
+                  try {
+                      Set<String> wanted=new HashSet<>();
+                      for(String k:keys) if (k!=null) wanted.add(k.toLowerCase(Locale.US));
+                      Iterator<String> it=j.keys();
+                      while(it.hasNext()) {
+                          String actual=it.next();
+                          Object value=j.opt(actual);
+                          if (wanted.contains(actual.toLowerCase(Locale.US))) {
+                              if (value instanceof JSONArray) {
+                                  JSONArray a=(JSONArray)value;
+                                  if (a.length()>0) return String.valueOf(a.get(a.length()-1));
+                              }
+                              if (value!=null && value!=JSONObject.NULL) return String.valueOf(value);
+                          }
+                          if (value instanceof JSONObject) {
+                              String nested=findConfigValueAnyCase((JSONObject)value,keys);
+                              if (!nested.isEmpty()) return nested;
+                          }
+                      }
+                  } catch(Exception ignored) {}
+                  return "";
+              }
+
+              private String compactLong(String s,int max) {
+                  if (s==null) return "";
+                  String x=s.replace("\n"," ").replace("\r"," ");
+                  return x.length()>max?x.substring(0,max):x;
+              }
+
               private void startLocalAuthDiagnostic() {
                   if (!authenticated) {
                       toast("Authenticate charger first.");
@@ -3620,6 +3799,7 @@ jobs:
                       disconnectBtn.setEnabled(gatt!=null);
                       authBtn.setEnabled(transportReady && !authenticated && !authInProgress);
                       if (readConfigBtn!=null) readConfigBtn.setEnabled(authenticated && !authInProgress && !readInProgress);
+                      if (basicAuthVerifyBtn!=null) basicAuthVerifyBtn.setEnabled(authenticated && !authInProgress && !readInProgress);
                       verifyBtn.setEnabled(authenticated);
                       if (authDiagStartBtn!=null) authDiagStartBtn.setEnabled(authenticated && !authDiagRunning);
                       if (authDiagRestoreBtn!=null) authDiagRestoreBtn.setEnabled(authenticated);
@@ -3915,14 +4095,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.2-auth-direct.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.3-basic-auth-verify.apk
           cd artifact
-          sha256sum EMOS-5.2-auth-direct.apk | tee EMOS-5.2-auth-direct.apk.sha256
+          sha256sum EMOS-5.3-basic-auth-verify.apk | tee EMOS-5.3-basic-auth-verify.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: EMOS-5.2-auth-direct
+          name: EMOS-5.3-basic-auth-verify
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
