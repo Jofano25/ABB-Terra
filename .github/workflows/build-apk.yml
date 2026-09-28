@@ -1,4 +1,4 @@
-name: Build ABB Terra Direct Secure 4.7 FINAL-AUTH-HEX
+name: Build ABB Terra Direct Secure 4.8 FINAL-OCPP-AUTH
 
 on:
   workflow_dispatch:
@@ -79,8 +79,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 430
-                  versionName '4.7-final-auth-hex'
+                  versionCode 440
+                  versionName '4.8-final-ocpp-auth'
               }
 
               buildTypes {
@@ -107,7 +107,7 @@ jobs:
 
               <application
                   android:allowBackup="false"
-                  android:usesCleartextTraffic="false"
+                  android:usesCleartextTraffic="true"
                   android:label="ABB Terra Direct"
                   android:supportsRtl="true"
                   android:theme="@android:style/Theme.Material.NoActionBar">
@@ -222,6 +222,14 @@ jobs:
               private boolean wifiWritePending = false;
               private String pendingDesiredSsid = "";
               private String pendingDesiredOcppUrl = "";
+              // Basic Auth provisioning is intentionally done through the user's local OCPP
+              // gateway (HTTP :3000 -> charger WS :9220), because ABB accepts
+              // AuthorizationKey reliably through OCPP ChangeConfiguration while D6's
+              // securityKey field does not enable the HTTP Authorization header.
+              private boolean pendingGatewayBasicAuth = false;
+              private String pendingGatewayAuthKey = "";
+              private String pendingGatewayClientId = "";
+              private int gatewayAuthGeneration = 0;
               private boolean autoReconnectEnabled = false;
               private String autoReconnectDeviceNumber = "";
               private String deviceNumber = "";
@@ -435,7 +443,7 @@ jobs:
 
                   if (hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("ABB Terra Direct Secure 4.7 FINAL AUTH-HEX started");
+                      appendLog("ABB Terra Direct Secure 4.8 FINAL OCPP-AUTH started");
                       appendLog("Saved authorization found. Opening commissioning screen.");
                   } else {
                       showLoginScreen();
@@ -572,7 +580,7 @@ jobs:
                   ocppCard.addView(section("CUSTOM OCPP SERVER • STAGED", ACCENT));
                   chargePointId = input("ABB-V2-NEW", WHITE, MUTED);
                   serverUrl = input("ws://192.168.10.186:9220", WHITE, MUTED);
-                  authKey = input("AuthorizationKey / password (plain; auto HEX for ABB)", WHITE, MUTED);
+                  authKey = input("AuthorizationKey / password (plain; provision via OCPP)", WHITE, MUTED);
                   authKey.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
                   requiresPassword = new CheckBox(this);
                   requiresPassword.setText("Server requires password / AuthKey");
@@ -586,7 +594,7 @@ jobs:
 
                   TextView hint = text(
                           "READ ALL shows values actually stored in charger. FW 2.1.0 is locked to the proven D6 layout so the local OCPP URL will not roll back to ABB Cloud. "
-                          +"If Server requires password / AuthKey is checked, the AuthorizationKey is staged in D6. HTTP Basic Auth itself must then be enabled once with OCPP ChangeConfiguration (HTTPBasicAuthEnable=true) while SteVe is temporarily on Security Profile 0. "
+                          +"If Server requires password / AuthKey is checked, D6 is applied WITHOUT a security key so the charger can first connect unauthenticated. After reconnect, this app calls your local OCPP gateway on port 3000 and sends ChangeConfiguration AuthorizationKey (HEX) followed by HTTPBasicAuthEnable=true. Keep SteVe temporarily on Security Profile 0 during provisioning, then switch it to Profile 1 with the same plain password. "
                           +"After that, set SteVe to Security Profile 1 with the same password. Unchecked = no AuthKey in D6.",
                           11,false,MUTED);
                   hint.setPadding(0,dp(4),0,dp(8));
@@ -714,7 +722,7 @@ jobs:
                           runOnUiThread(() -> {
                               adminPassword.setText("");
                               buildUi();
-                              appendLog("ABB Terra Direct Secure 4.7 FINAL AUTH-HEX started");
+                              appendLog("ABB Terra Direct Secure 4.8 FINAL OCPP-AUTH started");
                               appendLog("LOGIN SUCCESS. Authorization stored securely; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -1340,12 +1348,23 @@ jobs:
                   saveBtn.setEnabled(false);
                   lastOcppApplyOk=false;
                   lastOcppApplyMessage="Not applied";
-                  setStatus("APPLYING FINAL CONFIGURATION",
-                          "Using persistent D6 variant 2 with ABB/OCPP AuthKey HEX encoding, then network configuration");
-                  progress("OCPP configuration",false,"Applying fixed D6 variant 2...");
-                  appendLog("APPLY ALL FINAL AUTH-HEX: fixed OCPP D6 variant=2 only. When AuthKey is enabled, the plain password is converted to the same HEX representation observed in SteVe ChangeConfiguration before being inserted into D6.");
 
-                  tryOcppVariant(url,cp,requiresPassword.isChecked()?key:"",
+                  // Do NOT put AuthorizationKey in D6. Real charger tests proved that ABB's
+                  // Basic Auth password is reliably accepted through OCPP ChangeConfiguration,
+                  // while D6 may accept a key without ever emitting the HTTP Authorization header.
+                  pendingGatewayBasicAuth=requiresPassword.isChecked();
+                  pendingGatewayAuthKey=pendingGatewayBasicAuth?key:"";
+                  pendingGatewayClientId=cp;
+                  gatewayAuthGeneration++;
+
+                  setStatus("APPLYING FINAL CONFIGURATION",
+                          pendingGatewayBasicAuth
+                                  ?"Applying local OCPP endpoint first; Basic Auth will be provisioned through OCPP after reconnect"
+                                  :"Applying local OCPP endpoint without Basic Auth");
+                  progress("OCPP configuration",false,"Applying fixed D6 variant 2 with keyLen=0...");
+                  appendLog("APPLY ALL FINAL OCPP-AUTH: fixed D6 variant=2 with keyLen=0. AuthKey is NOT written through D6. If enabled, AuthorizationKey will be sent later through the local OCPP gateway /changeconfiguration exactly like SteVe.");
+
+                  tryOcppVariant(url,cp,"",
                           connectionPosition,ssid,wifiPass,0);
               }
 
@@ -1390,7 +1409,7 @@ jobs:
                                   appendLog("OCPP D6 accepted using variant="+variant+".");
                                   pendingDesiredOcppUrl=url;
                                   saveLocalProfile();
-                                  configureHttpBasicAuthForApply(!key.isEmpty(),key,
+                                  configureHttpBasicAuthForApply(pendingGatewayBasicAuth,pendingGatewayAuthKey,
                                           connectionPosition,ssid,wifiPass);
                                   return;
                               }
@@ -1420,23 +1439,19 @@ jobs:
 
               private void configureHttpBasicAuthForApply(boolean enable,String key,
                       int connectionPosition,String ssid,String wifiPass) {
-                  progress("OCPP Basic Auth",false,enable?"Staging AuthorizationKey in fixed D6 variant 2...":"Basic Auth / AuthKey disabled");
+                  progress("OCPP Basic Auth",false,enable
+                          ?"Waiting for charger to reconnect to local OCPP before provisioning..."
+                          :"Basic Auth / AuthKey disabled");
                   appendLog("BASIC AUTH APPLY enable="+enable
                           +" authKeyBytes="+(enable?key.getBytes(StandardCharsets.UTF_8).length:0)
                           +" username="+chargePointId.getText().toString().trim());
 
-                  // FINAL AUTH-HEX behavior, derived from a successful SteVe ChangeConfiguration test:
-                  // Plain password 1234567890123456 is transmitted by SteVe as the ASCII hex string
-                  // 31323334353637383930313233343536. The D6 builder below now performs the same
-                  // UTF-8 -> HEX conversion automatically before putting the security key in D6.
-                  // The UI/local profile continue to store the user's plain password (encrypted locally).
-                  appendLog("BASIC AUTH FINAL AUTH-HEX: AuthorizationKey "+(enable?"enabled":"cleared")+" using persistent D6 variant 2.");
                   if (enable) {
                       int rawLen=key.getBytes(StandardCharsets.UTF_8).length;
-                      appendLog("BASIC AUTH ENCODING: plainBytes="+rawLen+" -> hexChars="+(rawLen*2)+" (secret hidden)");
-                      progress("OCPP Basic Auth",true,"AuthKey converted to ABB/OCPP hex format and staged in D6");
+                      appendLog("BASIC AUTH METHOD: D6 keyLen=0; after reconnect POST http://<OCPP-host>:3000/changeconfiguration AuthorizationKey=<HEX> then HTTPBasicAuthEnable=true. plainBytes="+rawLen+" hexChars="+(rawLen*2));
+                      progress("OCPP Basic Auth",false,"Queued for OCPP ChangeConfiguration after reconnect");
                   } else {
-                      progress("OCPP Basic Auth",true,"AuthKey disabled in D6");
+                      progress("OCPP Basic Auth",true,"Disabled");
                   }
                   continueWithNetwork(connectionPosition,ssid,wifiPass);
               }
@@ -1971,7 +1986,116 @@ jobs:
                       appendLog("READ ALL COMPLETE");
                       readInProgress=false;
                       saveBtn.setEnabled(authenticated);
+
+                      // After the post-APPLY reboot/read-back, provision Basic Auth via the
+                      // user's existing Node OCPP gateway. This reproduces the exact OCPP
+                      // ChangeConfiguration path that the charger has already accepted.
+                      if (pendingGatewayBasicAuth
+                              && pendingGatewayAuthKey!=null && !pendingGatewayAuthKey.isEmpty()
+                              && pendingGatewayClientId!=null && !pendingGatewayClientId.isEmpty()) {
+                          final int generation=gatewayAuthGeneration;
+                          main.postDelayed(() -> {
+                              if (generation==gatewayAuthGeneration && pendingGatewayBasicAuth)
+                                  startGatewayBasicAuthProvision(generation);
+                          },1500);
+                      }
                   });
+              }
+
+              private void startGatewayBasicAuthProvision(int generation) {
+                  if (!pendingGatewayBasicAuth || generation!=gatewayAuthGeneration) return;
+
+                  final String cp=pendingGatewayClientId==null?"":pendingGatewayClientId.trim();
+                  final String plain=pendingGatewayAuthKey==null?"":pendingGatewayAuthKey;
+                  final String ocpp=pendingDesiredOcppUrl==null || pendingDesiredOcppUrl.trim().isEmpty()
+                          ?serverUrl.getText().toString().trim():pendingDesiredOcppUrl.trim();
+
+                  if (cp.isEmpty() || plain.isEmpty()) {
+                      appendLog("BASIC AUTH GATEWAY aborted: missing Charger ID/AuthKey.");
+                      progress("OCPP Basic Auth",false,"Missing Charger ID/AuthKey");
+                      return;
+                  }
+
+                  final String api;
+                  try {
+                      java.net.URI uri=new java.net.URI(ocpp);
+                      String host=uri.getHost();
+                      if (host==null || host.isEmpty()) throw new Exception("OCPP host missing");
+                      api="http://"+host+":3000/changeconfiguration";
+                  } catch(Exception e) {
+                      appendLog("BASIC AUTH GATEWAY URL ERROR: "+safeError(e));
+                      progress("OCPP Basic Auth",false,"Cannot derive gateway API from OCPP URL");
+                      return;
+                  }
+
+                  byte[] raw=plain.getBytes(StandardCharsets.UTF_8);
+                  final String hexKey=bytesToHexAscii(raw);
+                  setStatus("PROVISIONING OCPP BASIC AUTH",
+                          "Sending AuthorizationKey through local gateway for "+cp+"...");
+                  progress("OCPP Basic Auth",false,"Waiting for "+cp+" on gateway :3000");
+                  appendLog("BASIC AUTH GATEWAY start clientId="+cp
+                          +" api="+api
+                          +" plainBytes="+raw.length
+                          +" hexChars="+hexKey.length
+                          +" (secret hidden)");
+
+                  gatewayChangeConfigWithRetry(generation,api,cp,
+                          "AuthorizationKey",hexKey,0,24,() -> {
+                              appendLog("BASIC AUTH GATEWAY AuthorizationKey send accepted by gateway. Charger may reconnect before the next command.");
+                              progress("OCPP Basic Auth",false,"AuthorizationKey sent; waiting to enable HTTP Basic Auth...");
+                              main.postDelayed(() -> gatewayChangeConfigWithRetry(generation,api,cp,
+                                      "HTTPBasicAuthEnable","true",0,30,() -> {
+                                          if (generation!=gatewayAuthGeneration) return;
+                                          pendingGatewayBasicAuth=false;
+                                          progress("OCPP Basic Auth",true,"AuthorizationKey + HTTPBasicAuthEnable commands sent");
+                                          setStatus("BASIC AUTH COMMANDS SENT",
+                                                  "Now use SteVe Security Profile 1 with the SAME plain password. Charger ID must exactly match "+cp+".");
+                                          appendLog("BASIC AUTH GATEWAY COMPLETE: AuthorizationKey=<HEX> and HTTPBasicAuthEnable=true were sent through OCPP. SteVe password remains the original plain password; do NOT enter the HEX string in SteVe.");
+                                      }),2500);
+                          });
+              }
+
+              private void gatewayChangeConfigWithRetry(int generation,String endpoint,String clientId,
+                      String key,String value,int attempt,int maxAttempts,Runnable onSent) {
+                  if (generation!=gatewayAuthGeneration || !pendingGatewayBasicAuth) return;
+                  if (attempt>=maxAttempts) {
+                      appendLog("BASIC AUTH GATEWAY FAILED: "+key+" could not be sent after "+maxAttempts+" attempts. Keep SteVe on Security Profile 0 and confirm Node HTTP API port 3000 is reachable from the phone.");
+                      progress("OCPP Basic Auth",false,key+" not sent; gateway/client unavailable");
+                      setStatus("BASIC AUTH NOT PROVISIONED",
+                              "Could not reach connected charger through http://<server>:3000/changeconfiguration");
+                      return;
+                  }
+
+                  final int next=attempt+1;
+                  new Thread(() -> {
+                      try {
+                          JSONObject j=new JSONObject();
+                          j.put("clientId",clientId);
+                          j.put("key",key);
+                          j.put("value",value);
+                          String resp=http("POST",endpoint,"application/json",j.toString(),null);
+                          appendLog("BASIC AUTH GATEWAY "+key+" HTTP 200 attempt="+next
+                                  +" response="+compact(resp));
+                          runOnUiThread(() -> {
+                              if (generation==gatewayAuthGeneration && pendingGatewayBasicAuth && onSent!=null)
+                                  onSent.run();
+                          });
+                      } catch(HttpError e) {
+                          // The user's gateway returns 404 'Client not connected' while the
+                          // charger is rebooting/reconnecting. Retry automatically.
+                          appendLog("BASIC AUTH GATEWAY "+key+" retry="+next
+                                  +" HTTP "+e.code+" "+safeError(e));
+                          runOnUiThread(() -> main.postDelayed(() ->
+                                  gatewayChangeConfigWithRetry(generation,endpoint,clientId,key,value,
+                                          next,maxAttempts,onSent),5000));
+                      } catch(Exception e) {
+                          appendLog("BASIC AUTH GATEWAY "+key+" retry="+next
+                                  +" error="+safeError(e));
+                          runOnUiThread(() -> main.postDelayed(() ->
+                                  gatewayChangeConfigWithRetry(generation,endpoint,clientId,key,value,
+                                          next,maxAttempts,onSent),5000));
+                      }
+                  }).start();
               }
 
               private String printableUtf8(byte[] payload) {
@@ -2127,16 +2251,11 @@ jobs:
 
                   byte[] domainBytes=fullUrl.getBytes(StandardCharsets.UTF_8);
 
-                  // ABB/OCPP AuthorizationKey is represented as a hexadecimal string.
-                  // Example observed from SteVe:
-                  //   plain  : 1234567890123456
-                  //   OCPP   : 31323334353637383930313233343536
-                  // Keep accepting a normal password in the UI and perform the conversion here.
-                  byte[] plainKeyBytes=securityKeyText.isEmpty()
+                  // D6 is only responsible for endpoint/identity in the final flow.
+                  // AuthorizationKey is provisioned later through OCPP ChangeConfiguration.
+                  byte[] keyBytes=securityKeyText.isEmpty()
                           ?new byte[0]
                           :securityKeyText.getBytes(StandardCharsets.UTF_8);
-                  String keyHex=plainKeyBytes.length==0?"":bytesToHexAscii(plainKeyBytes);
-                  byte[] keyBytes=keyHex.getBytes(StandardCharsets.US_ASCII);
                   byte[] tag=chargerId.getBytes(StandardCharsets.UTF_8);
 
                   appendLog("D6 STRUCT variant="+variant
@@ -2145,8 +2264,7 @@ jobs:
                           +" port="+port
                           +" protocolType=1"
                           +" protocolVersion="+protocolVersion
-                          +" keyPlainBytes="+plainKeyBytes.length
-                          +" keyHexChars="+keyBytes.length
+                          +" keyLen="+keyBytes.length
                           +" tls="+(tls?1:0)
                           +" includeTag="+includeTag
                           +(includeTag?" tagLen="+tag.length+" tag="+chargerId:""));
@@ -2983,14 +3101,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-4.7-FINAL-AUTH-HEX.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-4.8-FINAL-OCPP-AUTH.apk
           cd artifact
-          sha256sum ABB-Terra-Direct-Secure-4.7-FINAL-AUTH-HEX.apk | tee ABB-Terra-Direct-Secure-4.7-FINAL-AUTH-HEX.apk.sha256
+          sha256sum ABB-Terra-Direct-Secure-4.8-FINAL-OCPP-AUTH.apk | tee ABB-Terra-Direct-Secure-4.8-FINAL-OCPP-AUTH.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ABB-Terra-Direct-Secure-4.7-FINAL-AUTH-HEX
+          name: ABB-Terra-Direct-Secure-4.8-FINAL-OCPP-AUTH
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
