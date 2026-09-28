@@ -1,4 +1,4 @@
-name: Build EMOS 4.9
+name: Build EMOS 5.0 Auth Diagnostic
 
 on:
   workflow_dispatch:
@@ -216,8 +216,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 490
-                  versionName '4.9-emos'
+                  versionCode 500
+                  versionName '5.0-emos-authdiag'
               }
 
               buildTypes {
@@ -236,6 +236,7 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
               <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
               <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
               <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
@@ -276,6 +277,7 @@ jobs:
           import android.graphics.Typeface;
           import android.graphics.drawable.GradientDrawable;
           import android.os.*;
+          import android.net.*;
           import android.security.keystore.KeyGenParameterSpec;
           import android.security.keystore.KeyProperties;
           import android.text.InputFilter;
@@ -291,6 +293,10 @@ jobs:
           import java.net.HttpURLConnection;
           import java.net.URL;
           import java.net.URLEncoder;
+          import java.net.ServerSocket;
+          import java.net.Socket;
+          import java.net.Inet4Address;
+          import java.security.MessageDigest;
           import java.nio.charset.StandardCharsets;
           import java.security.KeyStore;
           import java.security.SecureRandom;
@@ -337,6 +343,8 @@ jobs:
               private static final String OCPP_LOCAL = "ws://192.168.10.186:9220";
               private static final String OCPP_PLN = "wss://homecharging.pln.co.id:443/";
               private static boolean appSessionAuthorized = false;
+              private static final int AUTH_DIAG_PORT = 9221;
+              private static final String WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
               private final Handler main = new Handler(Looper.getMainLooper());
               private final SecureRandom rng = new SecureRandom();
@@ -372,6 +380,17 @@ jobs:
               private String pendingGatewayAuthKey = "";
               private String pendingGatewayClientId = "";
               private int gatewayAuthGeneration = 0;
+
+              // Local AuthKey reboot diagnostic. This runs a tiny OCPP 1.6 endpoint
+              // directly inside the Android APK, so ICON/SteVe/Node do not need to be
+              // modified. The charger is temporarily pointed to ws://<phone-ip>:9221.
+              private volatile boolean authDiagRunning = false;
+              private ServerSocket authDiagServer;
+              private Thread authDiagThread;
+              private String authDiagOriginalUrl = "";
+              private String authDiagExpectedPlain = "";
+              private String authDiagBaselinePassword = null;
+              private int authDiagConnectionCount = 0;
               private boolean autoReconnectEnabled = false;
               private String autoReconnectDeviceNumber = "";
               private String deviceNumber = "";
@@ -393,14 +412,15 @@ jobs:
 
               private SharedPreferences prefs;
 
-              private TextView statusTitle, statusDetail, selectedDevice, logText, adminStatus, connectionStatus;
+              private TextView statusTitle, statusDetail, selectedDevice, logText, adminStatus, connectionStatus, authDiagStatus;
               private LinearLayout deviceList, progressBox, adminFields, wifiFields, ocppCard;
               private View mainContent;
               private EditText chargerPin, wifiSsid, wifiPassword, chargePointId, serverUrl, authKey, adminEmail, adminPassword;
               private CheckBox requiresPassword;
               private Spinner connectionType, serverUrlSpinner;
               private Button scanBtn, authBtn, readConfigBtn, saveBtn, verifyBtn,
-                      disconnectBtn, adminToggle, adminLogin, adminClear;
+                      disconnectBtn, adminToggle, adminLogin, adminClear,
+                      authDiagStartBtn, authDiagRestoreBtn, authDiagStopBtn;
 
               interface PacketCallback { void onPacket(Packet p); }
 
@@ -589,7 +609,7 @@ jobs:
                   // launch always asks for login again. Charger profiles remain saved.
                   if (appSessionAuthorized && hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("EMOS 4.9 started");
+                      appendLog("EMOS 5.0 started");
                       appendLog("Installer session active for this app session.");
                   } else {
                       clearAuthorizationTokensOnly();
@@ -774,6 +794,37 @@ jobs:
                   root.addView(ocppCard, cardLp());
                   setOcppUiEnabled(false);
 
+                  LinearLayout authDiagCard = card(CARD);
+                  authDiagCard.addView(section("AUTHKEY REBOOT DIAGNOSTIC • LOCAL APK", ACCENT));
+                  TextView authDiagInfo = text(
+                          "Tidak mengubah server ICON. EMOS membuka mini OCPP endpoint di HP pada port 9221, "
+                          +"sementara mengarahkan charger ke HP, lalu menangkap Basic Authorization yang benar-benar "
+                          +"dikirim ABB. Ambil capture awal, power-cycle charger, lalu bandingkan capture setelah reboot. "
+                          +"HP dan charger harus berada pada Wi-Fi/LAN yang sama dan AP client isolation harus OFF.",
+                          11,false,MUTED);
+                  authDiagInfo.setPadding(0,0,0,dp(8));
+                  authDiagCard.addView(authDiagInfo);
+
+                  authDiagStatus = text("Diagnostic stopped. Authenticate charger and READ ALL first.",11,true,MUTED);
+                  authDiagStatus.setTextIsSelectable(true);
+                  authDiagStatus.setPadding(0,0,0,dp(8));
+                  authDiagCard.addView(authDiagStatus);
+
+                  authDiagStartBtn = button("START LOCAL AUTH CAPTURE", ACCENT, Color.rgb(4,35,38));
+                  authDiagRestoreBtn = button("RESTORE ORIGINAL OCPP URL", SECONDARY, WHITE);
+                  authDiagStopBtn = button("STOP LISTENER ONLY", SECONDARY, WHITE);
+                  authDiagCard.addView(authDiagStartBtn,new LinearLayout.LayoutParams(-1,dp(52)));
+                  LinearLayout.LayoutParams adlp1=new LinearLayout.LayoutParams(-1,dp(48));
+                  adlp1.setMargins(0,dp(7),0,0);
+                  authDiagCard.addView(authDiagRestoreBtn,adlp1);
+                  LinearLayout.LayoutParams adlp2=new LinearLayout.LayoutParams(-1,dp(48));
+                  adlp2.setMargins(0,dp(7),0,0);
+                  authDiagCard.addView(authDiagStopBtn,adlp2);
+                  authDiagStartBtn.setOnClickListener(v -> startLocalAuthDiagnostic());
+                  authDiagRestoreBtn.setOnClickListener(v -> restoreOcppAfterAuthDiagnostic());
+                  authDiagStopBtn.setOnClickListener(v -> stopLocalAuthDiagnostic(false));
+                  root.addView(authDiagCard, cardLp());
+
                   LinearLayout progressCard = card(CARD);
                   progressCard.addView(section("COMMISSIONING STATUS", ACCENT));
                   progressBox = new LinearLayout(this);
@@ -894,7 +945,7 @@ jobs:
                               adminPassword.setText("");
                               appSessionAuthorized=true;
                               buildUi();
-                              appendLog("EMOS 4.9 started");
+                              appendLog("EMOS 5.0 started");
                               appendLog("LOGIN SUCCESS. Authorization is valid for this app session only; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -2275,6 +2326,390 @@ jobs:
                   }).start();
               }
 
+              private void startLocalAuthDiagnostic() {
+                  if (!authenticated) {
+                      toast("Authenticate charger first.");
+                      return;
+                  }
+
+                  final String cp=chargePointId.getText().toString().trim();
+                  if (cp.isEmpty()) {
+                      toast("Charger ID is required.");
+                      return;
+                  }
+
+                  final String original=serverUrl.getText().toString().trim();
+                  if (!(original.startsWith("ws://") || original.startsWith("wss://"))) {
+                      toast("READ ALL / select the original OCPP URL first.");
+                      return;
+                  }
+
+                  try {
+                      String ip=getActiveWifiIpv4();
+                      authDiagOriginalUrl=original;
+                      authDiagExpectedPlain=authKey.getText().toString();
+                      authDiagBaselinePassword=null;
+                      authDiagConnectionCount=0;
+                      writeSecure(profileKey("auth_diag_original_url"),original);
+                      startAuthDiagServer();
+
+                      final String tempUrl="ws://"+ip+":"+AUTH_DIAG_PORT;
+                      appendLog("AUTH DIAG START localEndpoint="+tempUrl
+                              +" original="+original+" expectedPlainBytes="
+                              +authDiagExpectedPlain.getBytes(StandardCharsets.UTF_8).length
+                              +" (secret not logged here)");
+                      authDiagStatus.setText("Listener ACTIVE: "+tempUrl
+                              +"\nWriting temporary OCPP endpoint to charger...\n"
+                              +"Do NOT change/reset AuthKey. After CAPTURE #1 appears, power-cycle the charger and keep EMOS open.");
+
+                      writeOcppEndpointOnly(tempUrl,cp,() -> {
+                          authDiagStatus.setText("LOCAL LISTENER ACTIVE: "+tempUrl
+                                  +"\nWaiting for ABB WebSocket handshake / Basic Authorization...\n"
+                                  +"Original URL saved: "+authDiagOriginalUrl);
+                          setStatus("AUTH DIAGNOSTIC ACTIVE",
+                                  "Waiting for ABB at "+tempUrl+". After first capture, reboot/power-cycle charger.");
+                      });
+
+                  } catch(Exception e) {
+                      stopLocalAuthDiagnostic(false);
+                      appendLog("AUTH DIAG START ERROR: "+safeError(e));
+                      if (authDiagStatus!=null) authDiagStatus.setText("Start failed: "+safeError(e));
+                      toast("Auth diagnostic failed: "+safeError(e));
+                  }
+              }
+
+              private String getActiveWifiIpv4() throws Exception {
+                  ConnectivityManager cm=(ConnectivityManager)getSystemService(CONNECTIVITY_SERVICE);
+                  if (cm==null) throw new Exception("ConnectivityManager unavailable");
+                  Network network=cm.getActiveNetwork();
+                  if (network==null) throw new Exception("Phone has no active network. Connect phone to the same Wi-Fi as charger.");
+                  NetworkCapabilities caps=cm.getNetworkCapabilities(network);
+                  if (caps==null || !caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI))
+                      throw new Exception("Phone must be connected to the same Wi-Fi/LAN as the charger (not mobile data only).");
+                  LinkProperties lp=cm.getLinkProperties(network);
+                  if (lp==null) throw new Exception("Wi-Fi link properties unavailable");
+                  for (LinkAddress la:lp.getLinkAddresses()) {
+                      if (la.getAddress() instanceof Inet4Address && !la.getAddress().isLoopbackAddress())
+                          return la.getAddress().getHostAddress();
+                  }
+                  throw new Exception("Wi-Fi IPv4 address not found");
+              }
+
+              private void startAuthDiagServer() throws Exception {
+                  stopLocalAuthDiagnostic(false);
+                  authDiagServer=new ServerSocket(AUTH_DIAG_PORT);
+                  authDiagServer.setReuseAddress(true);
+                  authDiagRunning=true;
+                  authDiagThread=new Thread(() -> {
+                      appendLog("AUTH DIAG listener started on TCP "+AUTH_DIAG_PORT);
+                      while(authDiagRunning) {
+                          try {
+                              Socket socket=authDiagServer.accept();
+                              socket.setSoTimeout(120000);
+                              handleAuthDiagClient(socket);
+                          } catch(Exception e) {
+                              if (authDiagRunning) appendLog("AUTH DIAG socket: "+safeError(e));
+                          }
+                      }
+                  },"emos-auth-diag");
+                  authDiagThread.start();
+              }
+
+              private void handleAuthDiagClient(Socket socket) {
+                  try(Socket s=socket) {
+                      InputStream in=new BufferedInputStream(s.getInputStream());
+                      OutputStream out=new BufferedOutputStream(s.getOutputStream());
+                      String header=readHttpHeader(in,16384);
+                      if (header.isEmpty()) return;
+
+                      String requestLine="";
+                      String authorization="";
+                      String wsKey="";
+                      String wsProtocol="";
+                      String[] lines=header.split("\\r?\\n");
+                      if (lines.length>0) requestLine=lines[0];
+                      for(String line:lines) {
+                          int c=line.indexOf(':');
+                          if (c<=0) continue;
+                          String n=line.substring(0,c).trim();
+                          String v=line.substring(c+1).trim();
+                          if ("Authorization".equalsIgnoreCase(n)) authorization=v;
+                          else if ("Sec-WebSocket-Key".equalsIgnoreCase(n)) wsKey=v;
+                          else if ("Sec-WebSocket-Protocol".equalsIgnoreCase(n)) wsProtocol=v;
+                      }
+
+                      AuthDiagDecoded auth=decodeBasicAuth(authorization);
+                      final int capture=++authDiagConnectionCount;
+                      final String expectedHex=bytesToHexAscii(authDiagExpectedPlain.getBytes(StandardCharsets.UTF_8));
+                      String verdict;
+                      if (!auth.present) verdict="NO_AUTH_HEADER";
+                      else if (!authDiagExpectedPlain.isEmpty() && auth.password.equals(authDiagExpectedPlain)) verdict="MATCH_EXPECTED_PLAIN";
+                      else if (!expectedHex.isEmpty() && auth.password.equalsIgnoreCase(expectedHex)) verdict="PASSWORD_IS_HEX_OF_EXPECTED";
+                      else if (authDiagBaselinePassword==null) verdict="BASELINE_RECORDED";
+                      else if (auth.password.equals(authDiagBaselinePassword)) verdict="SAME_AS_BASELINE";
+                      else {
+                          String baseHex=bytesToHexAscii(authDiagBaselinePassword.getBytes(StandardCharsets.UTF_8));
+                          verdict=auth.password.equalsIgnoreCase(baseHex)
+                                  ?"PASSWORD_IS_HEX_OF_BASELINE"
+                                  :"PASSWORD_CHANGED_FROM_BASELINE";
+                      }
+                      if (authDiagBaselinePassword==null && auth.present) authDiagBaselinePassword=auth.password;
+
+                      final String finalVerdict=verdict;
+                      final String remote=String.valueOf(s.getRemoteSocketAddress());
+                      final String display="CAPTURE #"+capture+" • "+finalVerdict
+                              +"\nRemote: "+remote
+                              +"\nRequest: "+requestLine
+                              +"\nUsername: "+(auth.username.isEmpty()?"<empty>":auth.username)
+                              +"\nPassword ASCII: "+(auth.present?auth.password:"<not sent>")
+                              +"\nPassword HEX: "+(auth.present?auth.passwordHex:"-")
+                              +"\nLength: "+auth.passwordBytes+" byte / "+auth.password.length()+" char"
+                              +"\n\nExpected plain: "+(authDiagExpectedPlain.isEmpty()?"<not entered>":authDiagExpectedPlain)
+                              +"\nOriginal OCPP: "+authDiagOriginalUrl;
+
+                      appendLog("AUTH DIAG CAPTURE #"+capture
+                              +" remote="+remote
+                              +" user="+auth.username
+                              +" passwordBytes="+auth.passwordBytes
+                              +" verdict="+finalVerdict);
+                      runOnUiThread(() -> {
+                          if (authDiagStatus!=null) authDiagStatus.setText(display
+                                  +"\n\nKeep this screen open. For reboot test, power-cycle charger; next WebSocket handshake becomes another CAPTURE.");
+                      });
+
+                      if (wsKey.isEmpty()) {
+                          String resp="HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
+                          out.write(resp.getBytes(StandardCharsets.US_ASCII));
+                          out.flush();
+                          return;
+                      }
+
+                      String accept=Base64.encodeToString(
+                              MessageDigest.getInstance("SHA-1")
+                                      .digest((wsKey+WS_GUID).getBytes(StandardCharsets.US_ASCII)),
+                              Base64.NO_WRAP);
+                      String protocol=wsProtocol.toLowerCase(Locale.US).contains("ocpp1.6")
+                              ?"Sec-WebSocket-Protocol: ocpp1.6\r\n":"";
+                      String resp="HTTP/1.1 101 Switching Protocols\r\n"
+                              +"Upgrade: websocket\r\n"
+                              +"Connection: Upgrade\r\n"
+                              +"Sec-WebSocket-Accept: "+accept+"\r\n"
+                              +protocol+"\r\n";
+                      out.write(resp.getBytes(StandardCharsets.US_ASCII));
+                      out.flush();
+
+                      while(authDiagRunning && !s.isClosed()) {
+                          WsFrame f=readWsFrame(in);
+                          if (f==null) break;
+                          if (f.opcode==0x8) break;
+                          if (f.opcode==0x9) {
+                              writeWsFrame(out,0xA,f.payload);
+                              continue;
+                          }
+                          if (f.opcode!=0x1) continue;
+                          String text=new String(f.payload,StandardCharsets.UTF_8);
+                          appendLog("AUTH DIAG OCPP RX "+compact(text));
+                          String reply=buildDiagOcppReply(text);
+                          if (reply!=null && !reply.isEmpty()) {
+                              writeWsFrame(out,0x1,reply.getBytes(StandardCharsets.UTF_8));
+                              appendLog("AUTH DIAG OCPP TX "+compact(reply));
+                          }
+                      }
+                  } catch(Exception e) {
+                      if (authDiagRunning) appendLog("AUTH DIAG client closed: "+safeError(e));
+                  }
+              }
+
+              static class AuthDiagDecoded {
+                  boolean present;
+                  String username="";
+                  String password="";
+                  String passwordHex="";
+                  int passwordBytes=0;
+              }
+
+              static class WsFrame {
+                  int opcode;
+                  byte[] payload;
+              }
+
+              private AuthDiagDecoded decodeBasicAuth(String header) {
+                  AuthDiagDecoded r=new AuthDiagDecoded();
+                  if (header==null || header.trim().isEmpty()) return r;
+                  String h=header.trim();
+                  if (!h.regionMatches(true,0,"Basic ",0,6)) return r;
+                  try {
+                      byte[] raw=Base64.decode(h.substring(6).trim(),Base64.DEFAULT);
+                      String decoded=new String(raw,StandardCharsets.UTF_8);
+                      int p=decoded.indexOf(':');
+                      r.present=true;
+                      r.username=p>=0?decoded.substring(0,p):decoded;
+                      r.password=p>=0?decoded.substring(p+1):"";
+                      byte[] pass=r.password.getBytes(StandardCharsets.UTF_8);
+                      r.passwordBytes=pass.length;
+                      r.passwordHex=bytesToHexAscii(pass);
+                  } catch(Exception ignored) {}
+                  return r;
+              }
+
+              private String readHttpHeader(InputStream in,int max) throws Exception {
+                  ByteArrayOutputStream b=new ByteArrayOutputStream();
+                  int state=0;
+                  while(b.size()<max) {
+                      int x=in.read();
+                      if (x<0) break;
+                      b.write(x);
+                      if (state==0 && x=='\r') state=1;
+                      else if (state==1 && x=='\n') state=2;
+                      else if (state==2 && x=='\r') state=3;
+                      else if (state==3 && x=='\n') break;
+                      else state=(x=='\r')?1:0;
+                  }
+                  return b.toString("ISO-8859-1");
+              }
+
+              private WsFrame readWsFrame(InputStream in) throws Exception {
+                  int b0=in.read();
+                  if (b0<0) return null;
+                  int b1=in.read();
+                  if (b1<0) return null;
+                  int opcode=b0&0x0f;
+                  boolean masked=(b1&0x80)!=0;
+                  long len=b1&0x7f;
+                  if (len==126) len=((long)readRequired(in)<<8)|readRequired(in);
+                  else if (len==127) {
+                      len=0;
+                      for(int i=0;i<8;i++) len=(len<<8)|readRequired(in);
+                  }
+                  if (len<0 || len>1024*1024) throw new Exception("WebSocket frame too large: "+len);
+                  byte[] mask=masked?readExact(in,4):null;
+                  byte[] payload=readExact(in,(int)len);
+                  if (masked) for(int i=0;i<payload.length;i++) payload[i]=(byte)(payload[i]^mask[i%4]);
+                  WsFrame f=new WsFrame();
+                  f.opcode=opcode;
+                  f.payload=payload;
+                  return f;
+              }
+
+              private int readRequired(InputStream in) throws Exception {
+                  int x=in.read();
+                  if (x<0) throw new EOFException("Unexpected end of WebSocket stream");
+                  return x&0xff;
+              }
+
+              private byte[] readExact(InputStream in,int len) throws Exception {
+                  byte[] b=new byte[len];
+                  int p=0;
+                  while(p<len) {
+                      int n=in.read(b,p,len-p);
+                      if (n<0) throw new EOFException("Unexpected end of stream");
+                      p+=n;
+                  }
+                  return b;
+              }
+
+              private void writeWsFrame(OutputStream out,int opcode,byte[] payload) throws Exception {
+                  if (payload==null) payload=new byte[0];
+                  ByteArrayOutputStream b=new ByteArrayOutputStream();
+                  b.write(0x80|(opcode&0x0f));
+                  int len=payload.length;
+                  if (len<126) b.write(len);
+                  else if (len<=65535) {
+                      b.write(126); b.write((len>>8)&0xff); b.write(len&0xff);
+                  } else {
+                      b.write(127);
+                      long l=len;
+                      for(int i=7;i>=0;i--) b.write((int)((l>>(8*i))&0xff));
+                  }
+                  b.write(payload);
+                  out.write(b.toByteArray());
+                  out.flush();
+              }
+
+              private String utcIsoNow() {
+                  SimpleDateFormat f=new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'",Locale.US);
+                  f.setTimeZone(TimeZone.getTimeZone("UTC"));
+                  return f.format(new Date());
+              }
+
+              private String buildDiagOcppReply(String text) {
+                  try {
+                      JSONArray a=new JSONArray(text);
+                      if (a.length()<3 || a.optInt(0,-1)!=2) return null;
+                      String id=a.optString(1,"");
+                      String action=a.optString(2,"");
+                      JSONObject payload=new JSONObject();
+                      if ("BootNotification".equals(action)) {
+                          payload.put("status","Accepted");
+                          payload.put("currentTime",utcIsoNow());
+                          payload.put("interval",300);
+                      } else if ("Heartbeat".equals(action)) {
+                          payload.put("currentTime",utcIsoNow());
+                      }
+                      JSONArray r=new JSONArray();
+                      r.put(3); r.put(id); r.put(payload);
+                      return r.toString();
+                  } catch(Exception e) {
+                      appendLog("AUTH DIAG OCPP parse warning: "+safeError(e));
+                      return null;
+                  }
+              }
+
+              private void writeOcppEndpointOnly(String url,String cp,Runnable onOk) throws Exception {
+                  byte[] payload=buildOcppPayload(url,cp,"",2);
+                  appendLog("AUTH DIAG TX D6 temporary endpoint="+url+" id="+cp+" keyLen=0");
+                  sendEncrypted(CMD_OCPP,payload,p -> {
+                      try {
+                          requirePacketOk(p,"Auth diagnostic OCPP endpoint");
+                          if (p.payload==null || p.payload.length<1 || (p.payload[0]&0xff)!=1)
+                              throw new Exception("D6 endpoint rejected payload="+hex(p.payload));
+                          appendLog("AUTH DIAG D6 endpoint accepted: "+url);
+                          if (onOk!=null) onOk.run();
+                      } catch(Exception e) {
+                          appendLog("AUTH DIAG D6 ERROR: "+safeError(e));
+                          if (authDiagStatus!=null) authDiagStatus.setText("Temporary endpoint failed: "+safeError(e));
+                      }
+                  });
+              }
+
+              private void restoreOcppAfterAuthDiagnostic() {
+                  if (!authenticated) {
+                      toast("Reconnect/authenticate charger first, then press RESTORE ORIGINAL OCPP URL.");
+                      return;
+                  }
+                  String original=authDiagOriginalUrl;
+                  if (original==null || original.trim().isEmpty()) original=readSecure(profileKey("auth_diag_original_url"));
+                  if (original==null || original.trim().isEmpty()) original=serverUrl.getText().toString().trim();
+                  final String target=original;
+                  final String cp=chargePointId.getText().toString().trim();
+                  if (target.isEmpty() || cp.isEmpty()) {
+                      toast("Original OCPP URL / Charger ID unavailable.");
+                      return;
+                  }
+                  try {
+                      writeOcppEndpointOnly(target,cp,() -> {
+                          appendLog("AUTH DIAG RESTORE OK target="+target);
+                          if (authDiagStatus!=null) authDiagStatus.setText("Original OCPP URL restored: "+target
+                                  +"\nLocal listener stopped. AuthKey was NOT changed/reset by diagnostic mode.");
+                          stopLocalAuthDiagnostic(false);
+                          setStatus("OCPP URL RESTORED",target);
+                      });
+                  } catch(Exception e) {
+                      appendLog("AUTH DIAG RESTORE ERROR: "+safeError(e));
+                      toast("Restore failed: "+safeError(e));
+                  }
+              }
+
+              private void stopLocalAuthDiagnostic(boolean clearSavedOriginal) {
+                  authDiagRunning=false;
+                  ServerSocket ss=authDiagServer;
+                  authDiagServer=null;
+                  if (ss!=null) try { ss.close(); } catch(Exception ignored) {}
+                  if (clearSavedOriginal && deviceNumber!=null && !deviceNumber.isEmpty())
+                      try { writeSecure(profileKey("auth_diag_original_url"),""); } catch(Exception ignored) {}
+                  appendLog("AUTH DIAG listener stopped");
+              }
+
               private String printableUtf8(byte[] payload) {
                   if (payload==null || payload.length==0) return "";
                   String x=new String(payload,StandardCharsets.UTF_8).trim();
@@ -3030,6 +3465,9 @@ jobs:
                       authBtn.setEnabled(transportReady && !authenticated && !authInProgress);
                       if (readConfigBtn!=null) readConfigBtn.setEnabled(authenticated && !authInProgress && !readInProgress);
                       verifyBtn.setEnabled(authenticated);
+                      if (authDiagStartBtn!=null) authDiagStartBtn.setEnabled(authenticated && !authDiagRunning);
+                      if (authDiagRestoreBtn!=null) authDiagRestoreBtn.setEnabled(authenticated);
+                      if (authDiagStopBtn!=null) authDiagStopBtn.setEnabled(authDiagRunning);
                       setOcppUiEnabled(authenticated);
                   });
               }
@@ -3301,6 +3739,7 @@ jobs:
               }
 
               @Override protected void onDestroy() {
+                  stopLocalAuthDiagnostic(false);
                   if (isFinishing()) {
                       clearAuthorizationTokensOnly();
                       appSessionAuthorized=false;
@@ -3320,14 +3759,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-4.9.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.0-auth-diagnostic.apk
           cd artifact
-          sha256sum EMOS-4.9.apk | tee EMOS-4.9.apk.sha256
+          sha256sum EMOS-5.0-auth-diagnostic.apk | tee EMOS-5.0-auth-diagnostic.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: EMOS-4.9
+          name: EMOS-5.0-auth-diagnostic
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
