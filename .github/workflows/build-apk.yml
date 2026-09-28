@@ -1,4 +1,4 @@
-name: Build ABB Terra Direct Secure 4.8 FINAL-OCPP-AUTH
+name: Build ABB Terra Direct Secure 4.8.1 FINAL-OCPP-AUTH
 
 on:
   workflow_dispatch:
@@ -79,8 +79,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 440
-                  versionName '4.8-final-ocpp-auth'
+                  versionCode 441
+                  versionName '4.8.1-final-ocpp-auth'
               }
 
               buildTypes {
@@ -443,7 +443,7 @@ jobs:
 
                   if (hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("ABB Terra Direct Secure 4.8 FINAL OCPP-AUTH started");
+                      appendLog("ABB Terra Direct Secure 4.8.1 FINAL OCPP-AUTH started");
                       appendLog("Saved authorization found. Opening commissioning screen.");
                   } else {
                       showLoginScreen();
@@ -722,7 +722,7 @@ jobs:
                           runOnUiThread(() -> {
                               adminPassword.setText("");
                               buildUi();
-                              appendLog("ABB Terra Direct Secure 4.8 FINAL OCPP-AUTH started");
+                              appendLog("ABB Terra Direct Secure 4.8.1 FINAL OCPP-AUTH started");
                               appendLog("LOGIN SUCCESS. Authorization stored securely; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -2036,7 +2036,7 @@ jobs:
                   appendLog("BASIC AUTH GATEWAY start clientId="+cp
                           +" api="+api
                           +" plainBytes="+raw.length
-                          +" hexChars="+hexKey.length
+                          +" hexChars="+hexKey.length()
                           +" (secret hidden)");
 
                   gatewayChangeConfigWithRetry(generation,api,cp,
@@ -3101,14 +3101,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-4.8-FINAL-OCPP-AUTH.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/ABB-Terra-Direct-Secure-4.8.1-FINAL-OCPP-AUTH.apk
           cd artifact
-          sha256sum ABB-Terra-Direct-Secure-4.8-FINAL-OCPP-AUTH.apk | tee ABB-Terra-Direct-Secure-4.8-FINAL-OCPP-AUTH.apk.sha256
+          sha256sum ABB-Terra-Direct-Secure-4.8.1-FINAL-OCPP-AUTH.apk | tee ABB-Terra-Direct-Secure-4.8.1-FINAL-OCPP-AUTH.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ABB-Terra-Direct-Secure-4.8-FINAL-OCPP-AUTH
+          name: ABB-Terra-Direct-Secure-4.8.1-FINAL-OCPP-AUTH
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
