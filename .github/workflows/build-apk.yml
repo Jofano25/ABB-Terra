@@ -1,4 +1,4 @@
-name: Build EMOS 5.1 Auth Diagnostic
+name: Build EMOS 5.2 Auth Diagnostic
 
 on:
   workflow_dispatch:
@@ -216,8 +216,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 510
-                  versionName '5.1-emos-authdiag'
+                  versionCode 520
+                  versionName '5.2-emos-authdirect'
               }
 
               buildTypes {
@@ -372,6 +372,7 @@ jobs:
               private boolean wifiWritePending = false;
               private String pendingDesiredSsid = "";
               private String pendingDesiredOcppUrl = "";
+              private String lastReadOcppChargerId = "";
               // Basic Auth provisioning is intentionally done through the user's local OCPP
               // gateway (HTTP :3000 -> charger WS :9220), because ABB accepts
               // AuthorizationKey reliably through OCPP ChangeConfiguration while D6's
@@ -612,7 +613,7 @@ jobs:
                   // launch always asks for login again. Charger profiles remain saved.
                   if (appSessionAuthorized && hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("EMOS 5.1 started");
+                      appendLog("EMOS 5.2 started");
                       appendLog("Installer session active for this app session.");
                   } else {
                       clearAuthorizationTokensOnly();
@@ -783,9 +784,9 @@ jobs:
                   ocppCard.addView(requiresPassword);
 
                   TextView hint = text(
-                          "READ ALL shows values actually stored in charger. FW 2.1.0 is locked to the proven D6 layout so the local OCPP URL will not roll back to ABB Cloud. "
-                          +"If Server requires password / AuthKey is checked, D6 is applied WITHOUT a security key so the charger can first connect unauthenticated. After reconnect, this app calls your local OCPP gateway on port 3000 and sends ChangeConfiguration AuthorizationKey (HEX) followed by HTTPBasicAuthEnable=true. Keep SteVe temporarily on Security Profile 0 during provisioning, then switch it to Profile 1 with the same plain password. "
-                          +"After that, set SteVe to Security Profile 1 with the same password. Unchecked = no AuthKey in D6.",
+                          "READ ALL shows values actually stored in charger. EMOS 5.2 writes the OCPP endpoint with the proven D6 variant 2 layout. "
+                          +"If Server requires password / AuthKey is checked, the PLAIN AuthKey is written directly into D6 (keyLen = actual UTF-8 byte length), matching the earlier working ABB trace; it is NOT HEX-encoded and is NOT cleared to keyLen=0. "
+                          +"EMOS also sends best-effort HTTPBasicAuthEnable=true through the charger configuration channel. No Node/SteVe provisioning API is required by APPLY ALL. Unchecked = no AuthKey in D6.",
                           11,false,MUTED);
                   hint.setPadding(0,dp(4),0,dp(8));
                   ocppCard.addView(hint);
@@ -973,7 +974,7 @@ jobs:
                               adminPassword.setText("");
                               appSessionAuthorized=true;
                               buildUi();
-                              appendLog("EMOS 5.1 started");
+                              appendLog("EMOS 5.2 started");
                               appendLog("LOGIN SUCCESS. Authorization is valid for this app session only; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -1574,12 +1575,15 @@ jobs:
                   }
                   if (requiresPassword.isChecked()) {
                       int authBytes=key.getBytes(StandardCharsets.UTF_8).length;
-                      if (authBytes<16 || authBytes>20) {
-                          String m="ABB Terra AuthorizationKey plain password must be 16-20 bytes. It will be converted to 32-40 HEX characters automatically. Current plain length="+authBytes;
+                      if (authBytes<10 || authBytes>20) {
+                          String m="AuthKey compatibility range in EMOS is 10-20 UTF-8 bytes. Current plain length="+authBytes;
                           appendLog("BASIC AUTH PREFLIGHT BLOCKED: "+m);
                           failStatus("AUTHKEY INVALID",m);
                           toast(m);
                           return;
+                      }
+                      if (authBytes<16) {
+                          appendLog("BASIC AUTH NOTE: AuthKey is "+authBytes+" bytes. ICON compatibility mode allows it, although 16+ bytes is the safer interoperability target.");
                       }
                   }
                   if (connectionPosition==0 && ssid.trim().isEmpty()) {
@@ -1617,22 +1621,26 @@ jobs:
                   lastOcppApplyOk=false;
                   lastOcppApplyMessage="Not applied";
 
-                  // Do NOT put AuthorizationKey in D6. Real charger tests proved that ABB's
-                  // Basic Auth password is reliably accepted through OCPP ChangeConfiguration,
-                  // while D6 may accept a key without ever emitting the HTTP Authorization header.
-                  pendingGatewayBasicAuth=requiresPassword.isChecked();
-                  pendingGatewayAuthKey=pendingGatewayBasicAuth?key:"";
-                  pendingGatewayClientId=cp;
+                  // EMOS 5.2: restore the earlier working ABB path.
+                  // The AuthKey entered by the user is written directly into D6 as PLAIN UTF-8
+                  // bytes. Do not send HEX here and do not clear it with keyLen=0.
+                  pendingGatewayBasicAuth=false;
+                  pendingGatewayAuthKey="";
+                  pendingGatewayClientId="";
                   gatewayAuthGeneration++;
 
+                  final String d6Key=requiresPassword.isChecked()?key:"";
+                  final int d6KeyBytes=d6Key.getBytes(StandardCharsets.UTF_8).length;
                   setStatus("APPLYING FINAL CONFIGURATION",
-                          pendingGatewayBasicAuth
-                                  ?"Applying local OCPP endpoint first; Basic Auth will be provisioned through OCPP after reconnect"
-                                  :"Applying local OCPP endpoint without Basic Auth");
-                  progress("OCPP configuration",false,"Applying fixed D6 variant 2 with keyLen=0...");
-                  appendLog("APPLY ALL FINAL OCPP-AUTH: fixed D6 variant=2 with keyLen=0. AuthKey is NOT written through D6. If enabled, AuthorizationKey will be sent later through the local OCPP gateway /changeconfiguration exactly like SteVe.");
+                          requiresPassword.isChecked()
+                                  ?"Writing OCPP endpoint + plain AuthKey directly to ABB"
+                                  :"Applying OCPP endpoint without Basic Auth");
+                  progress("OCPP configuration",false,"Applying fixed D6 variant 2 with keyLen="+d6KeyBytes+"...");
+                  appendLog("APPLY ALL AUTH-DIRECT v5.2: D6 variant=2; AuthKey="
+                          +(d6Key.isEmpty()?"OFF":"ON")+" keyLen="+d6KeyBytes
+                          +"; value is plain UTF-8 and secret is not logged.");
 
-                  tryOcppVariant(url,cp,"",
+                  tryOcppVariant(url,cp,d6Key,
                           connectionPosition,ssid,wifiPass,0);
               }
 
@@ -1677,7 +1685,7 @@ jobs:
                                   appendLog("OCPP D6 accepted using variant="+variant+".");
                                   pendingDesiredOcppUrl=url;
                                   saveLocalProfile();
-                                  configureHttpBasicAuthForApply(pendingGatewayBasicAuth,pendingGatewayAuthKey,
+                                  configureHttpBasicAuthForApply(!key.isEmpty(),key,
                                           connectionPosition,ssid,wifiPass);
                                   return;
                               }
@@ -1708,7 +1716,7 @@ jobs:
               private void configureHttpBasicAuthForApply(boolean enable,String key,
                       int connectionPosition,String ssid,String wifiPass) {
                   progress("OCPP Basic Auth",false,enable
-                          ?"Waiting for charger to reconnect to local OCPP before provisioning..."
+                          ?"AuthKey written in D6; enabling HTTP Basic Auth..."
                           :"Basic Auth / AuthKey disabled");
                   appendLog("BASIC AUTH APPLY enable="+enable
                           +" authKeyBytes="+(enable?key.getBytes(StandardCharsets.UTF_8).length:0)
@@ -1716,12 +1724,13 @@ jobs:
 
                   if (enable) {
                       int rawLen=key.getBytes(StandardCharsets.UTF_8).length;
-                      appendLog("BASIC AUTH METHOD: D6 keyLen=0; after reconnect POST http://<OCPP-host>:3000/changeconfiguration AuthorizationKey=<HEX> then HTTPBasicAuthEnable=true. plainBytes="+rawLen+" hexChars="+(rawLen*2));
-                      progress("OCPP Basic Auth",false,"Queued for OCPP ChangeConfiguration after reconnect");
+                      appendLog("BASIC AUTH METHOD v5.2: D6 carries PLAIN AuthKey bytes="+rawLen
+                              +"; then best-effort C5 HTTPBasicAuthEnable=1. No gateway :3000 required.");
+                      tryBasicAuthC5Variant(true,key,connectionPosition,ssid,wifiPass,0);
                   } else {
                       progress("OCPP Basic Auth",true,"Disabled");
+                      continueWithNetwork(connectionPosition,ssid,wifiPass);
                   }
-                  continueWithNetwork(connectionPosition,ssid,wifiPass);
               }
 
               private void tryBasicAuthC5Variant(boolean enable,String key,
@@ -2188,7 +2197,10 @@ jobs:
                                   +" tag="+tag);
 
                           if (!fullUrl.isEmpty()) setServerUrlValue(fullUrl);
-                          if (!tag.isEmpty()) chargePointId.setText(tag);
+                          if (!tag.isEmpty()) {
+                              lastReadOcppChargerId=tag;
+                              chargePointId.setText(tag);
+                          }
 
                           // DB does not expose securityKey/AuthKey. Keep encrypted
                           // local profile value if our app has one.
@@ -2230,6 +2242,7 @@ jobs:
                                       appendLog("READ C5 HTTPBasicAuthEnable="+basicAuth);
                                   }
                                   if (!id.isEmpty()) {
+                                      lastReadOcppChargerId=id;
                                       chargePointId.setText(id);
                                       appendLog("READ C5 charger identity="+id);
                                   }
@@ -2372,10 +2385,17 @@ jobs:
                       return;
                   }
 
-                  final String cp=chargePointId.getText().toString().trim();
+                  final String cp=!lastReadOcppChargerId.isEmpty()
+                          ?lastReadOcppChargerId
+                          :chargePointId.getText().toString().trim();
                   if (cp.isEmpty()) {
                       toast("Charger ID is required.");
                       return;
+                  }
+                  if (!cp.equals(chargePointId.getText().toString().trim())) {
+                      appendLog("AUTH DIAG Charger ID corrected from UI="+chargePointId.getText().toString().trim()
+                              +" to charger read-back="+cp);
+                      chargePointId.setText(cp);
                   }
 
                   final String original=serverUrl.getText().toString().trim();
@@ -2388,6 +2408,11 @@ jobs:
                       String ip=getActiveWifiIpv4();
                       authDiagOriginalUrl=original;
                       authDiagExpectedPlain=authKey.getText().toString();
+                      int diagKeyBytes=authDiagExpectedPlain.getBytes(StandardCharsets.UTF_8).length;
+                      if (authDiagExpectedPlain.isEmpty())
+                          throw new Exception("Enter the plain AuthKey/password first.");
+                      if (diagKeyBytes<10 || diagKeyBytes>20)
+                          throw new Exception("AuthKey must be 10-20 UTF-8 bytes for this compatibility test. Current="+diagKeyBytes);
                       authDiagBaselinePassword=null;
                       authDiagConnectionCount=0;
                       authDiagChallengeCount=0;
@@ -2403,9 +2428,10 @@ jobs:
                               +"\nWriting temporary OCPP endpoint to charger...\n"
                               +"Do NOT change/reset AuthKey. After CAPTURE #1 appears, power-cycle the charger and keep EMOS open.");
 
-                      writeOcppEndpointOnly(tempUrl,cp,() -> {
+                      writeOcppEndpointOnly(tempUrl,cp,authDiagExpectedPlain,() -> {
                           authDiagStatus.setText("LOCAL LISTENER ACTIVE: "+tempUrl
-                                  +"\nWaiting for ABB WebSocket handshake. If ABB sends no Authorization initially, EMOS will issue an HTTP 401 Basic challenge and wait for the authenticated retry...\n"
+                                  +"\nD6 was written with the PLAIN AuthKey (not HEX, not keyLen=0). EMOS also sent best-effort HTTPBasicAuthEnable=1.\n"
+                                  +"Waiting for ABB WebSocket handshake. If ABB starts without Authorization, EMOS sends an HTTP 401 Basic challenge and waits for the authenticated retry...\n"
                                   +"Original URL saved: "+authDiagOriginalUrl);
                           setStatus("AUTH DIAGNOSTIC ACTIVE",
                                   "Waiting for ABB at "+tempUrl+". After first capture, reboot/power-cycle charger.");
@@ -2739,21 +2765,59 @@ jobs:
                   }
               }
 
-              private void writeOcppEndpointOnly(String url,String cp,Runnable onOk) throws Exception {
-                  byte[] payload=buildOcppPayload(url,cp,"",2);
-                  appendLog("AUTH DIAG TX D6 temporary endpoint="+url+" id="+cp+" keyLen=0");
+              private void writeOcppEndpointOnly(String url,String cp,String plainKey,Runnable onOk) throws Exception {
+                  final String k=plainKey==null?"":plainKey;
+                  byte[] payload=buildOcppPayload(url,cp,k,2);
+                  appendLog("AUTH DIAG TX D6 temporary endpoint="+url+" id="+cp
+                          +" keyLen="+k.getBytes(StandardCharsets.UTF_8).length
+                          +" auth="+(k.isEmpty()?"off":"on")+" value=<hidden plain>");
                   sendEncrypted(CMD_OCPP,payload,p -> {
                       try {
                           requirePacketOk(p,"Auth diagnostic OCPP endpoint");
                           if (p.payload==null || p.payload.length<1 || (p.payload[0]&0xff)!=1)
                               throw new Exception("D6 endpoint rejected payload="+hex(p.payload));
-                          appendLog("AUTH DIAG D6 endpoint accepted: "+url);
-                          if (onOk!=null) onOk.run();
+                          appendLog("AUTH DIAG D6 endpoint accepted: "+url+" with keyLen="
+                                  +k.getBytes(StandardCharsets.UTF_8).length);
+                          if (!k.isEmpty()) {
+                              setHttpBasicAuthEnableForDiagnostic(true,0,onOk);
+                          } else if (onOk!=null) onOk.run();
                       } catch(Exception e) {
                           appendLog("AUTH DIAG D6 ERROR: "+safeError(e));
                           if (authDiagStatus!=null) authDiagStatus.setText("Temporary endpoint failed: "+safeError(e));
                       }
                   });
+              }
+
+              private void setHttpBasicAuthEnableForDiagnostic(boolean enable,int attempt,Runnable onDone) {
+                  final String[] names=new String[]{"http_basic_auth_enable","HTTPBasicAuthEnable"};
+                  if (attempt>=names.length) {
+                      appendLog("AUTH DIAG HTTPBasicAuthEnable write attempts complete.");
+                      if (onDone!=null) onDone.run();
+                      return;
+                  }
+                  final String configKey=names[attempt];
+                  try {
+                      JSONObject root=new JSONObject();
+                      JSONArray arr=new JSONArray();
+                      arr.put(51);
+                      arr.put(enable?1:0);
+                      root.put(configKey,arr);
+                      byte[] json=root.toString().getBytes(StandardCharsets.UTF_8);
+                      byte[] payload=concat(new byte[]{0x02},json);
+                      appendLog("AUTH DIAG TX C5 "+configKey+"="+(enable?1:0));
+                      sendEncrypted(CMD_READ_CONFIGURATION,payload,p -> {
+                          try {
+                              requirePacketOk(p,"Auth diagnostic C5 "+configKey);
+                              appendLog("AUTH DIAG RX C5 "+configKey+" payload="+hex(p.payload));
+                          } catch(Exception e) {
+                              appendLog("AUTH DIAG C5 "+configKey+" warning: "+safeError(e));
+                          }
+                          main.postDelayed(() -> setHttpBasicAuthEnableForDiagnostic(enable,attempt+1,onDone),220);
+                      });
+                  } catch(Exception e) {
+                      appendLog("AUTH DIAG C5 build warning: "+safeError(e));
+                      main.postDelayed(() -> setHttpBasicAuthEnableForDiagnostic(enable,attempt+1,onDone),220);
+                  }
               }
 
               private void restoreOcppAfterAuthDiagnostic() {
@@ -2765,16 +2829,24 @@ jobs:
                   if (original==null || original.trim().isEmpty()) original=readSecure(profileKey("auth_diag_original_url"));
                   if (original==null || original.trim().isEmpty()) original=serverUrl.getText().toString().trim();
                   final String target=original;
-                  final String cp=chargePointId.getText().toString().trim();
+                  final String cp=!lastReadOcppChargerId.isEmpty()
+                          ?lastReadOcppChargerId
+                          :chargePointId.getText().toString().trim();
                   if (target.isEmpty() || cp.isEmpty()) {
                       toast("Original OCPP URL / Charger ID unavailable.");
                       return;
                   }
                   try {
-                      writeOcppEndpointOnly(target,cp,() -> {
-                          appendLog("AUTH DIAG RESTORE OK target="+target);
+                      String restoreKey=authDiagExpectedPlain;
+                      if (restoreKey==null || restoreKey.isEmpty()) restoreKey=authKey==null?"":authKey.getText().toString();
+                      if ((restoreKey==null || restoreKey.isEmpty()) && deviceNumber!=null && !deviceNumber.isEmpty())
+                          restoreKey=readProfile("auth_key");
+                      final String finalRestoreKey=restoreKey==null?"":restoreKey;
+                      writeOcppEndpointOnly(target,cp,finalRestoreKey,() -> {
+                          appendLog("AUTH DIAG RESTORE OK target="+target+" keyLen="
+                                  +finalRestoreKey.getBytes(StandardCharsets.UTF_8).length);
                           if (authDiagStatus!=null) authDiagStatus.setText("Original OCPP URL restored: "+target
-                                  +"\nLocal listener stopped. AuthKey was NOT changed/reset by diagnostic mode.");
+                                  +"\nAuthKey was preserved/re-written with the same plain value; local listener stopped.");
                           stopLocalAuthDiagnostic(false);
                           setStatus("OCPP URL RESTORED",target);
                       });
@@ -3843,14 +3915,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.1-auth-diagnostic.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.2-auth-direct.apk
           cd artifact
-          sha256sum EMOS-5.1-auth-diagnostic.apk | tee EMOS-5.1-auth-diagnostic.apk.sha256
+          sha256sum EMOS-5.2-auth-direct.apk | tee EMOS-5.2-auth-direct.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: EMOS-5.1-auth-diagnostic
+          name: EMOS-5.2-auth-direct
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
