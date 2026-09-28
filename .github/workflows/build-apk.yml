@@ -1,4 +1,4 @@
-name: Build EMOS 5.0 Auth Diagnostic
+name: Build EMOS 5.1 Auth Diagnostic
 
 on:
   workflow_dispatch:
@@ -216,8 +216,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 500
-                  versionName '5.0-emos-authdiag'
+                  versionCode 510
+                  versionName '5.1-emos-authdiag'
               }
 
               buildTypes {
@@ -391,6 +391,7 @@ jobs:
               private String authDiagExpectedPlain = "";
               private String authDiagBaselinePassword = null;
               private int authDiagConnectionCount = 0;
+              private int authDiagChallengeCount = 0;
               private boolean autoReconnectEnabled = false;
               private String autoReconnectDeviceNumber = "";
               private String deviceNumber = "";
@@ -413,6 +414,8 @@ jobs:
               private SharedPreferences prefs;
 
               private TextView statusTitle, statusDetail, selectedDevice, logText, adminStatus, connectionStatus, authDiagStatus;
+              private ProgressBar adminLoginProgress;
+              private volatile boolean adminLoginInProgress = false;
               private LinearLayout deviceList, progressBox, adminFields, wifiFields, ocppCard;
               private View mainContent;
               private EditText chargerPin, wifiSsid, wifiPassword, chargePointId, serverUrl, authKey, adminEmail, adminPassword;
@@ -609,7 +612,7 @@ jobs:
                   // launch always asks for login again. Charger profiles remain saved.
                   if (appSessionAuthorized && hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("EMOS 5.0 started");
+                      appendLog("EMOS 5.1 started");
                       appendLog("Installer session active for this app session.");
                   } else {
                       clearAuthorizationTokensOnly();
@@ -800,7 +803,8 @@ jobs:
                           "Tidak mengubah server ICON. EMOS membuka mini OCPP endpoint di HP pada port 9221, "
                           +"sementara mengarahkan charger ke HP, lalu menangkap Basic Authorization yang benar-benar "
                           +"dikirim ABB. Ambil capture awal, power-cycle charger, lalu bandingkan capture setelah reboot. "
-                          +"HP dan charger harus berada pada Wi-Fi/LAN yang sama dan AP client isolation harus OFF.",
+                          +"HP dan charger harus berada pada Wi-Fi/LAN yang sama dan AP client isolation harus OFF. "
+                          +"EMOS akan meniru server Security Profile 1: request pertama tanpa Authorization akan dibalas HTTP 401 Basic challenge, lalu capture dilakukan pada retry ABB yang membawa Authorization header.",
                           11,false,MUTED);
                   authDiagInfo.setPadding(0,0,0,dp(8));
                   authDiagCard.addView(authDiagInfo);
@@ -912,8 +916,20 @@ jobs:
                   adminStatus.setPadding(0,dp(8),0,dp(8));
                   loginCard.addView(adminStatus);
 
+                  LinearLayout loginActionRow=new LinearLayout(this);
+                  loginActionRow.setOrientation(LinearLayout.HORIZONTAL);
+                  loginActionRow.setGravity(Gravity.CENTER_VERTICAL);
+
+                  adminLoginProgress=new ProgressBar(this);
+                  adminLoginProgress.setIndeterminate(true);
+                  adminLoginProgress.setVisibility(View.GONE);
+                  LinearLayout.LayoutParams progressLp=new LinearLayout.LayoutParams(dp(38),dp(38));
+                  progressLp.setMargins(0,0,dp(10),0);
+                  loginActionRow.addView(adminLoginProgress,progressLp);
+
                   adminLogin=button("LOGIN & AUTHORIZE",ACCENT,Color.rgb(4,35,38));
-                  loginCard.addView(adminLogin,new LinearLayout.LayoutParams(-1,dp(56)));
+                  loginActionRow.addView(adminLogin,new LinearLayout.LayoutParams(0,dp(56),1));
+                  loginCard.addView(loginActionRow,new LinearLayout.LayoutParams(-1,dp(56)));
                   adminLogin.setOnClickListener(v -> authorizeAdmin());
 
                   root.addView(loginCard,cardLp());
@@ -929,23 +945,35 @@ jobs:
               }
 
               private void authorizeAdmin() {
+                  if (adminLoginInProgress) return;
+
                   String email = adminEmail.getText().toString().trim();
                   String password = adminPassword.getText().toString();
-                  if (email.isEmpty() || password.isEmpty()) { toast("Email and password are required for one-time authorization."); return; }
+                  if (email.isEmpty() || password.isEmpty()) {
+                      toast("Email and password are required for one-time authorization.");
+                      return;
+                  }
 
+                  adminLoginInProgress=true;
                   adminLogin.setEnabled(false);
-                  adminStatus.setText("Authorizing...");
+                  adminLogin.setText("LOGGING IN...");
+                  adminEmail.setEnabled(false);
+                  adminPassword.setEnabled(false);
+                  if (adminLoginProgress!=null) adminLoginProgress.setVisibility(View.VISIBLE);
+                  adminStatus.setText("Authorizing... please wait");
+
                   new Thread(() -> {
+                      boolean success=false;
                       try {
                           JSONObject token = oauthPasswordLogin(email,password);
                           saveAuthorization(token,email);
-                          adminPassword.setText("");
                           ensureUserId();
+                          success=true;
                           runOnUiThread(() -> {
                               adminPassword.setText("");
                               appSessionAuthorized=true;
                               buildUi();
-                              appendLog("EMOS 5.0 started");
+                              appendLog("EMOS 5.1 started");
                               appendLog("LOGIN SUCCESS. Authorization is valid for this app session only; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -954,7 +982,19 @@ jobs:
                           appendLog("ADMIN AUTH ERROR: " + safeError(e));
                           runOnUiThread(() -> adminStatus.setText("Authorization failed: " + safeError(e)));
                       } finally {
-                          runOnUiThread(() -> adminLogin.setEnabled(true));
+                          final boolean loginSuccess=success;
+                          runOnUiThread(() -> {
+                              adminLoginInProgress=false;
+                              if (!loginSuccess) {
+                                  if (adminLoginProgress!=null) adminLoginProgress.setVisibility(View.GONE);
+                                  if (adminLogin!=null) {
+                                      adminLogin.setEnabled(true);
+                                      adminLogin.setText("LOGIN & AUTHORIZE");
+                                  }
+                                  if (adminEmail!=null) adminEmail.setEnabled(true);
+                                  if (adminPassword!=null) adminPassword.setEnabled(true);
+                              }
+                          });
                       }
                   }).start();
               }
@@ -2350,6 +2390,7 @@ jobs:
                       authDiagExpectedPlain=authKey.getText().toString();
                       authDiagBaselinePassword=null;
                       authDiagConnectionCount=0;
+                      authDiagChallengeCount=0;
                       writeSecure(profileKey("auth_diag_original_url"),original);
                       startAuthDiagServer();
 
@@ -2364,7 +2405,7 @@ jobs:
 
                       writeOcppEndpointOnly(tempUrl,cp,() -> {
                           authDiagStatus.setText("LOCAL LISTENER ACTIVE: "+tempUrl
-                                  +"\nWaiting for ABB WebSocket handshake / Basic Authorization...\n"
+                                  +"\nWaiting for ABB WebSocket handshake. If ABB sends no Authorization initially, EMOS will issue an HTTP 401 Basic challenge and wait for the authenticated retry...\n"
                                   +"Original URL saved: "+authDiagOriginalUrl);
                           setStatus("AUTH DIAGNOSTIC ACTIVE",
                                   "Waiting for ABB at "+tempUrl+". After first capture, reboot/power-cycle charger.");
@@ -2439,11 +2480,55 @@ jobs:
                       }
 
                       AuthDiagDecoded auth=decodeBasicAuth(authorization);
+                      final String remote=String.valueOf(s.getRemoteSocketAddress());
+
+                      // ABB/HTTP Basic Auth may be challenge-response rather than preemptive.
+                      // SteVe Security Profile 1 first rejects an unauthenticated WebSocket
+                      // handshake with HTTP 401 + WWW-Authenticate. If we immediately return
+                      // 101 here, ABB has no reason to send Authorization, which caused the
+                      // old diagnostic to report NO_AUTH_HEADER even though Basic Auth worked
+                      // against SteVe. Reproduce the real challenge before counting a capture.
+                      if (!auth.present) {
+                          final int challenge=++authDiagChallengeCount;
+                          final int capturesBefore=authDiagConnectionCount;
+                          appendLog("AUTH DIAG CHALLENGE #"+challenge
+                                  +" remote="+remote
+                                  +" request="+requestLine
+                                  +" no Authorization header; replying HTTP 401 Basic");
+
+                          String unauthorized="HTTP/1.1 401 Unauthorized\r\n"
+                                  +"WWW-Authenticate: Basic realm=\"OCPP\"\r\n"
+                                  +"Content-Length: 0\r\n"
+                                  +"Connection: close\r\n"
+                                  +"Cache-Control: no-store\r\n\r\n";
+                          out.write(unauthorized.getBytes(StandardCharsets.US_ASCII));
+                          out.flush();
+
+                          runOnUiThread(() -> {
+                              if (authDiagStatus!=null) authDiagStatus.setText(
+                                      "AUTH CHALLENGE #"+challenge+" • first request has no Authorization\n"
+                                      +"Remote: "+remote+"\n"
+                                      +"HTTP 401 + WWW-Authenticate: Basic sent.\n"
+                                      +"Waiting for ABB to retry WebSocket with Basic Authorization...\n\n"
+                                      +"This first no-header request is NORMAL for challenge-response Basic Auth and is not counted as CAPTURE.");
+                          });
+
+                          main.postDelayed(() -> {
+                              if (authDiagRunning && authDiagConnectionCount==capturesBefore && authDiagStatus!=null) {
+                                  String cur=authDiagStatus.getText().toString();
+                                  if (cur.startsWith("AUTH CHALLENGE #"+challenge)) {
+                                      authDiagStatus.setText(cur
+                                              +"\n\nNo authenticated retry received yet. If this remains unchanged, HTTPBasicAuthEnable may not be active/persistent, or the charger cannot reach the phone again.");
+                                  }
+                              }
+                          },12000);
+                          return;
+                      }
+
                       final int capture=++authDiagConnectionCount;
                       final String expectedHex=bytesToHexAscii(authDiagExpectedPlain.getBytes(StandardCharsets.UTF_8));
                       String verdict;
-                      if (!auth.present) verdict="NO_AUTH_HEADER";
-                      else if (!authDiagExpectedPlain.isEmpty() && auth.password.equals(authDiagExpectedPlain)) verdict="MATCH_EXPECTED_PLAIN";
+                      if (!authDiagExpectedPlain.isEmpty() && auth.password.equals(authDiagExpectedPlain)) verdict="MATCH_EXPECTED_PLAIN";
                       else if (!expectedHex.isEmpty() && auth.password.equalsIgnoreCase(expectedHex)) verdict="PASSWORD_IS_HEX_OF_EXPECTED";
                       else if (authDiagBaselinePassword==null) verdict="BASELINE_RECORDED";
                       else if (auth.password.equals(authDiagBaselinePassword)) verdict="SAME_AS_BASELINE";
@@ -2453,16 +2538,15 @@ jobs:
                                   ?"PASSWORD_IS_HEX_OF_BASELINE"
                                   :"PASSWORD_CHANGED_FROM_BASELINE";
                       }
-                      if (authDiagBaselinePassword==null && auth.present) authDiagBaselinePassword=auth.password;
+                      if (authDiagBaselinePassword==null) authDiagBaselinePassword=auth.password;
 
                       final String finalVerdict=verdict;
-                      final String remote=String.valueOf(s.getRemoteSocketAddress());
                       final String display="CAPTURE #"+capture+" • "+finalVerdict
                               +"\nRemote: "+remote
                               +"\nRequest: "+requestLine
                               +"\nUsername: "+(auth.username.isEmpty()?"<empty>":auth.username)
-                              +"\nPassword ASCII: "+(auth.present?auth.password:"<not sent>")
-                              +"\nPassword HEX: "+(auth.present?auth.passwordHex:"-")
+                              +"\nPassword ASCII: "+auth.password
+                              +"\nPassword HEX: "+auth.passwordHex
                               +"\nLength: "+auth.passwordBytes+" byte / "+auth.password.length()+" char"
                               +"\n\nExpected plain: "+(authDiagExpectedPlain.isEmpty()?"<not entered>":authDiagExpectedPlain)
                               +"\nOriginal OCPP: "+authDiagOriginalUrl;
@@ -2474,7 +2558,7 @@ jobs:
                               +" verdict="+finalVerdict);
                       runOnUiThread(() -> {
                           if (authDiagStatus!=null) authDiagStatus.setText(display
-                                  +"\n\nKeep this screen open. For reboot test, power-cycle charger; next WebSocket handshake becomes another CAPTURE.");
+                                  +"\n\nAuthorization captured. Keep this screen open. For reboot test, power-cycle charger; the next authenticated WebSocket handshake becomes another CAPTURE.");
                       });
 
                       if (wsKey.isEmpty()) {
@@ -3759,14 +3843,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.0-auth-diagnostic.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.1-auth-diagnostic.apk
           cd artifact
-          sha256sum EMOS-5.0-auth-diagnostic.apk | tee EMOS-5.0-auth-diagnostic.apk.sha256
+          sha256sum EMOS-5.1-auth-diagnostic.apk | tee EMOS-5.1-auth-diagnostic.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: EMOS-5.0-auth-diagnostic
+          name: EMOS-5.1-auth-diagnostic
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
