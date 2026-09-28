@@ -1,4 +1,4 @@
-name: Build EMOS 5.3 Basic Auth Verify
+name: Build EMOS 5.4 OCPP Auth Provision Test
 
 on:
   workflow_dispatch:
@@ -216,8 +216,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 530
-                  versionName '5.3-basic-auth-verify'
+                  versionCode 540
+                  versionName '5.4-ocpp-auth-provision-test'
               }
 
               buildTypes {
@@ -393,6 +393,17 @@ jobs:
               private String authDiagBaselinePassword = null;
               private int authDiagConnectionCount = 0;
               private int authDiagChallengeCount = 0;
+
+              // OCPP Auth Provision Test state:
+              // 0 = waiting initial BootNotification / need AuthorizationKey
+              // 1 = AuthorizationKey ChangeConfiguration sent, waiting CALLRESULT
+              // 2 = AuthorizationKey accepted / need HTTPBasicAuthEnable
+              // 3 = HTTPBasicAuthEnable ChangeConfiguration sent, waiting CALLRESULT
+              // 4 = both Accepted; waiting for reconnect carrying HTTP Basic Authorization
+              // 90 = provisioning rejected/failed
+              private volatile int authProvisionStage = 0;
+              private volatile String authProvisionRequestId = "";
+              private volatile int authProvisionUnauthReconnects = 0;
               private boolean autoReconnectEnabled = false;
               private String autoReconnectDeviceNumber = "";
               private String deviceNumber = "";
@@ -613,7 +624,7 @@ jobs:
                   // launch always asks for login again. Charger profiles remain saved.
                   if (appSessionAuthorized && hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("EMOS 5.3 started");
+                      appendLog("EMOS 5.4 started");
                       appendLog("Installer session active for this app session.");
                   } else {
                       clearAuthorizationTokensOnly();
@@ -784,7 +795,7 @@ jobs:
                   ocppCard.addView(requiresPassword);
 
                   TextView hint = text(
-                          "READ ALL shows values actually stored in charger. EMOS 5.2 writes the OCPP endpoint with the proven D6 variant 2 layout. "
+                          "READ ALL shows values actually stored in charger. EMOS 5.4 writes the OCPP endpoint with the proven D6 variant 2 layout. "
                           +"If Server requires password / AuthKey is checked, the PLAIN AuthKey is written directly into D6 (keyLen = actual UTF-8 byte length), matching the earlier working ABB trace; it is NOT HEX-encoded and is NOT cleared to keyLen=0. "
                           +"EMOS also sends best-effort HTTPBasicAuthEnable=true through the charger configuration channel. No Node/SteVe provisioning API is required by APPLY ALL. Unchecked = no AuthKey in D6.",
                           11,false,MUTED);
@@ -821,23 +832,24 @@ jobs:
                   root.addView(basicVerifyCard, cardLp());
 
                   LinearLayout authDiagCard = card(CARD);
-                  authDiagCard.addView(section("AUTHKEY REBOOT DIAGNOSTIC • LOCAL APK", ACCENT));
+                  authDiagCard.addView(section("OCPP AUTH PROVISION TEST • LOCAL APK", ACCENT));
                   TextView authDiagInfo = text(
-                          "Tidak mengubah server ICON. EMOS membuka mini OCPP endpoint di HP pada port 9221, "
-                          +"sementara mengarahkan charger ke HP, lalu menangkap Basic Authorization yang benar-benar "
-                          +"dikirim ABB. Ambil capture awal, power-cycle charger, lalu bandingkan capture setelah reboot. "
-                          +"HP dan charger harus berada pada Wi-Fi/LAN yang sama dan AP client isolation harus OFF. "
-                          +"EMOS akan meniru server Security Profile 1: request pertama tanpa Authorization akan dibalas HTTP 401 Basic challenge, lalu capture dilakukan pada retry ABB yang membawa Authorization header.",
+                          "Tidak mengubah server ICON/SteVe. EMOS menjadi mini CSMS OCPP 1.6 di HP port 9221. "
+                          +"Charger sementara diarahkan ke HP TANPA AuthKey agar koneksi awal pasti masuk. Setelah BootNotification Accepted, "
+                          +"EMOS sendiri mengirim ChangeConfiguration AuthorizationKey=<HEX dari password plain>, menunggu status Accepted, "
+                          +"lalu mengirim ChangeConfiguration HTTPBasicAuthEnable=true dan menunggu Accepted. Setelah kedua command Accepted, "
+                          +"EMOS memutus WebSocket agar ABB reconnect. Reconnect itulah yang diperiksa apakah benar membawa Authorization: Basic. "
+                          +"HP dan charger harus berada pada Wi-Fi/LAN yang sama dan AP client isolation harus OFF.",
                           11,false,MUTED);
                   authDiagInfo.setPadding(0,0,0,dp(8));
                   authDiagCard.addView(authDiagInfo);
 
-                  authDiagStatus = text("Diagnostic stopped. Authenticate charger and READ ALL first.",11,true,MUTED);
+                  authDiagStatus = text("Provision test stopped. Authenticate charger and READ ALL first.",11,true,MUTED);
                   authDiagStatus.setTextIsSelectable(true);
                   authDiagStatus.setPadding(0,0,0,dp(8));
                   authDiagCard.addView(authDiagStatus);
 
-                  authDiagStartBtn = button("START LOCAL AUTH CAPTURE", ACCENT, Color.rgb(4,35,38));
+                  authDiagStartBtn = button("START OCPP AUTH PROVISION TEST", ACCENT, Color.rgb(4,35,38));
                   authDiagRestoreBtn = button("RESTORE ORIGINAL OCPP URL", SECONDARY, WHITE);
                   authDiagStopBtn = button("STOP LISTENER ONLY", SECONDARY, WHITE);
                   authDiagCard.addView(authDiagStartBtn,new LinearLayout.LayoutParams(-1,dp(52)));
@@ -996,7 +1008,7 @@ jobs:
                               adminPassword.setText("");
                               appSessionAuthorized=true;
                               buildUi();
-                              appendLog("EMOS 5.3 started");
+                              appendLog("EMOS 5.4 started");
                               appendLog("LOGIN SUCCESS. Authorization is valid for this app session only; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -2572,7 +2584,7 @@ jobs:
                       return;
                   }
                   if (!cp.equals(chargePointId.getText().toString().trim())) {
-                      appendLog("AUTH DIAG Charger ID corrected from UI="+chargePointId.getText().toString().trim()
+                      appendLog("AUTH PROVISION Charger ID corrected from UI="+chargePointId.getText().toString().trim()
                               +" to charger read-back="+cp);
                       chargePointId.setText(cp);
                   }
@@ -2587,40 +2599,52 @@ jobs:
                       String ip=getActiveWifiIpv4();
                       authDiagOriginalUrl=original;
                       authDiagExpectedPlain=authKey.getText().toString();
-                      int diagKeyBytes=authDiagExpectedPlain.getBytes(StandardCharsets.UTF_8).length;
+                      int plainBytes=authDiagExpectedPlain.getBytes(StandardCharsets.UTF_8).length;
                       if (authDiagExpectedPlain.isEmpty())
                           throw new Exception("Enter the plain AuthKey/password first.");
-                      if (diagKeyBytes<10 || diagKeyBytes>20)
-                          throw new Exception("AuthKey must be 10-20 UTF-8 bytes for this compatibility test. Current="+diagKeyBytes);
+                      if (plainBytes<10 || plainBytes>20)
+                          throw new Exception("AuthKey must be 10-20 UTF-8 bytes for this ABB compatibility test. Current="+plainBytes);
+
                       authDiagBaselinePassword=null;
                       authDiagConnectionCount=0;
                       authDiagChallengeCount=0;
+                      authProvisionStage=0;
+                      authProvisionRequestId="";
+                      authProvisionUnauthReconnects=0;
                       writeSecure(profileKey("auth_diag_original_url"),original);
                       startAuthDiagServer();
 
                       final String tempUrl="ws://"+ip+":"+AUTH_DIAG_PORT;
-                      appendLog("AUTH DIAG START localEndpoint="+tempUrl
-                              +" original="+original+" expectedPlainBytes="
-                              +authDiagExpectedPlain.getBytes(StandardCharsets.UTF_8).length
-                              +" (secret not logged here)");
-                      authDiagStatus.setText("Listener ACTIVE: "+tempUrl
-                              +"\nWriting temporary OCPP endpoint to charger...\n"
-                              +"Do NOT change/reset AuthKey. After CAPTURE #1 appears, power-cycle the charger and keep EMOS open.");
+                      appendLog("AUTH PROVISION START localEndpoint="+tempUrl
+                              +" original="+original
+                              +" expectedPlainBytes="+plainBytes
+                              +" expectedHexChars="+(plainBytes*2)
+                              +" (secret hidden)");
+                      authDiagStatus.setText("LOCAL MINI-CSMS STARTING: "+tempUrl
+                              +"\nStep 1/4: writing temporary endpoint with keyLen=0 so ABB can connect without authentication."
+                              +"\nOriginal URL saved: "+authDiagOriginalUrl);
 
-                      writeOcppEndpointOnly(tempUrl,cp,authDiagExpectedPlain,() -> {
-                          authDiagStatus.setText("LOCAL LISTENER ACTIVE: "+tempUrl
-                                  +"\nD6 was written with the PLAIN AuthKey (not HEX, not keyLen=0). EMOS also sent best-effort HTTPBasicAuthEnable=1.\n"
-                                  +"Waiting for ABB WebSocket handshake. If ABB starts without Authorization, EMOS sends an HTTP 401 Basic challenge and waits for the authenticated retry...\n"
-                                  +"Original URL saved: "+authDiagOriginalUrl);
-                          setStatus("AUTH DIAGNOSTIC ACTIVE",
-                                  "Waiting for ABB at "+tempUrl+". After first capture, reboot/power-cycle charger.");
+                      // IMPORTANT: keyLen=0 here is intentional only for the local provisioning
+                      // test. The mini-CSMS must first accept the charger unauthenticated, then
+                      // provision AuthorizationKey through real OCPP ChangeConfiguration.
+                      writeOcppEndpointOnly(tempUrl,cp,"",() -> {
+                          authDiagStatus.setText("LOCAL MINI-CSMS ACTIVE: "+tempUrl
+                                  +"\nWaiting for ABB BootNotification WITHOUT Basic Auth."
+                                  +"\nThen EMOS will send:"
+                                  +"\n1) ChangeConfiguration AuthorizationKey=<HEX>"
+                                  +"\n2) ChangeConfiguration HTTPBasicAuthEnable=true"
+                                  +"\n3) force WebSocket reconnect"
+                                  +"\n4) capture Authorization header"
+                                  +"\n\nDo not reset AuthKey or change SteVe during this test.");
+                          setStatus("OCPP AUTH PROVISION TEST ACTIVE",
+                                  "Waiting for ABB BootNotification at "+tempUrl);
                       });
 
                   } catch(Exception e) {
                       stopLocalAuthDiagnostic(false);
-                      appendLog("AUTH DIAG START ERROR: "+safeError(e));
+                      appendLog("AUTH PROVISION START ERROR: "+safeError(e));
                       if (authDiagStatus!=null) authDiagStatus.setText("Start failed: "+safeError(e));
-                      toast("Auth diagnostic failed: "+safeError(e));
+                      toast("OCPP Auth Provision Test failed: "+safeError(e));
                   }
               }
 
@@ -2662,6 +2686,7 @@ jobs:
               }
 
               private void handleAuthDiagClient(Socket socket) {
+                  int stageAtOpen=authProvisionStage;
                   try(Socket s=socket) {
                       InputStream in=new BufferedInputStream(s.getInputStream());
                       OutputStream out=new BufferedOutputStream(s.getOutputStream());
@@ -2687,84 +2712,89 @@ jobs:
                       AuthDiagDecoded auth=decodeBasicAuth(authorization);
                       final String remote=String.valueOf(s.getRemoteSocketAddress());
 
-                      // ABB/HTTP Basic Auth may be challenge-response rather than preemptive.
-                      // SteVe Security Profile 1 first rejects an unauthenticated WebSocket
-                      // handshake with HTTP 401 + WWW-Authenticate. If we immediately return
-                      // 101 here, ABB has no reason to send Authorization, which caused the
-                      // old diagnostic to report NO_AUTH_HEADER even though Basic Auth worked
-                      // against SteVe. Reproduce the real challenge before counting a capture.
-                      if (!auth.present) {
-                          final int challenge=++authDiagChallengeCount;
-                          final int capturesBefore=authDiagConnectionCount;
-                          appendLog("AUTH DIAG CHALLENGE #"+challenge
-                                  +" remote="+remote
-                                  +" request="+requestLine
-                                  +" no Authorization header; replying HTTP 401 Basic");
+                      // Before both ChangeConfiguration commands are Accepted, EMOS intentionally
+                      // accepts an unauthenticated WebSocket. This is the provisioning channel.
+                      // AFTER stage 4, the next connection is the actual proof and must contain
+                      // Authorization. If it does not, challenge exactly like Security Profile 1.
+                      if (authProvisionStage>=4) {
+                          if (!auth.present) {
+                              final int challenge=++authDiagChallengeCount;
+                              final int capturesBefore=authDiagConnectionCount;
+                              final int unauth=++authProvisionUnauthReconnects;
+                              appendLog("AUTH PROVISION RECONNECT NO_HEADER #"+unauth
+                                      +" challenge="+challenge
+                                      +" remote="+remote
+                                      +" request="+requestLine
+                                      +" -> HTTP 401 Basic");
 
-                          String unauthorized="HTTP/1.1 401 Unauthorized\r\n"
-                                  +"WWW-Authenticate: Basic realm=\"OCPP\"\r\n"
-                                  +"Content-Length: 0\r\n"
-                                  +"Connection: close\r\n"
-                                  +"Cache-Control: no-store\r\n\r\n";
-                          out.write(unauthorized.getBytes(StandardCharsets.US_ASCII));
-                          out.flush();
+                              String unauthorized="HTTP/1.1 401 Unauthorized\r\n"
+                                      +"WWW-Authenticate: Basic realm=\"OCPP\"\r\n"
+                                      +"Content-Length: 0\r\n"
+                                      +"Connection: close\r\n"
+                                      +"Cache-Control: no-store\r\n\r\n";
+                              out.write(unauthorized.getBytes(StandardCharsets.US_ASCII));
+                              out.flush();
 
-                          runOnUiThread(() -> {
-                              if (authDiagStatus!=null) authDiagStatus.setText(
-                                      "AUTH CHALLENGE #"+challenge+" • first request has no Authorization\n"
-                                      +"Remote: "+remote+"\n"
-                                      +"HTTP 401 + WWW-Authenticate: Basic sent.\n"
-                                      +"Waiting for ABB to retry WebSocket with Basic Authorization...\n\n"
-                                      +"This first no-header request is NORMAL for challenge-response Basic Auth and is not counted as CAPTURE.");
-                          });
+                              runOnUiThread(() -> {
+                                  if (authDiagStatus!=null) authDiagStatus.setText(
+                                          "PROVISION COMMANDS: ACCEPTED\n"
+                                          +"RECONNECT #"+unauth+" HAS NO AUTHORIZATION HEADER\n"
+                                          +"Remote: "+remote+"\n"
+                                          +"Request: "+requestLine+"\n\n"
+                                          +"EMOS replied HTTP 401 + WWW-Authenticate: Basic. Waiting for ABB retry with credentials...\n\n"
+                                          +"If ABB keeps reconnecting with NO HEADER, this is strong firmware/charger-side evidence: AuthorizationKey and HTTPBasicAuthEnable were both Accepted over OCPP, but the HTTP/WebSocket layer still does not emit Basic Auth.");
+                              });
 
-                          main.postDelayed(() -> {
-                              if (authDiagRunning && authDiagConnectionCount==capturesBefore && authDiagStatus!=null) {
-                                  String cur=authDiagStatus.getText().toString();
-                                  if (cur.startsWith("AUTH CHALLENGE #"+challenge)) {
-                                      authDiagStatus.setText(cur
-                                              +"\n\nNo authenticated retry received yet. If this remains unchanged, HTTPBasicAuthEnable may not be active/persistent, or the charger cannot reach the phone again.");
+                              main.postDelayed(() -> {
+                                  if (authDiagRunning && authDiagConnectionCount==capturesBefore && authDiagStatus!=null
+                                          && authProvisionStage>=4) {
+                                      String cur=authDiagStatus.getText().toString();
+                                      if (cur.contains("RECONNECT #"+unauth+" HAS NO AUTHORIZATION HEADER")) {
+                                          authDiagStatus.setText(cur
+                                                  +"\n\nNo authenticated retry received after 12 seconds. Capture the debug log; this result is directly comparable to the SteVe warning 'Failed to find username and password in Basic Authorization header'.");
+                                      }
                                   }
-                              }
-                          },12000);
-                          return;
+                              },12000);
+                              return;
+                          }
+
+                          final int capture=++authDiagConnectionCount;
+                          final String expectedHex=bytesToHexAscii(authDiagExpectedPlain.getBytes(StandardCharsets.UTF_8));
+                          String verdict;
+                          if (!authDiagExpectedPlain.isEmpty() && auth.password.equals(authDiagExpectedPlain))
+                              verdict="MATCH_EXPECTED_PLAIN";
+                          else if (!expectedHex.isEmpty() && auth.password.equalsIgnoreCase(expectedHex))
+                              verdict="PASSWORD_IS_HEX_OF_EXPECTED";
+                          else verdict="PASSWORD_DIFFERENT_FROM_EXPECTED";
+
+                          if (authDiagBaselinePassword==null) authDiagBaselinePassword=auth.password;
+                          final String finalVerdict=verdict;
+                          final String display="CAPTURE #"+capture+" • "+finalVerdict
+                                  +"\nPROVISION RESULT: AuthorizationKey=Accepted, HTTPBasicAuthEnable=Accepted"
+                                  +"\nRemote: "+remote
+                                  +"\nRequest: "+requestLine
+                                  +"\nUsername: "+(auth.username.isEmpty()?"<empty>":auth.username)
+                                  +"\nPassword ASCII: "+auth.password
+                                  +"\nPassword HEX: "+auth.passwordHex
+                                  +"\nLength: "+auth.passwordBytes+" byte / "+auth.password.length()+" char"
+                                  +"\n\nExpected plain: "+authDiagExpectedPlain
+                                  +"\nOriginal OCPP: "+authDiagOriginalUrl;
+
+                          appendLog("AUTH PROVISION CAPTURE #"+capture
+                                  +" remote="+remote
+                                  +" user="+auth.username
+                                  +" passwordBytes="+auth.passwordBytes
+                                  +" verdict="+finalVerdict);
+                          runOnUiThread(() -> {
+                              if (authDiagStatus!=null) authDiagStatus.setText(display
+                                      +"\n\nThis is the credential ABB actually placed in the HTTP WebSocket Authorization header after OCPP provisioning.");
+                          });
+                      } else {
+                          appendLog("AUTH PROVISION initial WS remote="+remote
+                                  +" stage="+authProvisionStage
+                                  +" authHeader="+(auth.present?"present":"absent")
+                                  +" request="+requestLine);
                       }
-
-                      final int capture=++authDiagConnectionCount;
-                      final String expectedHex=bytesToHexAscii(authDiagExpectedPlain.getBytes(StandardCharsets.UTF_8));
-                      String verdict;
-                      if (!authDiagExpectedPlain.isEmpty() && auth.password.equals(authDiagExpectedPlain)) verdict="MATCH_EXPECTED_PLAIN";
-                      else if (!expectedHex.isEmpty() && auth.password.equalsIgnoreCase(expectedHex)) verdict="PASSWORD_IS_HEX_OF_EXPECTED";
-                      else if (authDiagBaselinePassword==null) verdict="BASELINE_RECORDED";
-                      else if (auth.password.equals(authDiagBaselinePassword)) verdict="SAME_AS_BASELINE";
-                      else {
-                          String baseHex=bytesToHexAscii(authDiagBaselinePassword.getBytes(StandardCharsets.UTF_8));
-                          verdict=auth.password.equalsIgnoreCase(baseHex)
-                                  ?"PASSWORD_IS_HEX_OF_BASELINE"
-                                  :"PASSWORD_CHANGED_FROM_BASELINE";
-                      }
-                      if (authDiagBaselinePassword==null) authDiagBaselinePassword=auth.password;
-
-                      final String finalVerdict=verdict;
-                      final String display="CAPTURE #"+capture+" • "+finalVerdict
-                              +"\nRemote: "+remote
-                              +"\nRequest: "+requestLine
-                              +"\nUsername: "+(auth.username.isEmpty()?"<empty>":auth.username)
-                              +"\nPassword ASCII: "+auth.password
-                              +"\nPassword HEX: "+auth.passwordHex
-                              +"\nLength: "+auth.passwordBytes+" byte / "+auth.password.length()+" char"
-                              +"\n\nExpected plain: "+(authDiagExpectedPlain.isEmpty()?"<not entered>":authDiagExpectedPlain)
-                              +"\nOriginal OCPP: "+authDiagOriginalUrl;
-
-                      appendLog("AUTH DIAG CAPTURE #"+capture
-                              +" remote="+remote
-                              +" user="+auth.username
-                              +" passwordBytes="+auth.passwordBytes
-                              +" verdict="+finalVerdict);
-                      runOnUiThread(() -> {
-                          if (authDiagStatus!=null) authDiagStatus.setText(display
-                                  +"\n\nAuthorization captured. Keep this screen open. For reboot test, power-cycle charger; the next authenticated WebSocket handshake becomes another CAPTURE.");
-                      });
 
                       if (wsKey.isEmpty()) {
                           String resp="HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
@@ -2796,16 +2826,157 @@ jobs:
                               continue;
                           }
                           if (f.opcode!=0x1) continue;
+
                           String text=new String(f.payload,StandardCharsets.UTF_8);
-                          appendLog("AUTH DIAG OCPP RX "+compact(text));
-                          String reply=buildDiagOcppReply(text);
-                          if (reply!=null && !reply.isEmpty()) {
-                              writeWsFrame(out,0x1,reply.getBytes(StandardCharsets.UTF_8));
-                              appendLog("AUTH DIAG OCPP TX "+compact(reply));
+                          appendLog("AUTH PROVISION OCPP RX "+compactLong(text,500));
+
+                          JSONArray msg;
+                          try {
+                              msg=new JSONArray(text);
+                          } catch(Exception parse) {
+                              appendLog("AUTH PROVISION invalid OCPP JSON: "+safeError(parse));
+                              continue;
+                          }
+                          if (msg.length()<2) continue;
+                          int type=msg.optInt(0,-1);
+
+                          if (type==2 && msg.length()>=3) { // CALL from charger
+                              String id=msg.optString(1,"");
+                              String action=msg.optString(2,"");
+                              String reply=buildDiagOcppReply(text);
+                              if (reply!=null && !reply.isEmpty()) {
+                                  writeWsFrame(out,0x1,reply.getBytes(StandardCharsets.UTF_8));
+                                  appendLog("AUTH PROVISION OCPP TX "+compactLong(reply,500));
+                              }
+
+                              if ("BootNotification".equals(action)) {
+                                  if (authProvisionStage==0) {
+                                      sendAuthProvisionChangeConfiguration(out,"AuthorizationKey",
+                                              bytesToHexAscii(authDiagExpectedPlain.getBytes(StandardCharsets.UTF_8)),1);
+                                      runOnUiThread(() -> {
+                                          if (authDiagStatus!=null) authDiagStatus.setText(
+                                                  "BOOTNOTIFICATION: ACCEPTED\n"
+                                                  +"Step 2/4: ChangeConfiguration AuthorizationKey=<HEX> sent.\n"
+                                                  +"Waiting for charger CALLRESULT status...");
+                                      });
+                                  } else if (authProvisionStage==2) {
+                                      sendAuthProvisionChangeConfiguration(out,"HTTPBasicAuthEnable","true",3);
+                                  }
+                              }
+                              continue;
+                          }
+
+                          if (type==3 && msg.length()>=3) { // CALLRESULT to EMOS request
+                              String id=msg.optString(1,"");
+                              JSONObject payload=msg.optJSONObject(2);
+                              String status=payload==null?"":payload.optString("status","");
+                              if (!id.equals(authProvisionRequestId)) continue;
+
+                              if (authProvisionStage==1) {
+                                  appendLog("AUTH PROVISION AuthorizationKey CALLRESULT status="+status);
+                                  if (!"Accepted".equalsIgnoreCase(status)) {
+                                      authProvisionStage=90;
+                                      runOnUiThread(() -> {
+                                          if (authDiagStatus!=null) authDiagStatus.setText(
+                                                  "AuthorizationKey ChangeConfiguration result: "+status
+                                                  +"\nProvisioning stopped. ABB did not accept the key.");
+                                      });
+                                      continue;
+                                  }
+                                  authProvisionStage=2;
+                                  runOnUiThread(() -> {
+                                      if (authDiagStatus!=null) authDiagStatus.setText(
+                                              "AuthorizationKey: ACCEPTED\n"
+                                              +"Step 3/4: sending HTTPBasicAuthEnable=true...");
+                                  });
+                                  sendAuthProvisionChangeConfiguration(out,"HTTPBasicAuthEnable","true",3);
+                                  continue;
+                              }
+
+                              if (authProvisionStage==3) {
+                                  appendLog("AUTH PROVISION HTTPBasicAuthEnable CALLRESULT status="+status);
+                                  if (!"Accepted".equalsIgnoreCase(status)) {
+                                      authProvisionStage=90;
+                                      runOnUiThread(() -> {
+                                          if (authDiagStatus!=null) authDiagStatus.setText(
+                                                  "AuthorizationKey: ACCEPTED\n"
+                                                  +"HTTPBasicAuthEnable result: "+status
+                                                  +"\nProvisioning stopped because Basic Auth enable was not Accepted.");
+                                      });
+                                      continue;
+                                  }
+
+                                  authProvisionStage=4;
+                                  authProvisionRequestId="";
+                                  appendLog("AUTH PROVISION BOTH ACCEPTED. Closing WebSocket to force authenticated reconnect.");
+                                  runOnUiThread(() -> {
+                                      if (authDiagStatus!=null) authDiagStatus.setText(
+                                              "AuthorizationKey: ACCEPTED\n"
+                                              +"HTTPBasicAuthEnable: ACCEPTED\n"
+                                              +"Step 4/4: forcing WebSocket reconnect...\n\n"
+                                              +"The NEXT HTTP WebSocket handshake must carry Authorization: Basic. If it does not, EMOS will record NO_HEADER and issue a 401 challenge.");
+                                  });
+                                  Thread.sleep(450);
+                                  writeWsFrame(out,0x8,new byte[]{0x03,(byte)0xE8});
+                                  return;
+                              }
+                              continue;
+                          }
+
+                          if (type==4 && msg.length()>=4) { // CALLERROR
+                              String id=msg.optString(1,"");
+                              if (id.equals(authProvisionRequestId)) {
+                                  String code=msg.optString(2,"");
+                                  String desc=msg.optString(3,"");
+                                  appendLog("AUTH PROVISION CALLERROR stage="+authProvisionStage
+                                          +" code="+code+" desc="+desc);
+                                  authProvisionStage=90;
+                                  runOnUiThread(() -> {
+                                      if (authDiagStatus!=null) authDiagStatus.setText(
+                                              "OCPP provisioning CALLERROR: "+code+" • "+desc);
+                                  });
+                              }
                           }
                       }
                   } catch(Exception e) {
-                      if (authDiagRunning) appendLog("AUTH DIAG client closed: "+safeError(e));
+                      if (authDiagRunning) appendLog("AUTH PROVISION client closed: "+safeError(e));
+                  } finally {
+                      // If ABB restarts the socket while applying a setting before EMOS receives
+                      // the CALLRESULT, resend the same idempotent ChangeConfiguration on the next
+                      // BootNotification rather than becoming stuck in a waiting stage.
+                      if (authDiagRunning) {
+                          if (authProvisionStage==1) {
+                              authProvisionStage=0;
+                              authProvisionRequestId="";
+                              appendLog("AUTH PROVISION connection ended while waiting AuthorizationKey result; will resend on next BootNotification.");
+                          } else if (authProvisionStage==3) {
+                              authProvisionStage=2;
+                              authProvisionRequestId="";
+                              appendLog("AUTH PROVISION connection ended while waiting HTTPBasicAuthEnable result; will resend on next BootNotification.");
+                          }
+                      }
+                  }
+              }
+
+              private void sendAuthProvisionChangeConfiguration(OutputStream out,String key,String value,int waitingStage) throws Exception {
+                  String id="emos54-"+waitingStage+"-"+Long.toHexString(System.currentTimeMillis());
+                  JSONObject payload=new JSONObject();
+                  payload.put("key",key);
+                  payload.put("value",value);
+                  JSONArray call=new JSONArray();
+                  call.put(2);
+                  call.put(id);
+                  call.put("ChangeConfiguration");
+                  call.put(payload);
+
+                  authProvisionRequestId=id;
+                  authProvisionStage=waitingStage;
+                  writeWsFrame(out,0x1,call.toString().getBytes(StandardCharsets.UTF_8));
+
+                  if ("AuthorizationKey".equals(key)) {
+                      appendLog("AUTH PROVISION OCPP TX ChangeConfiguration AuthorizationKey=<hidden HEX> hexChars="+value.length()+" id="+id);
+                  } else {
+                      appendLog("AUTH PROVISION OCPP TX ChangeConfiguration "+key+"="+value+" id="+id);
                   }
               }
 
@@ -2947,7 +3118,7 @@ jobs:
               private void writeOcppEndpointOnly(String url,String cp,String plainKey,Runnable onOk) throws Exception {
                   final String k=plainKey==null?"":plainKey;
                   byte[] payload=buildOcppPayload(url,cp,k,2);
-                  appendLog("AUTH DIAG TX D6 temporary endpoint="+url+" id="+cp
+                  appendLog("AUTH PROVISION TX D6 temporary endpoint="+url+" id="+cp
                           +" keyLen="+k.getBytes(StandardCharsets.UTF_8).length
                           +" auth="+(k.isEmpty()?"off":"on")+" value=<hidden plain>");
                   sendEncrypted(CMD_OCPP,payload,p -> {
@@ -2955,13 +3126,13 @@ jobs:
                           requirePacketOk(p,"Auth diagnostic OCPP endpoint");
                           if (p.payload==null || p.payload.length<1 || (p.payload[0]&0xff)!=1)
                               throw new Exception("D6 endpoint rejected payload="+hex(p.payload));
-                          appendLog("AUTH DIAG D6 endpoint accepted: "+url+" with keyLen="
+                          appendLog("AUTH PROVISION D6 endpoint accepted: "+url+" with keyLen="
                                   +k.getBytes(StandardCharsets.UTF_8).length);
                           if (!k.isEmpty()) {
                               setHttpBasicAuthEnableForDiagnostic(true,0,onOk);
                           } else if (onOk!=null) onOk.run();
                       } catch(Exception e) {
-                          appendLog("AUTH DIAG D6 ERROR: "+safeError(e));
+                          appendLog("AUTH PROVISION D6 ERROR: "+safeError(e));
                           if (authDiagStatus!=null) authDiagStatus.setText("Temporary endpoint failed: "+safeError(e));
                       }
                   });
@@ -3042,7 +3213,10 @@ jobs:
                   if (ss!=null) try { ss.close(); } catch(Exception ignored) {}
                   if (clearSavedOriginal && deviceNumber!=null && !deviceNumber.isEmpty())
                       try { writeSecure(profileKey("auth_diag_original_url"),""); } catch(Exception ignored) {}
-                  appendLog("AUTH DIAG listener stopped");
+                  authProvisionStage=0;
+                  authProvisionRequestId="";
+                  authProvisionUnauthReconnects=0;
+                  appendLog("AUTH PROVISION listener stopped");
               }
 
               private String printableUtf8(byte[] payload) {
@@ -4095,14 +4269,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.3-basic-auth-verify.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.4-ocpp-auth-provision-test.apk
           cd artifact
-          sha256sum EMOS-5.3-basic-auth-verify.apk | tee EMOS-5.3-basic-auth-verify.apk.sha256
+          sha256sum EMOS-5.4-ocpp-auth-provision-test.apk | tee EMOS-5.4-ocpp-auth-provision-test.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: EMOS-5.3-basic-auth-verify
+          name: EMOS-5.4-ocpp-auth-provision-test
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
