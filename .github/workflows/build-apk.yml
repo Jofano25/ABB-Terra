@@ -1,4 +1,4 @@
-name: Build EMOS 5.7 WiFi First Provision Fix
+name: Build EMOS 5.8 TerraConfig WiFi Flow
 
 on:
   workflow_dispatch:
@@ -216,8 +216,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 570
-                  versionName '5.7-wifi-first-provision-fix'
+                  versionCode 580
+                  versionName '5.8-terraconfig-wifi-flow'
               }
 
               buildTypes {
@@ -366,6 +366,10 @@ jobs:
               private String lastTcpIpSummary = "";
               private int lastAaInterfaceType = -1; // learned from AA read-back; FW 2.1.0 reports Wi-Fi as 0
               private int lastAaIpMode = -1;        // AA byte[1]: 0=DHCP, 1=static; used to avoid unnecessary AB writes
+              // TerraConfig official NetworkingMode mapping: 1=Wi-Fi, 2=Ethernet.
+              // READ D3 populates this so Wi-Fi APPLY can follow TerraConfig's exact branch:
+              // current mode already Wi-Fi -> write SSID/password directly via D2 (NO AB, NO CE_AUTH).
+              private int lastD3Mode = -1;
               private boolean lastOcppApplyOk = false;
               private String lastOcppApplyMessage = "Not applied";
               private boolean awaitingExpectedReboot = false;
@@ -634,7 +638,7 @@ jobs:
                   // launch always asks for login again. Charger profiles remain saved.
                   if (appSessionAuthorized && hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("EMOS 5.7 started");
+                      appendLog("EMOS 5.8 started");
                       appendLog("Installer session active for this app session.");
                   } else {
                       clearAuthorizationTokensOnly();
@@ -1037,7 +1041,7 @@ jobs:
                               adminPassword.setText("");
                               appSessionAuthorized=true;
                               buildUi();
-                              appendLog("EMOS 5.7 started");
+                              appendLog("EMOS 5.8 started");
                               appendLog("LOGIN SUCCESS. Authorization is valid for this app session only; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -1552,6 +1556,7 @@ jobs:
 
                           int networkResult=p.payload[0]&0xff;
                           int mode=p.payload[1]&0xff;
+                          lastD3Mode=mode;
                           int detail=(p.payload[2]&0xff)|((p.payload[3]&0xff)<<8);
                           String detailText=networkDetailText(detail);
 
@@ -1910,24 +1915,41 @@ jobs:
               }
 
               private void applyWifiLast(String ssid,String password) {
-                  expectedNetworkMode=1; // D3 read-back: Wi-Fi
+                  expectedNetworkMode=1; // TerraConfig NetworkingMode.WIFI = 1
                   pendingDesiredSsid=ssid;
                   wifiWritePending=true;
 
-                  appendLog("WIFI APPLY FIRST-PROVISION FIX target ssid="
-                          +ssid+" password=<hidden>");
+                  appendLog("WIFI APPLY TERRACONFIG-FLOW v5.8 target ssid="
+                          +ssid+" password=<hidden> currentD3Mode="+lastD3Mode);
 
                   progress("Internet connection",false,
-                          "Preparing first-provision Wi-Fi profile...");
+                          "Applying Wi-Fi using TerraConfig-compatible flow...");
 
                   connectionStatus.setText(
-                          "Preparing persistent Wi-Fi profile for "+ssid+"...");
+                          "Applying Wi-Fi "+ssid+" using TerraConfig-compatible flow...");
 
-                  appendLog(
-                          "WIFI FIRST-PROVISION FLOW: AB interface=0 DHCP -> CE_AUTH mode=6 -> D2.");
-                  appendLog(
-                          "AB inner response is advisory; D4 remains skipped on FW 2.1.0.");
+                  // Reverse-engineered directly from official TerraConfig:
+                  // ChargerConfigurationManager.writeStep(CONNECTIONS) first reads current
+                  // NetworkingMode. If current == desired WIFI, it calls
+                  // writeExtraConnectionInformation() -> writeWiFiConfiguration() ->
+                  // CDBleClient.configurationWifiNetwork(ssid,password), which is D2.
+                  //
+                  // IMPORTANT: on this branch TerraConfig does NOT send AB and does NOT
+                  // send CE_AUTH. Our older 4.0/5.6/5.7 flows always inserted CE_AUTH
+                  // (and sometimes AB), then the charger rebooted and rolled back.
+                  if (lastD3Mode==1) {
+                      appendLog("TERRACONFIG WIFI MATCH: current mode already WIFI (D3=1).");
+                      appendLog("TERRACONFIG WIFI FLOW: DIRECT D2 only; AB skipped; CE_AUTH skipped.");
+                      sendWifiCredentialsForApply(ssid,password);
+                      return;
+                  }
 
+                  // Fallback only when the charger is NOT already in Wi-Fi mode.
+                  // Official TerraConfig switches the connection mode first in this case.
+                  // Keep the previous compatibility path for non-Wi-Fi starting states,
+                  // but never use it for the user's proven D3=1 scenario.
+                  appendLog("TERRACONFIG WIFI MODE CHANGE: current D3 mode="+lastD3Mode
+                          +"; using compatibility mode-switch fallback before D2.");
                   forceWifiDhcpProfileBeforeCredentialWrite(
                           () -> enableConnectionAuth(
                                   NET_WIFI,
@@ -1941,8 +1963,8 @@ jobs:
                   progress("Internet connection",false,"Writing Wi-Fi SSID/password...");
                   connectionStatus.setText("Writing Wi-Fi "+ssid+" • DHCP. Charger may restart BLE/network.");
                   appendLog("TX WIFI D2 ssid="+ssid+" password=<hidden> payloadLen="+payload.length);
-                  appendLog("D2 response window=40s. On FW 2.1.0 a disconnect/restart may happen before D2 reply; "+
-                          "post-reboot E4 is authoritative for persistence.");
+                  appendLog("D2 response window=40s. TerraConfig official direct-WiFi branch uses this same D2 command. "+
+                          "If FW 2.1.0 restarts before reply, post-reboot E4 remains authoritative.");
 
                   // Arm expected reboot BEFORE D2. FW 2.1.0 can restart/disconnect before
                   // sending the D2 response, which happened in 3.8 after about 7 seconds.
@@ -2259,6 +2281,7 @@ jobs:
 
                           int networkResult=p.payload[0]&0xff;
                           int mode=p.payload[1]&0xff;
+                          lastD3Mode=mode;
                           int detail=(p.payload[2]&0xff)|((p.payload[3]&0xff)<<8);
                           String detailText=networkDetailText(detail);
                           String modeText=mode==1?"Wi-Fi":mode==2?"Ethernet":"mode "+mode;
@@ -3986,6 +4009,7 @@ jobs:
                   internetReady=false;
                   expectedNetworkMode=0;
                   lastTcpIpSummary="";
+                  lastD3Mode=-1;
                   tx=null;rx=null;
                   encryptionKey=null;
                   cipherInfo=null;
@@ -4414,14 +4438,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.7-wifi-first-provision-fix.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.8-terraconfig-wifi-flow.apk
           cd artifact
-          sha256sum EMOS-5.7-wifi-first-provision-fix.apk | tee EMOS-5.7-wifi-first-provision-fix.apk.sha256
+          sha256sum EMOS-5.8-terraconfig-wifi-flow.apk | tee EMOS-5.8-terraconfig-wifi-flow.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: EMOS-5.7-wifi-first-provision-fix
+          name: EMOS-5.8-terraconfig-wifi-flow
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
