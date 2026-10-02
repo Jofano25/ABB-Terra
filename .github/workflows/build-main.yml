@@ -1,4 +1,4 @@
-name: Build EMOS 5.5 ABB Plain Auth Test
+name: Build EMOS 5.7 WiFi First Provision Fix
 
 on:
   workflow_dispatch:
@@ -216,8 +216,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 550
-                  versionName '5.5-abb-plain-auth-test'
+                  versionCode 570
+                  versionName '5.7-wifi-first-provision-fix'
               }
 
               buildTypes {
@@ -410,7 +410,7 @@ jobs:
               private volatile boolean authProvisionHttpBasicResultLost = false;
               private volatile String authProvisionRequestId = "";
               private volatile int authProvisionUnauthReconnects = 0;
-              // EMOS 5.5 default: ABB FW 2.2.2 compatibility uses the plain password
+              // EMOS 5.7 default: ABB FW 2.2.2 compatibility uses the plain password
               // in ChangeConfiguration AuthorizationKey. Position 1 is retained only
               // as an OCPP-standard HEX diagnostic comparison mode.
               private volatile boolean authProvisionUseHex = false;
@@ -634,7 +634,7 @@ jobs:
                   // launch always asks for login again. Charger profiles remain saved.
                   if (appSessionAuthorized && hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("EMOS 5.5 started");
+                      appendLog("EMOS 5.7 started");
                       appendLog("Installer session active for this app session.");
                   } else {
                       clearAuthorizationTokensOnly();
@@ -805,7 +805,7 @@ jobs:
                   ocppCard.addView(requiresPassword);
 
                   TextView hint = text(
-                          "READ ALL shows values actually stored in charger. EMOS 5.5 writes the OCPP endpoint with the proven D6 variant 2 layout and uses plain AuthKey bytes for ABB compatibility. "
+                          "READ ALL shows values actually stored in charger. EMOS 5.7 writes the OCPP endpoint with the proven D6 variant 2 layout and uses plain AuthKey bytes for ABB compatibility. "
                           +"If Server requires password / AuthKey is checked, the PLAIN AuthKey is written directly into D6 (keyLen = actual UTF-8 byte length), matching the earlier working ABB trace; it is NOT HEX-encoded and is NOT cleared to keyLen=0. "
                           +"EMOS also sends best-effort HTTPBasicAuthEnable=true through the charger configuration channel. No Node/SteVe provisioning API is required by APPLY ALL. Unchecked = no AuthKey in D6.",
                           11,false,MUTED);
@@ -847,7 +847,7 @@ jobs:
                           "Tidak mengubah server ICON/SteVe. EMOS menjadi mini CSMS OCPP 1.6 di HP port 9221. "
                           +"Charger sementara diarahkan ke HP tanpa AuthKey agar koneksi awal pasti masuk. Setelah BootNotification Accepted, "
                           +"EMOS mengirim ChangeConfiguration AuthorizationKey lalu HTTPBasicAuthEnable=true. "
-                          +"EMOS 5.5 default memakai ABB COMPATIBILITY / PLAIN karena FW 2.2.2 sudah terbukti mengirim nilai HEX sebagai password literal bila HEX diprovision. "
+                          +"EMOS 5.7 default memakai ABB COMPATIBILITY / PLAIN karena FW 2.2.2 sudah terbukti mengirim nilai HEX sebagai password literal bila HEX diprovision. "
                           +"Mode OCPP STANDARD HEX tetap tersedia hanya untuk pembanding diagnostik. Setelah provisioning, ABB dipaksa reconnect dan header Authorization ditangkap langsung oleh APK. "
                           +"HP dan charger harus berada pada Wi-Fi/LAN yang sama dan AP client isolation harus OFF.",
                           11,false,MUTED);
@@ -1037,7 +1037,7 @@ jobs:
                               adminPassword.setText("");
                               appSessionAuthorized=true;
                               buildUi();
-                              appendLog("EMOS 5.5 started");
+                              appendLog("EMOS 5.7 started");
                               appendLog("LOGIN SUCCESS. Authorization is valid for this app session only; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -1499,22 +1499,46 @@ jobs:
               }
 
               private void enableConnectionAuth(int mode,Runnable next) {
-                  // CE_AUTH payload format is confirmed by this charger: [mode, 0x00].
-                  // FW 2.1.0 accepted mode 6 for Wi-Fi in the 3.8 log.
+                  // EMOS 5.7 Wi-Fi persistence fix.
+                  // CE_AUTH payload confirmed for ABB Terra: [mode, 0x00].
+                  // Wi-Fi uses mode 6. Do NOT continue to D2 if CE_AUTH is rejected.
                   byte[] payload=new byte[]{(byte)(mode&0xff),0x00};
                   String name=mode==NET_WIFI?"Wi-Fi":mode==NET_ETHERNET?"Ethernet":"mode "+mode;
+
                   appendLog("TX CE_AUTH "+name+" mode="+mode);
+
                   sendEncrypted(CMD_CE_AUTH,payload,p -> {
                       try {
                           requirePacketOk(p,"CE connection authorization");
-                          int ceCode=(p.payload!=null && p.payload.length>0)?(p.payload[0]&0xff):0;
-                          appendLog("RX CE_AUTH payload="+hex(p.payload)+" ceCode="+ceCode);
+
+                          int ceCode=(p.payload!=null && p.payload.length>0)
+                                  ?(p.payload[0]&0xff):0;
+
+                          appendLog("RX CE_AUTH payload="+hex(p.payload)
+                                  +" ceCode="+ceCode);
+
                           if (ceCode!=0)
-                              appendLog("CE_AUTH warning code="+ceCode+"; continuing with network write.");
+                              throw new Exception("CE_AUTH rejected, code="+ceCode);
+
+                          appendLog("CE_AUTH OK "+name
+                                  +". Continuing to network write.");
+
+                          if (next!=null)
+                              main.postDelayed(next,350);
+
                       } catch(Exception e) {
-                          appendLog("CE_AUTH warning: "+safeError(e)+"; continuing with network write.");
+                          internetReady=false;
+                          wifiWritePending=false;
+
+                          progress("Internet connection",false,safeError(e));
+                          failStatus("Connection enable failed",safeError(e));
+
+                          appendLog("CE_AUTH BLOCKED network write: "
+                                  +safeError(e));
+
+                          if (saveBtn!=null)
+                              saveBtn.setEnabled(true);
                       }
-                      if (next!=null) main.postDelayed(next,250);
                   });
               }
 
@@ -1787,7 +1811,7 @@ jobs:
 
                   if (enable) {
                       int rawLen=key.getBytes(StandardCharsets.UTF_8).length;
-                      appendLog("BASIC AUTH METHOD v5.5: D6 carries PLAIN AuthKey bytes="+rawLen
+                      appendLog("BASIC AUTH METHOD v5.6: D6 carries PLAIN AuthKey bytes="+rawLen
                               +"; then best-effort C5 HTTPBasicAuthEnable=1. No gateway :3000 required.");
                       tryBasicAuthC5Variant(true,key,connectionPosition,ssid,wifiPass,0);
                   } else {
@@ -1845,23 +1869,71 @@ jobs:
                   }
               }
 
+              private void forceWifiDhcpProfileBeforeCredentialWrite(Runnable next) {
+                  // EMOS 5.7 FIRST-PROVISION FIX
+                  //
+                  // FW 2.1.0 AA reports Wi-Fi interface enum 0.
+                  // Older 4.0 testing used enum 1 and rolled back.
+                  // Older 4.1 used enum 0, but incorrectly treated the short inner
+                  // response 00 01 as a hard failure and therefore never reached D2.
+                  //
+                  // Here we explicitly write the Wi-Fi TCP/IP profile as DHCP with
+                  // interface enum 0, but only the outer/transport response is treated
+                  // as authoritative. A short payload such as 00 01 is logged as
+                  // advisory and DOES NOT block CE_AUTH -> D2.
+                  final int wifiInterfaceType=0;
+                  byte[] payload=buildDhcpPayload(wifiInterfaceType);
+
+                  appendLog("WIFI FIRST-PROVISION STEP 1/3: TX AB interface=0 DHCP payload="
+                          +hex(payload));
+                  progress("Internet connection",false,
+                          "Preparing persistent Wi-Fi DHCP profile...");
+
+                  sendEncrypted(CMD_CONFIGURE_TCPIP,payload,p -> {
+                      try {
+                          requirePacketOk(p,"Prepare Wi-Fi DHCP profile");
+                          appendLog("WIFI FIRST-PROVISION AB transport OK payload="
+                                  +hex(p.payload)
+                                  +" (inner bytes advisory; continuing)");
+                      } catch(Exception e) {
+                          // Do not hide a transport/protocol error. If the command itself
+                          // is unsupported we still continue because CE_AUTH+D2 is the
+                          // established fallback path and the charger can reboot on D2.
+                          appendLog("WIFI FIRST-PROVISION AB warning: "
+                                  +safeError(e)
+                                  +"; continuing to CE_AUTH fallback.");
+                      }
+
+                      if (next!=null)
+                          main.postDelayed(next,350);
+                  });
+              }
+
               private void applyWifiLast(String ssid,String password) {
-                  expectedNetworkMode=1; // D3 enum: 1=Wi-Fi on FW 2.1.0
+                  expectedNetworkMode=1; // D3 read-back: Wi-Fi
                   pendingDesiredSsid=ssid;
                   wifiWritePending=true;
-                  appendLog("WIFI APPLY target ssid="+ssid+" password=<hidden>");
-                  progress("Internet connection",false,"Preparing Wi-Fi DHCP...");
 
-                  // FW 2.1.0 READ AA already reports DHCP, so normally AB is skipped.
-                  // FW 2.1.0 explicitly returned response-code 20 for D4 CHANGE_NET_MODE,
-                  // therefore DO NOT send D4. CE_AUTH mode=6 is confirmed accepted by this
-                  // charger and is used only to select/authorize Wi-Fi before D2.
-                  int wifiAaType=(lastAaInterfaceType>=0)?lastAaInterfaceType:0;
-                  appendLog("WIFI FLOW interfaceEnum="+wifiAaType
-                          +" aaIpMode="+lastAaIpMode+" d3Mode=1(Wi-Fi)");
-                  appendLog("D4 skipped: FW 2.1.0 reports command does not exist. Using CE_AUTH mode=6 before D2.");
-                  ensureDhcpBeforeNetworkWrite(wifiAaType,() ->
-                      enableConnectionAuth(NET_WIFI,() -> sendWifiCredentialsForApply(ssid,password)));
+                  appendLog("WIFI APPLY FIRST-PROVISION FIX target ssid="
+                          +ssid+" password=<hidden>");
+
+                  progress("Internet connection",false,
+                          "Preparing first-provision Wi-Fi profile...");
+
+                  connectionStatus.setText(
+                          "Preparing persistent Wi-Fi profile for "+ssid+"...");
+
+                  appendLog(
+                          "WIFI FIRST-PROVISION FLOW: AB interface=0 DHCP -> CE_AUTH mode=6 -> D2.");
+                  appendLog(
+                          "AB inner response is advisory; D4 remains skipped on FW 2.1.0.");
+
+                  forceWifiDhcpProfileBeforeCredentialWrite(
+                          () -> enableConnectionAuth(
+                                  NET_WIFI,
+                                  () -> sendWifiCredentialsForApply(ssid,password)
+                          )
+                  );
               }
 
               private void sendWifiCredentialsForApply(String ssid,String password) {
@@ -1869,8 +1941,8 @@ jobs:
                   progress("Internet connection",false,"Writing Wi-Fi SSID/password...");
                   connectionStatus.setText("Writing Wi-Fi "+ssid+" • DHCP. Charger may restart BLE/network.");
                   appendLog("TX WIFI D2 ssid="+ssid+" password=<hidden> payloadLen="+payload.length);
-                  appendLog("D2 response window=40s (FW 2.1.0 previously replied after ~21s). "+
-                          "Disconnect before response is treated as expected restart.");
+                  appendLog("D2 response window=40s. On FW 2.1.0 a disconnect/restart may happen before D2 reply; "+
+                          "post-reboot E4 is authoritative for persistence.");
 
                   // Arm expected reboot BEFORE D2. FW 2.1.0 can restart/disconnect before
                   // sending the D2 response, which happened in 3.8 after about 7 seconds.
@@ -4342,14 +4414,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.5-abb-plain-auth-test.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.7-wifi-first-provision-fix.apk
           cd artifact
-          sha256sum EMOS-5.5-abb-plain-auth-test.apk | tee EMOS-5.5-abb-plain-auth-test.apk.sha256
+          sha256sum EMOS-5.7-wifi-first-provision-fix.apk | tee EMOS-5.7-wifi-first-provision-fix.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: EMOS-5.5-abb-plain-auth-test
+          name: EMOS-5.7-wifi-first-provision-fix
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
