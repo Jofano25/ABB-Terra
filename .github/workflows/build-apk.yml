@@ -1,4 +1,4 @@
-name: Build EMOS 5.6 WiFi Persistence Fix
+name: Build EMOS 5.7 WiFi First Provision Fix
 
 on:
   workflow_dispatch:
@@ -216,8 +216,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 560
-                  versionName '5.6-wifi-persistence-fix'
+                  versionCode 570
+                  versionName '5.7-wifi-first-provision-fix'
               }
 
               buildTypes {
@@ -410,7 +410,7 @@ jobs:
               private volatile boolean authProvisionHttpBasicResultLost = false;
               private volatile String authProvisionRequestId = "";
               private volatile int authProvisionUnauthReconnects = 0;
-              // EMOS 5.6 default: ABB FW 2.2.2 compatibility uses the plain password
+              // EMOS 5.7 default: ABB FW 2.2.2 compatibility uses the plain password
               // in ChangeConfiguration AuthorizationKey. Position 1 is retained only
               // as an OCPP-standard HEX diagnostic comparison mode.
               private volatile boolean authProvisionUseHex = false;
@@ -634,7 +634,7 @@ jobs:
                   // launch always asks for login again. Charger profiles remain saved.
                   if (appSessionAuthorized && hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("EMOS 5.6 started");
+                      appendLog("EMOS 5.7 started");
                       appendLog("Installer session active for this app session.");
                   } else {
                       clearAuthorizationTokensOnly();
@@ -805,7 +805,7 @@ jobs:
                   ocppCard.addView(requiresPassword);
 
                   TextView hint = text(
-                          "READ ALL shows values actually stored in charger. EMOS 5.6 writes the OCPP endpoint with the proven D6 variant 2 layout and uses plain AuthKey bytes for ABB compatibility. "
+                          "READ ALL shows values actually stored in charger. EMOS 5.7 writes the OCPP endpoint with the proven D6 variant 2 layout and uses plain AuthKey bytes for ABB compatibility. "
                           +"If Server requires password / AuthKey is checked, the PLAIN AuthKey is written directly into D6 (keyLen = actual UTF-8 byte length), matching the earlier working ABB trace; it is NOT HEX-encoded and is NOT cleared to keyLen=0. "
                           +"EMOS also sends best-effort HTTPBasicAuthEnable=true through the charger configuration channel. No Node/SteVe provisioning API is required by APPLY ALL. Unchecked = no AuthKey in D6.",
                           11,false,MUTED);
@@ -847,7 +847,7 @@ jobs:
                           "Tidak mengubah server ICON/SteVe. EMOS menjadi mini CSMS OCPP 1.6 di HP port 9221. "
                           +"Charger sementara diarahkan ke HP tanpa AuthKey agar koneksi awal pasti masuk. Setelah BootNotification Accepted, "
                           +"EMOS mengirim ChangeConfiguration AuthorizationKey lalu HTTPBasicAuthEnable=true. "
-                          +"EMOS 5.6 default memakai ABB COMPATIBILITY / PLAIN karena FW 2.2.2 sudah terbukti mengirim nilai HEX sebagai password literal bila HEX diprovision. "
+                          +"EMOS 5.7 default memakai ABB COMPATIBILITY / PLAIN karena FW 2.2.2 sudah terbukti mengirim nilai HEX sebagai password literal bila HEX diprovision. "
                           +"Mode OCPP STANDARD HEX tetap tersedia hanya untuk pembanding diagnostik. Setelah provisioning, ABB dipaksa reconnect dan header Authorization ditangkap langsung oleh APK. "
                           +"HP dan charger harus berada pada Wi-Fi/LAN yang sama dan AP client isolation harus OFF.",
                           11,false,MUTED);
@@ -1037,7 +1037,7 @@ jobs:
                               adminPassword.setText("");
                               appSessionAuthorized=true;
                               buildUi();
-                              appendLog("EMOS 5.6 started");
+                              appendLog("EMOS 5.7 started");
                               appendLog("LOGIN SUCCESS. Authorization is valid for this app session only; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -1499,7 +1499,7 @@ jobs:
               }
 
               private void enableConnectionAuth(int mode,Runnable next) {
-                  // EMOS 5.6 Wi-Fi persistence fix.
+                  // EMOS 5.7 Wi-Fi persistence fix.
                   // CE_AUTH payload confirmed for ABB Terra: [mode, 0x00].
                   // Wi-Fi uses mode 6. Do NOT continue to D2 if CE_AUTH is rejected.
                   byte[] payload=new byte[]{(byte)(mode&0xff),0x00};
@@ -1869,35 +1869,70 @@ jobs:
                   }
               }
 
+              private void forceWifiDhcpProfileBeforeCredentialWrite(Runnable next) {
+                  // EMOS 5.7 FIRST-PROVISION FIX
+                  //
+                  // FW 2.1.0 AA reports Wi-Fi interface enum 0.
+                  // Older 4.0 testing used enum 1 and rolled back.
+                  // Older 4.1 used enum 0, but incorrectly treated the short inner
+                  // response 00 01 as a hard failure and therefore never reached D2.
+                  //
+                  // Here we explicitly write the Wi-Fi TCP/IP profile as DHCP with
+                  // interface enum 0, but only the outer/transport response is treated
+                  // as authoritative. A short payload such as 00 01 is logged as
+                  // advisory and DOES NOT block CE_AUTH -> D2.
+                  final int wifiInterfaceType=0;
+                  byte[] payload=buildDhcpPayload(wifiInterfaceType);
+
+                  appendLog("WIFI FIRST-PROVISION STEP 1/3: TX AB interface=0 DHCP payload="
+                          +hex(payload));
+                  progress("Internet connection",false,
+                          "Preparing persistent Wi-Fi DHCP profile...");
+
+                  sendEncrypted(CMD_CONFIGURE_TCPIP,payload,p -> {
+                      try {
+                          requirePacketOk(p,"Prepare Wi-Fi DHCP profile");
+                          appendLog("WIFI FIRST-PROVISION AB transport OK payload="
+                                  +hex(p.payload)
+                                  +" (inner bytes advisory; continuing)");
+                      } catch(Exception e) {
+                          // Do not hide a transport/protocol error. If the command itself
+                          // is unsupported we still continue because CE_AUTH+D2 is the
+                          // established fallback path and the charger can reboot on D2.
+                          appendLog("WIFI FIRST-PROVISION AB warning: "
+                                  +safeError(e)
+                                  +"; continuing to CE_AUTH fallback.");
+                      }
+
+                      if (next!=null)
+                          main.postDelayed(next,350);
+                  });
+              }
+
               private void applyWifiLast(String ssid,String password) {
                   expectedNetworkMode=1; // D3 read-back: Wi-Fi
                   pendingDesiredSsid=ssid;
                   wifiWritePending=true;
 
-                  appendLog("WIFI APPLY PERSISTENCE FIX target ssid="
+                  appendLog("WIFI APPLY FIRST-PROVISION FIX target ssid="
                           +ssid+" password=<hidden>");
 
                   progress("Internet connection",false,
-                          "Enabling Wi-Fi before credential write...");
+                          "Preparing first-provision Wi-Fi profile...");
 
                   connectionStatus.setText(
-                          "Preparing persistent Wi-Fi save for "+ssid+"...");
+                          "Preparing persistent Wi-Fi profile for "+ssid+"...");
 
-                  // Restore the older proven ABB Terra Wi-Fi sequence:
-                  //
-                  //     CE_AUTH mode=6 -> D2 SSID/password
-                  //
-                  // Do NOT rewrite AA/AB TCP/IP configuration here.
-                  // AA stays READ-ONLY in READ ALL.
-                  // Do NOT use D4.
                   appendLog(
-                          "WIFI PERSISTENCE FLOW: CE_AUTH mode=6 -> D2 directly.");
+                          "WIFI FIRST-PROVISION FLOW: AB interface=0 DHCP -> CE_AUTH mode=6 -> D2.");
                   appendLog(
-                          "Wi-Fi APPLY skips AA/AB DHCP rewrite and D4; AA remains read-only.");
+                          "AB inner response is advisory; D4 remains skipped on FW 2.1.0.");
 
-                  enableConnectionAuth(
-                          NET_WIFI,
-                          () -> sendWifiCredentialsForApply(ssid,password)
+                  forceWifiDhcpProfileBeforeCredentialWrite(
+                          () -> enableConnectionAuth(
+                                  NET_WIFI,
+                                  () -> sendWifiCredentialsForApply(ssid,password)
+                          )
                   );
               }
 
@@ -1906,8 +1941,8 @@ jobs:
                   progress("Internet connection",false,"Writing Wi-Fi SSID/password...");
                   connectionStatus.setText("Writing Wi-Fi "+ssid+" • DHCP. Charger may restart BLE/network.");
                   appendLog("TX WIFI D2 ssid="+ssid+" password=<hidden> payloadLen="+payload.length);
-                  appendLog("D2 response window=40s (FW 2.1.0 previously replied after ~21s). "+
-                          "Disconnect before response is treated as expected restart.");
+                  appendLog("D2 response window=40s. On FW 2.1.0 a disconnect/restart may happen before D2 reply; "+
+                          "post-reboot E4 is authoritative for persistence.");
 
                   // Arm expected reboot BEFORE D2. FW 2.1.0 can restart/disconnect before
                   // sending the D2 response, which happened in 3.8 after about 7 seconds.
@@ -4379,14 +4414,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.6-wifi-persistence-fix.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.7-wifi-first-provision-fix.apk
           cd artifact
-          sha256sum EMOS-5.6-wifi-persistence-fix.apk | tee EMOS-5.6-wifi-persistence-fix.apk.sha256
+          sha256sum EMOS-5.7-wifi-first-provision-fix.apk | tee EMOS-5.7-wifi-first-provision-fix.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: EMOS-5.6-wifi-persistence-fix
+          name: EMOS-5.7-wifi-first-provision-fix
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
