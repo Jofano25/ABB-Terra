@@ -1,4 +1,4 @@
-name: Build EMOS 5.8 TerraConfig WiFi Flow
+name: Build EMOS 5.8.1 Password Toggle
 
 on:
   workflow_dispatch:
@@ -216,8 +216,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 580
-                  versionName '5.8-terraconfig-wifi-flow'
+                  versionCode 581
+                  versionName '5.8.1-password-toggle'
               }
 
               buildTypes {
@@ -445,7 +445,7 @@ jobs:
               private LinearLayout deviceList, progressBox, adminFields, wifiFields, ocppCard;
               private View mainContent;
               private EditText chargerPin, wifiSsid, wifiPassword, chargePointId, serverUrl, authKey, adminEmail, adminPassword;
-              private CheckBox requiresPassword;
+              private CheckBox requiresPassword, showWifiPassword, showAuthKey, showAdminPassword;
               private Spinner connectionType, serverUrlSpinner, authProvisionModeSpinner;
               private Button scanBtn, authBtn, readConfigBtn, saveBtn, verifyBtn,
                       disconnectBtn, adminToggle, adminLogin, adminClear,
@@ -638,7 +638,7 @@ jobs:
                   // launch always asks for login again. Charger profiles remain saved.
                   if (appSessionAuthorized && hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("EMOS 5.8 started");
+                      appendLog("EMOS 5.8.1 started");
                       appendLog("Installer session active for this app session.");
                   } else {
                       clearAuthorizationTokensOnly();
@@ -750,8 +750,21 @@ jobs:
                   wifiSsid = input("Wi-Fi SSID", WHITE, MUTED);
                   wifiPassword = input("Wi-Fi password", WHITE, MUTED);
                   wifiPassword.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+
+                  showWifiPassword = new CheckBox(this);
+                  showWifiPassword.setText("Lihat password Wi-Fi");
+                  showWifiPassword.setTextColor(MUTED);
+                  showWifiPassword.setChecked(false);
+                  showWifiPassword.setOnCheckedChangeListener((buttonView,isChecked) -> {
+                      setPasswordVisible(wifiPassword,isChecked);
+                      showWifiPassword.setText(isChecked
+                              ?"Sembunyikan password Wi-Fi"
+                              :"Lihat password Wi-Fi");
+                  });
+
                   wifiFields.addView(labeled("Wi-Fi SSID", wifiSsid, MUTED));
                   wifiFields.addView(labeled("Wi-Fi Password", wifiPassword, MUTED));
+                  wifiFields.addView(showWifiPassword);
                   internet.addView(wifiFields);
 
                   connectionStatus = text(
@@ -798,6 +811,18 @@ jobs:
                   });
                   authKey = input("AuthorizationKey / password (plain; provision via OCPP)", WHITE, MUTED);
                   authKey.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+
+                  showAuthKey = new CheckBox(this);
+                  showAuthKey.setText("Lihat AuthKey / password");
+                  showAuthKey.setTextColor(MUTED);
+                  showAuthKey.setChecked(false);
+                  showAuthKey.setOnCheckedChangeListener((buttonView,isChecked) -> {
+                      setPasswordVisible(authKey,isChecked);
+                      showAuthKey.setText(isChecked
+                              ?"Sembunyikan AuthKey / password"
+                              :"Lihat AuthKey / password");
+                  });
+
                   requiresPassword = new CheckBox(this);
                   requiresPassword.setText("Server requires password / AuthKey");
                   requiresPassword.setTextColor(WHITE);
@@ -806,6 +831,7 @@ jobs:
                   ocppCard.addView(labeled("Charger ID / Charge Point Identity", chargePointId, MUTED));
                   ocppCard.addView(labeled("OCPP Server URL", serverUrlSpinner, MUTED));
                   ocppCard.addView(labeled("AuthKey / Password", authKey, MUTED));
+                  ocppCard.addView(showAuthKey);
                   ocppCard.addView(requiresPassword);
 
                   TextView hint = text(
@@ -977,8 +1003,20 @@ jobs:
                   adminPassword=input("Password",WHITE,MUTED);
                   adminPassword.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_VARIATION_PASSWORD);
 
+                  showAdminPassword = new CheckBox(this);
+                  showAdminPassword.setText("Lihat password login");
+                  showAdminPassword.setTextColor(MUTED);
+                  showAdminPassword.setChecked(false);
+                  showAdminPassword.setOnCheckedChangeListener((buttonView,isChecked) -> {
+                      setPasswordVisible(adminPassword,isChecked);
+                      showAdminPassword.setText(isChecked
+                              ?"Sembunyikan password login"
+                              :"Lihat password login");
+                  });
+
                   loginCard.addView(labeled("Installer Email",adminEmail,MUTED));
                   loginCard.addView(labeled("Password",adminPassword,MUTED));
+                  loginCard.addView(showAdminPassword);
 
                   adminStatus=text("Not authorized",12,false,MUTED);
                   adminStatus.setPadding(0,dp(8),0,dp(8));
@@ -1041,7 +1079,7 @@ jobs:
                               adminPassword.setText("");
                               appSessionAuthorized=true;
                               buildUi();
-                              appendLog("EMOS 5.8 started");
+                              appendLog("EMOS 5.8.1 started");
                               appendLog("LOGIN SUCCESS. Authorization is valid for this app session only; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -1638,6 +1676,7 @@ jobs:
                   if (serverUrl!=null) serverUrl.setEnabled(enabled);
                   if (serverUrlSpinner!=null) serverUrlSpinner.setEnabled(enabled);
                   if (authKey!=null) authKey.setEnabled(enabled);
+                  if (showAuthKey!=null) showAuthKey.setEnabled(enabled);
                   if (requiresPassword!=null) requiresPassword.setEnabled(enabled);
                   if (saveBtn!=null) saveBtn.setEnabled(enabled && authenticated);
                   if (ocppCard!=null) ocppCard.setAlpha(enabled?1.0f:0.48f);
@@ -4242,6 +4281,30 @@ jobs:
                   return x;
               }
 
+              private void setPasswordVisible(EditText field,boolean visible) {
+                  if (field==null) return;
+
+                  int pos=field.getSelectionStart();
+
+                  if (visible) {
+                      field.setInputType(
+                              InputType.TYPE_CLASS_TEXT
+                                      | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+                      );
+                  } else {
+                      field.setInputType(
+                              InputType.TYPE_CLASS_TEXT
+                                      | InputType.TYPE_TEXT_VARIATION_PASSWORD
+                      );
+                  }
+
+                  // setInputType may reset typeface/cursor; restore UI behavior.
+                  field.setTypeface(Typeface.DEFAULT);
+                  int len=field.getText()==null?0:field.getText().length();
+                  if (pos<0 || pos>len) pos=len;
+                  field.setSelection(pos);
+              }
+
               private EditText input(String hint,int fg,int hintColor) {
                   EditText e=new EditText(this);
                   e.setHint(hint);
@@ -4438,14 +4501,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.8-terraconfig-wifi-flow.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.8.1-password-toggle.apk
           cd artifact
-          sha256sum EMOS-5.8-terraconfig-wifi-flow.apk | tee EMOS-5.8-terraconfig-wifi-flow.apk.sha256
+          sha256sum EMOS-5.8.1-password-toggle.apk | tee EMOS-5.8.1-password-toggle.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: EMOS-5.8-terraconfig-wifi-flow
+          name: EMOS-5.8.1-password-toggle
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
