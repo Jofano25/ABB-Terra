@@ -1,4 +1,4 @@
-name: Build EMOS 5.8.3 Corrected OCPP URL
+name: Build EMOS 5.9 Free Vending Apply Progress
 
 on:
   workflow_dispatch:
@@ -216,8 +216,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 583
-                  versionName '5.8.3-corrected-ocpp-url'
+                  versionCode 590
+                  versionName '5.9-free-vending-apply-progress'
               }
 
               buildTypes {
@@ -329,7 +329,14 @@ jobs:
               private static final int CMD_WIFI_NETWORK_CONFIG = 0xC7; // newer Wi-Fi config/read family
               private static final int CMD_OCPP = 0xD6;
               private static final int CMD_QUERY_DEVICE_NET_CONFIG = 0xDB;
+              private static final int CMD_SET_DEVICE_CONFIG_CAPACITATE = 0xDC;
+              private static final int CMD_QUERY_DEVICE_CONFIG_CAPACITATE = 0xDD;
               private static final int CMD_QUERY_WIFI_INFO = 0xE4;
+
+              // Reverse-engineered directly from official TerraConfig:
+              // intToBitArray(config) returns 8 bits MSB-first and Free Vending writes index 5.
+              // Therefore Free Vending is config mask 0x04.
+              private static final int FREE_VENDING_MASK = 0x04;
 
               private static final int NET_WIFI = 6;
               private static final int NET_ETHERNET = 12;
@@ -341,7 +348,7 @@ jobs:
               private static final String KEY_ALIAS = "abb_terra_direct_token_v1";
               private static final String PREFS = "abb_terra_direct_secure";
               private static final String OCPP_LOCAL = "ws://192.168.10.186:9220";
-              private static final String OCPP_LOCAL_9221 = "ws://182.253.7.9:9221";
+              private static final String OCPP_PUBLIC_7979 = "ws://182.253.7.9:7979";
               private static final String OCPP_PLN = "wss://homecharging.pln.co.id:443/";
               private static final String OCPP_MANUAL = "Manual / Custom URL";
               private static boolean appSessionAuthorized = false;
@@ -374,6 +381,11 @@ jobs:
               private int lastD3Mode = -1;
               private boolean lastOcppApplyOk = false;
               private String lastOcppApplyMessage = "Not applied";
+              private boolean freeVendingKnown = false;
+              private boolean freeVendingReadEnabled = false;
+              private boolean applyInProgress = false;
+              private boolean applyHadWarning = false;
+              private Runnable applyWatchdog;
               private boolean awaitingExpectedReboot = false;
               private boolean wifiWritePending = false;
               private String pendingDesiredSsid = "";
@@ -441,13 +453,15 @@ jobs:
 
               private SharedPreferences prefs;
 
-              private TextView statusTitle, statusDetail, selectedDevice, logText, adminStatus, connectionStatus, authDiagStatus, basicAuthVerifyStatus;
-              private ProgressBar adminLoginProgress;
+              private TextView statusTitle, statusDetail, selectedDevice, logText, adminStatus, connectionStatus,
+                      authDiagStatus, basicAuthVerifyStatus, freeVendingStatus, applyStatus;
+              private ProgressBar adminLoginProgress, applyProgress;
               private volatile boolean adminLoginInProgress = false;
-              private LinearLayout deviceList, progressBox, adminFields, wifiFields, ocppCard, manualOcppUrlBox;
+              private LinearLayout deviceList, progressBox, adminFields, wifiFields, ocppCard,
+                      manualOcppUrlBox, applyProgressRow;
               private View mainContent;
               private EditText chargerPin, wifiSsid, wifiPassword, chargePointId, serverUrl, authKey, adminEmail, adminPassword;
-              private CheckBox requiresPassword, showWifiPassword, showAuthKey, showAdminPassword;
+              private CheckBox requiresPassword, showWifiPassword, showAuthKey, showAdminPassword, freeVendingCheck;
               private Spinner connectionType, serverUrlSpinner, authProvisionModeSpinner;
               private Button scanBtn, authBtn, readConfigBtn, saveBtn, verifyBtn,
                       disconnectBtn, adminToggle, adminLogin, adminClear,
@@ -640,7 +654,7 @@ jobs:
                   // launch always asks for login again. Charger profiles remain saved.
                   if (appSessionAuthorized && hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("EMOS 5.8.3 started");
+                      appendLog("EMOS 5.9 started");
                       appendLog("Installer session active for this app session.");
                   } else {
                       clearAuthorizationTokensOnly();
@@ -791,6 +805,32 @@ jobs:
 
                   root.addView(internet, cardLp());
 
+                  LinearLayout freeVendingCard = card(CARD);
+                  freeVendingCard.addView(section("FREE VENDING • STAGED", ACCENT));
+
+                  TextView freeVendInfo = text(
+                          "Free Vending memungkinkan charger memulai charging tanpa RFID/authorization. "
+                          +"EMOS membaca konfigurasi ABB terlebih dahulu, mengubah hanya bit Free Vending, "
+                          +"lalu membaca ulang untuk verifikasi.",
+                          11,false,MUTED);
+                  freeVendInfo.setPadding(0,0,0,dp(8));
+                  freeVendingCard.addView(freeVendInfo);
+
+                  freeVendingCheck = new CheckBox(this);
+                  freeVendingCheck.setText("Enable Free Vending");
+                  freeVendingCheck.setTextColor(WHITE);
+                  freeVendingCheck.setChecked(false);
+                  freeVendingCheck.setEnabled(false);
+                  freeVendingCard.addView(freeVendingCheck);
+
+                  freeVendingStatus = text(
+                          "Belum dibaca dari charger. Authenticate lalu READ ALL.",
+                          11,true,MUTED);
+                  freeVendingStatus.setPadding(0,dp(5),0,0);
+                  freeVendingCard.addView(freeVendingStatus);
+
+                  root.addView(freeVendingCard, cardLp());
+
                   ocppCard = card(CARD);
                   ocppCard.addView(section("CUSTOM OCPP SERVER • STAGED", ACCENT));
                   chargePointId = input("ABB-V2-NEW", WHITE, MUTED);
@@ -807,7 +847,7 @@ jobs:
                           android.R.layout.simple_spinner_dropdown_item,
                           new String[]{
                                   OCPP_LOCAL,
-                                  OCPP_LOCAL_9221,
+                                  OCPP_PUBLIC_7979,
                                   OCPP_PLN,
                                   OCPP_MANUAL
                           });
@@ -818,7 +858,7 @@ jobs:
                           switch(position) {
                               case 1:
                                   manualOcppUrlBox.setVisibility(View.GONE);
-                                  serverUrl.setText(OCPP_LOCAL_9221);
+                                  serverUrl.setText(OCPP_PUBLIC_7979);
                                   break;
                               case 2:
                                   manualOcppUrlBox.setVisibility(View.GONE);
@@ -828,7 +868,7 @@ jobs:
                                   manualOcppUrlBox.setVisibility(View.VISIBLE);
                                   String current=serverUrl.getText().toString().trim();
                                   if (OCPP_LOCAL.equals(current)
-                                          || OCPP_LOCAL_9221.equals(current)
+                                          || OCPP_PUBLIC_7979.equals(current)
                                           || OCPP_PLN.equals(current)) {
                                       serverUrl.setText("");
                                   }
@@ -874,6 +914,22 @@ jobs:
                           11,false,MUTED);
                   hint.setPadding(0,dp(4),0,dp(8));
                   ocppCard.addView(hint);
+
+                  applyProgressRow = new LinearLayout(this);
+                  applyProgressRow.setOrientation(LinearLayout.HORIZONTAL);
+                  applyProgressRow.setGravity(Gravity.CENTER_VERTICAL);
+                  applyProgressRow.setPadding(0,dp(8),0,dp(8));
+                  applyProgressRow.setVisibility(View.GONE);
+
+                  applyProgress = new ProgressBar(this);
+                  applyProgress.setIndeterminate(true);
+                  LinearLayout.LayoutParams aplp = new LinearLayout.LayoutParams(dp(34),dp(34));
+                  aplp.setMargins(0,0,dp(10),0);
+                  applyProgressRow.addView(applyProgress,aplp);
+
+                  applyStatus = text("Ready to apply.",12,true,MUTED);
+                  applyProgressRow.addView(applyStatus,new LinearLayout.LayoutParams(0,-2,1));
+                  ocppCard.addView(applyProgressRow);
 
                   saveBtn = button("APPLY ALL CHANGES", ACCENT, Color.rgb(4,35,38));
                   saveBtn.setEnabled(false);
@@ -966,6 +1022,7 @@ jobs:
                   progress("Secure session", false, "Waiting");
                   progress("Authentication", false, "Waiting");
                   progress("Current configuration", false, "Waiting for authenticated read");
+                  progress("Free Vending", false, "Waiting for READ ALL");
                   progress("Internet connection", false, "Staged / not yet applied");
                   progress("OCPP configuration", false, "Staged / not yet applied");
                   progress("Verification", false, "Waiting");
@@ -1613,6 +1670,8 @@ jobs:
 
                           if (saveBtn!=null)
                               saveBtn.setEnabled(true);
+                          if (applyInProgress)
+                              finishApplyUi(false,"✕ APPLY FAILED • "+safeError(e));
                       }
                   });
               }
@@ -1712,8 +1771,82 @@ jobs:
                   if (authKey!=null) authKey.setEnabled(enabled);
                   if (showAuthKey!=null) showAuthKey.setEnabled(enabled);
                   if (requiresPassword!=null) requiresPassword.setEnabled(enabled);
-                  if (saveBtn!=null) saveBtn.setEnabled(enabled && authenticated);
+                  if (saveBtn!=null) saveBtn.setEnabled(enabled && authenticated && !applyInProgress);
+                  if (freeVendingCheck!=null)
+                      freeVendingCheck.setEnabled(authenticated && !applyInProgress);
                   if (ocppCard!=null) ocppCard.setAlpha(enabled?1.0f:0.48f);
+              }
+
+              private void beginApplyUi() {
+                  applyInProgress=true;
+                  applyHadWarning=false;
+
+                  if (applyProgressRow!=null) applyProgressRow.setVisibility(View.VISIBLE);
+                  if (applyProgress!=null) applyProgress.setVisibility(View.VISIBLE);
+                  if (applyStatus!=null) {
+                      applyStatus.setText("Applying configuration... jangan putuskan BLE.");
+                      applyStatus.setTextColor(Color.rgb(44,220,199));
+                  }
+                  if (saveBtn!=null) {
+                      saveBtn.setEnabled(false);
+                      saveBtn.setText("APPLYING...");
+                  }
+                  if (freeVendingCheck!=null) freeVendingCheck.setEnabled(false);
+
+                  if (applyWatchdog!=null) main.removeCallbacks(applyWatchdog);
+                  applyWatchdog=() -> {
+                      if (!applyInProgress) return;
+                      applyInProgress=false;
+                      applyHadWarning=true;
+                      if (applyProgress!=null) applyProgress.setVisibility(View.GONE);
+                      if (applyProgressRow!=null) applyProgressRow.setVisibility(View.VISIBLE);
+                      if (applyStatus!=null) {
+                          applyStatus.setText("⚠ APPLY TIMEOUT • tekan READ ALL untuk verifikasi kondisi charger.");
+                          applyStatus.setTextColor(Color.rgb(255,190,100));
+                      }
+                      if (saveBtn!=null) {
+                          saveBtn.setText("APPLY ALL CHANGES");
+                          saveBtn.setEnabled(authenticated);
+                      }
+                      if (freeVendingCheck!=null) freeVendingCheck.setEnabled(authenticated);
+                      appendLog("APPLY WATCHDOG TIMEOUT after 180s.");
+                  };
+                  main.postDelayed(applyWatchdog,180000);
+              }
+
+              private void updateApplyUi(String message) {
+                  if (!applyInProgress) return;
+                  if (applyProgressRow!=null) applyProgressRow.setVisibility(View.VISIBLE);
+                  if (applyProgress!=null) applyProgress.setVisibility(View.VISIBLE);
+                  if (applyStatus!=null) {
+                      applyStatus.setText(message);
+                      applyStatus.setTextColor(Color.rgb(44,220,199));
+                  }
+              }
+
+              private void markApplyWarning(String message) {
+                  applyHadWarning=true;
+                  appendLog("APPLY WARNING: "+message);
+              }
+
+              private void finishApplyUi(boolean success,String message) {
+                  if (applyWatchdog!=null) main.removeCallbacks(applyWatchdog);
+                  applyWatchdog=null;
+                  applyInProgress=false;
+
+                  if (applyProgressRow!=null) applyProgressRow.setVisibility(View.VISIBLE);
+                  if (applyProgress!=null) applyProgress.setVisibility(View.GONE);
+                  if (applyStatus!=null) {
+                      applyStatus.setText(message);
+                      applyStatus.setTextColor(success
+                              ?Color.rgb(44,220,199)
+                              :Color.rgb(255,160,160));
+                  }
+                  if (saveBtn!=null) {
+                      saveBtn.setText("APPLY ALL CHANGES");
+                      saveBtn.setEnabled(authenticated);
+                  }
+                  if (freeVendingCheck!=null) freeVendingCheck.setEnabled(authenticated);
               }
 
               private void applyAllChanges() {
@@ -1728,6 +1861,7 @@ jobs:
                   final int connectionPosition=connectionType.getSelectedItemPosition();
                   final String ssid=wifiSsid.getText().toString();
                   final String wifiPass=wifiPassword.getText().toString();
+                  final boolean freeVendDesired=freeVendingCheck!=null && freeVendingCheck.isChecked();
 
                   if (cp.isEmpty()) { toast("Charger ID is required."); return; }
                   if (!(url.startsWith("ws://") || url.startsWith("wss://"))) {
@@ -1782,7 +1916,8 @@ jobs:
                       }
                   }
 
-                  saveBtn.setEnabled(false);
+                  beginApplyUi();
+                  updateApplyUi("Step 1/3 • Applying Free Vending...");
                   lastOcppApplyOk=false;
                   lastOcppApplyMessage="Not applied";
 
@@ -1805,8 +1940,133 @@ jobs:
                           +(d6Key.isEmpty()?"OFF":"ON")+" keyLen="+d6KeyBytes
                           +"; value is plain UTF-8 and secret is not logged.");
 
-                  tryOcppVariant(url,cp,d6Key,
-                          connectionPosition,ssid,wifiPass,0);
+                  applyFreeVendingThen(freeVendDesired,() -> {
+                      updateApplyUi("Step 2/3 • Applying OCPP server configuration...");
+                      tryOcppVariant(url,cp,d6Key,
+                              connectionPosition,ssid,wifiPass,0);
+                  });
+              }
+
+              private void applyFreeVendingThen(boolean enable,Runnable next) {
+                  appendLog("FREE VENDING APPLY desired="+enable+"; querying DD before write.");
+                  progress("Free Vending",false,"Reading current ABB device config...");
+
+                  sendEncrypted(CMD_QUERY_DEVICE_CONFIG_CAPACITATE,new byte[0],p -> {
+                      try {
+                          requirePacketOk(p,"Query Free Vending / DD");
+                          if (p.payload==null || p.payload.length<1)
+                              throw new Exception("DD payload too short: "+hex(p.payload));
+
+                          int currentConfig=p.payload[0]&0xff;
+                          boolean current=(currentConfig&FREE_VENDING_MASK)!=0;
+                          int desiredConfig=enable
+                                  ?(currentConfig|FREE_VENDING_MASK)
+                                  :(currentConfig&~FREE_VENDING_MASK);
+
+                          appendLog("FREE VENDING DD currentConfig=0x"
+                                  +String.format(Locale.US,"%02X",currentConfig)
+                                  +" current="+current
+                                  +" desired="+enable);
+
+                          if (desiredConfig==currentConfig) {
+                              freeVendingKnown=true;
+                              freeVendingReadEnabled=current;
+                              if (freeVendingStatus!=null)
+                                  freeVendingStatus.setText("✓ Free Vending already "
+                                          +(current?"ENABLED":"DISABLED"));
+                              progress("Free Vending",true,current?"Enabled":"Disabled");
+                              if (next!=null) main.postDelayed(next,150);
+                              return;
+                          }
+
+                          // Official TerraConfig setDeviceConfigCapacitateRequestBody():
+                          // payload[0] = complete config byte; payload[1] = expand (0).
+                          byte[] body=new byte[]{
+                                  (byte)(desiredConfig&0xff),
+                                  0x00
+                          };
+                          appendLog("FREE VENDING TX DC config=0x"
+                                  +String.format(Locale.US,"%02X",desiredConfig)
+                                  +" payload="+hex(body));
+
+                          sendEncrypted(CMD_SET_DEVICE_CONFIG_CAPACITATE,body,setResp -> {
+                              try {
+                                  requirePacketOk(setResp,"Set Free Vending / DC");
+                                  int code=(setResp.payload!=null && setResp.payload.length>0)
+                                          ?(setResp.payload[0]&0xff):0;
+                                  appendLog("FREE VENDING RX DC payload="+hex(setResp.payload)
+                                          +" code="+code);
+                                  if (code!=0)
+                                      throw new Exception("DC Free Vending rejected, code="+code);
+
+                                  main.postDelayed(() ->
+                                          verifyFreeVendingAfterWrite(enable,next),300);
+
+                              } catch(Exception e) {
+                                  String err=safeError(e);
+                                  markApplyWarning("Free Vending write failed: "+err);
+                                  progress("Free Vending",false,err);
+                                  if (freeVendingStatus!=null)
+                                      freeVendingStatus.setText("✕ Free Vending write failed: "+err);
+                                  if (next!=null) main.postDelayed(next,150);
+                              }
+                          });
+
+                      } catch(Exception e) {
+                          String err=safeError(e);
+                          markApplyWarning("Free Vending read unsupported/failed: "+err);
+                          progress("Free Vending",false,err);
+                          if (freeVendingStatus!=null)
+                              freeVendingStatus.setText("⚠ Free Vending not changed: "+err);
+                          // Do not block OCPP/Wi-Fi commissioning on firmware where DD/DC
+                          // is unavailable. The warning remains visible in final APPLY status.
+                          if (next!=null) main.postDelayed(next,150);
+                      }
+                  });
+              }
+
+              private void verifyFreeVendingAfterWrite(boolean expected,Runnable next) {
+                  sendEncrypted(CMD_QUERY_DEVICE_CONFIG_CAPACITATE,new byte[0],p -> {
+                      try {
+                          requirePacketOk(p,"Verify Free Vending / DD");
+                          if (p.payload==null || p.payload.length<1)
+                              throw new Exception("DD verify payload too short: "+hex(p.payload));
+
+                          int config=p.payload[0]&0xff;
+                          boolean actual=(config&FREE_VENDING_MASK)!=0;
+                          freeVendingKnown=true;
+                          freeVendingReadEnabled=actual;
+
+                          appendLog("FREE VENDING VERIFY expected="+expected
+                                  +" actual="+actual
+                                  +" config=0x"+String.format(Locale.US,"%02X",config));
+
+                          if (freeVendingCheck!=null) freeVendingCheck.setChecked(actual);
+
+                          if (actual!=expected) {
+                              markApplyWarning("Free Vending verify mismatch");
+                              progress("Free Vending",false,
+                                      "Verify mismatch: expected "+expected+" actual "+actual);
+                              if (freeVendingStatus!=null)
+                                  freeVendingStatus.setText("✕ VERIFY FAILED • actual="
+                                          +(actual?"ENABLED":"DISABLED"));
+                          } else {
+                              progress("Free Vending",true,actual?"Enabled":"Disabled");
+                              if (freeVendingStatus!=null)
+                                  freeVendingStatus.setText("✓ VERIFIED • Free Vending "
+                                          +(actual?"ENABLED":"DISABLED"));
+                          }
+
+                      } catch(Exception e) {
+                          String err=safeError(e);
+                          markApplyWarning("Free Vending verify failed: "+err);
+                          progress("Free Vending",false,err);
+                          if (freeVendingStatus!=null)
+                              freeVendingStatus.setText("⚠ Free Vending verify failed: "+err);
+                      }
+
+                      if (next!=null) main.postDelayed(next,150);
+                  });
               }
 
               private void tryOcppVariant(String url,String cp,String key,
@@ -1872,6 +2132,7 @@ jobs:
               }
 
               private void continueWithNetwork(int connectionPosition,String ssid,String wifiPass) {
+                  updateApplyUi("Step 3/3 • Applying network/Wi-Fi and waiting for read-back...");
                   if (connectionPosition==0)
                       applyWifiLast(ssid,wifiPass);
                   else
@@ -2093,6 +2354,8 @@ jobs:
                               progress("Internet connection",false,err);
                               failStatus("Wi-Fi write failed",err);
                               saveBtn.setEnabled(true);
+                              if (applyInProgress)
+                                  finishApplyUi(false,"✕ APPLY FAILED • Wi-Fi: "+err);
                           }
                       }
                   });
@@ -2144,8 +2407,8 @@ jobs:
                   loadLocalProfile();
                   progress("Current configuration",false,"READ ALL in progress...");
                   setStatus("READING ALL CONFIGURATION",
-                          "E4/C7/AA/D3/DB/C5 • Wi-Fi, DHCP/static and OCPP");
-                  appendLog("READ ALL START: E4 -> C7 -> AA -> D3 -> DB -> C5");
+                          "E4/C7/AA/D3/DB/C5/DD • Wi-Fi, Free Vending, DHCP/static and OCPP");
+                  appendLog("READ ALL START: E4 -> C7 -> AA -> D3 -> DB -> C5 -> DD");
 
                   queryWifiInfo(() ->
                           queryWifiNetworkConfigForRead(() ->
@@ -2490,27 +2753,78 @@ jobs:
                       String cachedAuth=readProfile("auth_key");
                       if (!cachedAuth.isEmpty()) authKey.setText(cachedAuth);
 
-                      progress("Current configuration",true,"READ ALL complete");
-                      if (!statusTitle.getText().toString().equals("WI-FI NOT SAVED")) {
-                          setStatus("CONFIGURATION LOADED",
-                                  "Wi-Fi + DHCP/static + D3 status + OCPP read complete. Values shown are read from charger.");
-                      }
-                      appendLog("READ ALL COMPLETE");
-                      readInProgress=false;
-                      saveBtn.setEnabled(authenticated);
+                      queryFreeVendingForRead(() -> {
+                          progress("Current configuration",true,"READ ALL complete");
+                          if (!statusTitle.getText().toString().equals("WI-FI NOT SAVED")) {
+                              setStatus("CONFIGURATION LOADED",
+                                      "Wi-Fi + Free Vending + DHCP/static + OCPP read complete.");
+                          }
+                          appendLog("READ ALL COMPLETE");
+                          readInProgress=false;
+                          if (saveBtn!=null)
+                              saveBtn.setEnabled(authenticated && !applyInProgress);
 
-                      // After the post-APPLY reboot/read-back, provision Basic Auth via the
-                      // user's existing Node OCPP gateway. This reproduces the exact OCPP
-                      // ChangeConfiguration path that the charger has already accepted.
-                      if (pendingGatewayBasicAuth
-                              && pendingGatewayAuthKey!=null && !pendingGatewayAuthKey.isEmpty()
-                              && pendingGatewayClientId!=null && !pendingGatewayClientId.isEmpty()) {
-                          final int generation=gatewayAuthGeneration;
-                          main.postDelayed(() -> {
-                              if (generation==gatewayAuthGeneration && pendingGatewayBasicAuth)
-                                  startGatewayBasicAuthProvision(generation);
-                          },1500);
+                          if (applyInProgress) {
+                              boolean ok=!applyHadWarning;
+                              finishApplyUi(ok,ok
+                                      ?"✓ APPLY COMPLETE • configuration verified from charger."
+                                      :"⚠ APPLY COMPLETE WITH WARNING • check status/log above.");
+                              setStatus(ok?"APPLY COMPLETE":"APPLY COMPLETE WITH WARNING",
+                                      ok
+                                          ?"Charger configuration has been applied and read back."
+                                          :"Configuration applied, but at least one step needs attention.");
+                          }
+
+                          // After the post-APPLY reboot/read-back, provision Basic Auth via the
+                          // user's existing Node OCPP gateway.
+                          if (pendingGatewayBasicAuth
+                                  && pendingGatewayAuthKey!=null && !pendingGatewayAuthKey.isEmpty()
+                                  && pendingGatewayClientId!=null && !pendingGatewayClientId.isEmpty()) {
+                              final int generation=gatewayAuthGeneration;
+                              main.postDelayed(() -> {
+                                  if (generation==gatewayAuthGeneration && pendingGatewayBasicAuth)
+                                      startGatewayBasicAuthProvision(generation);
+                              },1500);
+                          }
+                      });
+                  });
+              }
+
+              private void queryFreeVendingForRead(Runnable next) {
+                  sendEncrypted(CMD_QUERY_DEVICE_CONFIG_CAPACITATE,new byte[0],p -> {
+                      try {
+                          requirePacketOk(p,"Read Free Vending / DD");
+                          if (p.payload==null || p.payload.length<1)
+                              throw new Exception("DD payload too short: "+hex(p.payload));
+
+                          int config=p.payload[0]&0xff;
+                          boolean enabled=(config&FREE_VENDING_MASK)!=0;
+                          freeVendingKnown=true;
+                          freeVendingReadEnabled=enabled;
+
+                          if (freeVendingCheck!=null) freeVendingCheck.setChecked(enabled);
+                          if (freeVendingStatus!=null)
+                              freeVendingStatus.setText("Current charger: Free Vending "
+                                      +(enabled?"ENABLED":"DISABLED")
+                                      +" • config=0x"
+                                      +String.format(Locale.US,"%02X",config));
+
+                          progress("Free Vending",true,enabled?"Enabled":"Disabled");
+                          appendLog("READ DD FREE_VENDING config=0x"
+                                  +String.format(Locale.US,"%02X",config)
+                                  +" enabled="+enabled
+                                  +" payload="+hex(p.payload));
+
+                      } catch(Exception e) {
+                          freeVendingKnown=false;
+                          String err=safeError(e);
+                          progress("Free Vending",false,err);
+                          if (freeVendingStatus!=null)
+                              freeVendingStatus.setText("Free Vending read unavailable: "+err);
+                          appendLog("DD Free Vending read warning: "+err);
                       }
+
+                      if (next!=null) next.run();
                   });
               }
 
@@ -3546,6 +3860,9 @@ jobs:
                               authKey.getText().toString());
                       writeSecure(profileKey("requires_password"),
                               requiresPassword.isChecked()?"1":"0");
+                      if (freeVendingCheck!=null)
+                          writeSecure(profileKey("free_vending"),
+                                  freeVendingCheck.isChecked()?"1":"0");
 
                       appendLog("Encrypted local profile saved for "+deviceNumber
                               +" (secrets not logged).");
@@ -3574,6 +3891,7 @@ jobs:
                   String url=readProfile("ocpp_url");
                   String key=readProfile("auth_key");
                   String req=readProfile("requires_password");
+                  String freeVend=readProfile("free_vending");
 
                   try {
                       if (!conn.isEmpty()) {
@@ -3588,6 +3906,8 @@ jobs:
                   if (!url.isEmpty()) setServerUrlValue(url);
                   if (!key.isEmpty()) authKey.setText(key);
                   if (!req.isEmpty()) requiresPassword.setChecked("1".equals(req));
+                  if (!freeVend.isEmpty() && freeVendingCheck!=null)
+                      freeVendingCheck.setChecked("1".equals(freeVend));
 
                   appendLog("Encrypted local profile loaded for "+deviceNumber
                           +" (password/AuthKey hidden from log).");
@@ -4220,6 +4540,8 @@ jobs:
                       if (authDiagStartBtn!=null) authDiagStartBtn.setEnabled(authenticated && !authDiagRunning);
                       if (authDiagRestoreBtn!=null) authDiagRestoreBtn.setEnabled(authenticated);
                       if (authDiagStopBtn!=null) authDiagStopBtn.setEnabled(authDiagRunning);
+                      if (freeVendingCheck!=null)
+                          freeVendingCheck.setEnabled(authenticated && !applyInProgress);
                       setOcppUiEnabled(authenticated);
                   });
               }
@@ -4274,8 +4596,8 @@ jobs:
                   if (v.startsWith("ws://192.168.10.186:9220")) {
                       v=OCPP_LOCAL;
                       idx=0;
-                  } else if (v.startsWith("ws://182.253.7.9:9221")) {
-                      v=OCPP_LOCAL_9221;
+                  } else if (v.startsWith("ws://182.253.7.9:7979")) {
+                      v=OCPP_PUBLIC_7979;
                       idx=1;
                   } else if (v.startsWith("wss://homecharging.pln.co.id")) {
                       v=OCPP_PLN;
@@ -4548,9 +4870,9 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.8.3-corrected-ocpp-url.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.9-free-vending-apply-progress.apk
           cd artifact
-          sha256sum EMOS-5.8.3-corrected-ocpp-url.apk | tee EMOS-5.8.1-password-toggle.apk.sha256
+          sha256sum EMOS-5.9-free-vending-apply-progress.apk | tee EMOS-5.8.1-password-toggle.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
