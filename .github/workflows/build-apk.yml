@@ -1,4 +1,4 @@
-name: Build EMOS 5.9 Free Vending Apply Progress
+name: Build EMOS 5.8.4 Universal BLE (5.8.3 base)
 
 on:
   workflow_dispatch:
@@ -216,8 +216,8 @@ jobs:
                   applicationId 'com.elmecon.abbterra'
                   minSdk 23
                   targetSdk 35
-                  versionCode 590
-                  versionName '5.9-free-vending-apply-progress'
+                  versionCode 584
+                  versionName '5.8.4-universal-ble-583-base'
               }
 
               buildTypes {
@@ -329,14 +329,7 @@ jobs:
               private static final int CMD_WIFI_NETWORK_CONFIG = 0xC7; // newer Wi-Fi config/read family
               private static final int CMD_OCPP = 0xD6;
               private static final int CMD_QUERY_DEVICE_NET_CONFIG = 0xDB;
-              private static final int CMD_SET_DEVICE_CONFIG_CAPACITATE = 0xDC;
-              private static final int CMD_QUERY_DEVICE_CONFIG_CAPACITATE = 0xDD;
               private static final int CMD_QUERY_WIFI_INFO = 0xE4;
-
-              // Reverse-engineered directly from official TerraConfig:
-              // intToBitArray(config) returns 8 bits MSB-first and Free Vending writes index 5.
-              // Therefore Free Vending is config mask 0x04.
-              private static final int FREE_VENDING_MASK = 0x04;
 
               private static final int NET_WIFI = 6;
               private static final int NET_ETHERNET = 12;
@@ -348,8 +341,8 @@ jobs:
               private static final String KEY_ALIAS = "abb_terra_direct_token_v1";
               private static final String PREFS = "abb_terra_direct_secure";
               private static final String OCPP_LOCAL = "ws://192.168.10.186:9220";
-              private static final String OCPP_PUBLIC_7979 = "ws://182.253.7.9:7979";
-              private static final String OCPP_PLN = "wss://homecharging.pln.co.id:443/";
+              private static final String OCPP_LOCAL_9221 = "ws://182.253.7.9:9221";
+              private static final String OCPP_PLN = "wss://homecharging.pln.co.id:443";
               private static final String OCPP_MANUAL = "Manual / Custom URL";
               private static boolean appSessionAuthorized = false;
               private static final int AUTH_DIAG_PORT = 9221;
@@ -364,7 +357,12 @@ jobs:
               private BluetoothLeScanner scanner;
               private BluetoothGatt gatt;
               private BluetoothGattCharacteristic tx, rx;
-              private int mtu = 158;
+              private int mtu = 23; // Safe default until ATT MTU is confirmed by Android.
+              // Legacy/OEM BLE fix: serialize discovery -> FFF4 CCCD -> optional MTU.
+              // 0=idle, 1=discovering, 2=CCCD, 3=MTU, 4=ready.
+              private int bleSetupPhase = 0;
+              private int bleDiscoveryAttempt = 0, bleNotifyAttempt = 0;
+              private boolean bleMtuWaiting = false;
               private boolean transportReady = false;
               private boolean authenticated = false;
               private boolean authInProgress = false;
@@ -381,11 +379,6 @@ jobs:
               private int lastD3Mode = -1;
               private boolean lastOcppApplyOk = false;
               private String lastOcppApplyMessage = "Not applied";
-              private boolean freeVendingKnown = false;
-              private boolean freeVendingReadEnabled = false;
-              private boolean applyInProgress = false;
-              private boolean applyHadWarning = false;
-              private Runnable applyWatchdog;
               private boolean awaitingExpectedReboot = false;
               private boolean wifiWritePending = false;
               private String pendingDesiredSsid = "";
@@ -453,15 +446,13 @@ jobs:
 
               private SharedPreferences prefs;
 
-              private TextView statusTitle, statusDetail, selectedDevice, logText, adminStatus, connectionStatus,
-                      authDiagStatus, basicAuthVerifyStatus, freeVendingStatus, applyStatus;
-              private ProgressBar adminLoginProgress, applyProgress;
+              private TextView statusTitle, statusDetail, selectedDevice, logText, adminStatus, connectionStatus, authDiagStatus, basicAuthVerifyStatus;
+              private ProgressBar adminLoginProgress;
               private volatile boolean adminLoginInProgress = false;
-              private LinearLayout deviceList, progressBox, adminFields, wifiFields, ocppCard,
-                      manualOcppUrlBox, applyProgressRow;
+              private LinearLayout deviceList, progressBox, adminFields, wifiFields, ocppCard, manualOcppUrlBox;
               private View mainContent;
               private EditText chargerPin, wifiSsid, wifiPassword, chargePointId, serverUrl, authKey, adminEmail, adminPassword;
-              private CheckBox requiresPassword, showWifiPassword, showAuthKey, showAdminPassword, freeVendingCheck;
+              private CheckBox requiresPassword, showWifiPassword, showAuthKey, showAdminPassword;
               private Spinner connectionType, serverUrlSpinner, authProvisionModeSpinner;
               private Button scanBtn, authBtn, readConfigBtn, saveBtn, verifyBtn,
                       disconnectBtn, adminToggle, adminLogin, adminClear,
@@ -522,124 +513,261 @@ jobs:
                   }
               };
 
+              // GATT callback ordering is not consistent across Android BLE stacks.
+              // All setup transitions are serialized on main; stale GATT callbacks are ignored.
               private final BluetoothGattCallback gattCallback = new BluetoothGattCallback() {
-                  @Override public void onConnectionStateChange(BluetoothGatt gg, int status, int newState) {
-                      appendLog("GATT state status=" + status + " state=" + newState);
-                      if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
-                          gatt = gg;
-                          progress("Bluetooth", true, "GATT connected");
-                          setStatus("Bluetooth connected", "Opening Terra configuration channel...");
-                          try { gg.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH); } catch(Exception ignored) {}
-                          try { gg.requestMtu(247); } catch(Exception ignored) {}
-                          main.postDelayed(() -> {
-                              try { gg.discoverServices(); }
-                              catch(Exception e) { failStatus("Service discovery failed", safeError(e)); }
-                          }, 250);
-                      } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                          boolean rebootFlow=awaitingExpectedReboot;
-                          String target=deviceNumber;
+                  @Override public void onConnectionStateChange(BluetoothGatt gg,int status,int newState) {
+                      appendLog("GATT state status="+status+" state="+newState);
+                      main.post(() -> {
+                          if (gatt!=null && gatt!=gg) return;
+                          if (status==BluetoothGatt.GATT_SUCCESS && newState==BluetoothProfile.STATE_CONNECTED) {
+                              gatt=gg;
+                              updateButtons(); // Allow DISCONNECT even if FFF0/CCCD is slow.
+                              mtu=23; bleSetupPhase=0; bleDiscoveryAttempt=0; bleNotifyAttempt=0; bleMtuWaiting=false;
+                              progress("Bluetooth",true,"GATT connected; preparing service discovery");
+                              setStatus("Bluetooth connected","Checking Terra BLE services (compatible mode)...");
+                              // Never request MTU and discover services at the same time.
+                              // Slow Tecno/older Android stacks may otherwise stall on FFF0 discovery.
+                              main.postDelayed(() -> discoverTerraServices(gg),700);
+                          } else if (newState==BluetoothProfile.STATE_DISCONNECTED || status!=BluetoothGatt.GATT_SUCCESS) {
+                              boolean rebootFlow=awaitingExpectedReboot;
+                              String target=deviceNumber;
+                              if (gatt==gg) gatt=null;
+                              clearSession();
+                              try { gg.close(); } catch(Exception ignored) {}
+                              authInProgress=false; readInProgress=false;
+                              progress("Bluetooth",false,rebootFlow?"Charger rebooting...":"Disconnected (GATT "+status+")");
+                              progress("Secure session",false,"Not authenticated");
+                              if (rebootFlow && target!=null && !target.isEmpty()) {
+                                  awaitingExpectedReboot=false;
+                                  autoReconnectDeviceNumber=target;
+                                  autoReconnectEnabled=true;
+                                  setStatus("CHARGER REBOOTING","Waiting for "+target+" to return...");
+                                  appendLog("Expected reboot detected. Auto reconnect armed for "+target);
+                                  main.postDelayed(() -> startScan(),8000);
+                              } else {
+                                  setStatus("Disconnected","Scan and select charger. GATT status="+status);
+                              }
+                              updateButtons();
+                          }
+                      });
+                  }
 
-                          clearSession();
-                          authInProgress=false;
-                          readInProgress=false;
-                          progress("Bluetooth", false, rebootFlow ? "Charger rebooting..." : "Disconnected");
-                          progress("Secure session", false, "Not authenticated");
+                  @Override public void onMtuChanged(BluetoothGatt gg,int newMtu,int status) {
+                      appendLog("MTU="+newMtu+" status="+status);
+                      main.post(() -> {
+                          if (gatt!=gg) return;
+                          if (status==BluetoothGatt.GATT_SUCCESS && newMtu>=23) mtu=newMtu;
+                          else mtu=23;
+                          if (bleSetupPhase==3 && bleMtuWaiting) completeTerraTransport(gg);
+                      });
+                  }
 
-                          if (rebootFlow && target!=null && !target.isEmpty()) {
-                              awaitingExpectedReboot=false;
-                              autoReconnectDeviceNumber=target;
-                              autoReconnectEnabled=true;
-                              setStatus("CHARGER REBOOTING","Waiting for "+target+" to return...");
-                              appendLog("Expected reboot detected. Auto reconnect armed for "+target);
-                              // FW 2.1.0 advertises again before its FFF0 service is always ready.
-                              // Give the charger more time to finish the network/BLE restart.
-                              main.postDelayed(() -> startScan(),8000);
+                  @Override public void onServicesDiscovered(BluetoothGatt gg,int status) {
+                      appendLog("Service discovery status="+status);
+                      main.post(() -> {
+                          if (gatt!=gg || bleSetupPhase!=1) return;
+                          if (status!=BluetoothGatt.GATT_SUCCESS) {
+                              retryTerraDiscovery(gg,"GATT discovery status="+status);
+                              return;
+                          }
+                          BluetoothGattService service=gg.getService(FFF0);
+                          if (service==null) {
+                              retryTerraDiscovery(gg,"Terra FFF0 service not available yet");
+                              return;
+                          }
+                          tx=service.getCharacteristic(FFF3);
+                          rx=service.getCharacteristic(FFF4);
+                          if (tx==null || rx==null) {
+                              retryTerraDiscovery(gg,"Terra FFF3/FFF4 characteristics not ready");
+                              return;
+                          }
+                          bleSetupPhase=2;
+                          bleNotifyAttempt=0;
+                          subscribeTerraNotifications(gg);
+                      });
+                  }
+
+                  @Override public void onDescriptorWrite(BluetoothGatt gg,BluetoothGattDescriptor descriptor,int status) {
+                      if (!CCCD.equals(descriptor.getUuid())) return;
+                      appendLog("FFF4 CCCD write status="+status);
+                      main.post(() -> {
+                          if (gatt!=gg || bleSetupPhase!=2) return;
+                          if (status!=BluetoothGatt.GATT_SUCCESS) {
+                              retryTerraNotify(gg,"CCCD GATT status="+status);
+                              return;
+                          }
+                          // CCCD must complete before MTU; the old code overlapped MTU/discovery.
+                          bleSetupPhase=3;
+                          bleMtuWaiting=true;
+                          if (useConservativeBleMtu()) {
+                              // Older Android and budget OEM GATT stacks can hang in requestMtu.
+                              // 20-byte ATT payloads work without negotiating a larger MTU.
+                              appendLog("BLE CONSERVATIVE: skip optional MTU; use standard MTU 23.");
+                              mtu=23;
+                              bleMtuWaiting=false;
+                              completeTerraTransport(gg);
+                              return;
+                          }
+                          boolean requested=false;
+                          try { requested=gg.requestMtu(158); }
+                          catch(Exception e) { appendLog("Optional MTU request: "+safeError(e)); }
+                          if (!requested) {
+                              appendLog("MTU negotiation unavailable; using safe MTU 23 with 20-byte chunks.");
+                              bleMtuWaiting=false;
+                              completeTerraTransport(gg);
                           } else {
-                              setStatus("Disconnected", "Scan and select charger.");
+                              main.postDelayed(() -> {
+                                  if (gatt==gg && bleSetupPhase==3 && bleMtuWaiting) {
+                                      appendLog("MTU callback timed out; proceeding with safe ATT payload size.");
+                                      bleMtuWaiting=false;
+                                      // Conservative framing in case Android's MTU callback was lost.
+                                      mtu=23;
+                                      completeTerraTransport(gg);
+                                  }
+                              },4000);
                           }
-                          updateButtons();
-                      }
+                      });
                   }
 
-                  @Override public void onMtuChanged(BluetoothGatt gg, int newMtu, int status) {
-                      if (status == BluetoothGatt.GATT_SUCCESS) mtu = newMtu;
-                      appendLog("MTU=" + newMtu + " status=" + status);
-                  }
-
-                  @Override public void onServicesDiscovered(BluetoothGatt gg, int status) {
-                      BluetoothGattService service = gg.getService(FFF0);
-                      if (service == null) {
-                          appendLog("FFF0 missing after reconnect; charger may still be booting.");
-                          if (autoReconnectDeviceNumber!=null && !autoReconnectDeviceNumber.isEmpty()) {
-                              String target=autoReconnectDeviceNumber;
-                              try { gg.disconnect(); } catch(Exception ignored) {}
-                              autoReconnectDeviceNumber=target;
-                              autoReconnectEnabled=true;
-                              setStatus("CHARGER STILL BOOTING","FFF0 not ready; retrying automatically...");
-                              main.postDelayed(() -> startScan(),5000);
-                          } else {
-                              failStatus("Terra BLE service not found", "FFF0 missing");
-                          }
-                          return;
-                      }
-                      tx = service.getCharacteristic(FFF3);
-                      rx = service.getCharacteristic(FFF4);
-                      if (tx == null || rx == null) { failStatus("Terra BLE channel incomplete", "FFF3/FFF4 missing"); return; }
-
-                      try {
-                          boolean ok = gg.setCharacteristicNotification(rx, true);
-                          appendLog("FFF4 local notify=" + ok);
-                          BluetoothGattDescriptor d = rx.getDescriptor(CCCD);
-                          if (d == null) { failStatus("Notification unavailable", "FFF4 CCCD missing"); return; }
-
-                          if (Build.VERSION.SDK_INT >= 33) {
-                              int r = gg.writeDescriptor(d, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-                              appendLog("CCCD write result=" + r);
-                          } else {
-                              d.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-                              appendLog("CCCD write=" + gg.writeDescriptor(d));
-                          }
-                      } catch(Exception e) {
-                          failStatus("FFF4 notification failed", safeError(e));
-                      }
-                  }
-
-                  @Override public void onDescriptorWrite(BluetoothGatt gg, BluetoothGattDescriptor descriptor, int status) {
-                      if (CCCD.equals(descriptor.getUuid()) && status == BluetoothGatt.GATT_SUCCESS) {
-                          transportReady = true;
-                          progress("Bluetooth", true, "FFF3 / FFF4 ready");
-                          setStatus("Charger connected", deviceNumber
-                                  + (firmwareVersion.isEmpty() ? "" : " • FW " + firmwareVersion)
-                                  + " • enter PIN");
-                          updateButtons();
-
-                          if (chargerPin.getText().toString().trim().length() == 8
-                                  && hasSavedAuthorization()
-                                  && !authenticated
-                                  && !authInProgress) {
-                              main.postDelayed(this::autoAuthenticate, 400);
-                          }
-                      }
-                  }
-
-                  private void autoAuthenticate() {
-                      if (!authenticated && !authInProgress && transportReady) authenticateCharger();
-                  }
-
-                  @Override public void onCharacteristicWrite(BluetoothGatt gg, BluetoothGattCharacteristic characteristic, int status) {
-                      txBusy = false;
-                      if (status != BluetoothGatt.GATT_SUCCESS) {
+                  @Override public void onCharacteristicWrite(BluetoothGatt gg,BluetoothGattCharacteristic characteristic,int status) {
+                      if (gatt!=gg) return;
+                      txBusy=false;
+                      if (status!=BluetoothGatt.GATT_SUCCESS) {
                           txChunks.clear();
-                          failStatus("BLE write failed", "GATT status " + status);
+                          failStatus("BLE write failed","GATT status "+status);
                           return;
                       }
                       sendNextChunk();
                   }
 
-                  @Override public void onCharacteristicChanged(BluetoothGatt gg, BluetoothGattCharacteristic characteristic) {
-                      onRx(characteristic.getValue());
+                  @Override public void onCharacteristicChanged(BluetoothGatt gg,BluetoothGattCharacteristic characteristic) {
+                      if (gatt==gg) onRx(characteristic.getValue());
                   }
               };
+
+              private void discoverTerraServices(BluetoothGatt gg) {
+                  if (gatt!=gg || transportReady) return;
+                  if (bleDiscoveryAttempt>=3) {
+                      failStatus("Terra BLE setup failed","Service discovery failed after 3 attempts; use DISCONNECT then SCAN.");
+                      updateButtons();
+                      return;
+                  }
+                  bleSetupPhase=1;
+                  final int attempt=++bleDiscoveryAttempt;
+                  setStatus("Bluetooth connected","Discovering Terra FFF0/FFF3/FFF4 (attempt "+attempt+"/3)...");
+                  appendLog("BLE DISCOVERY start attempt="+attempt);
+                  boolean ok=false;
+                  try { ok=gg.discoverServices(); }
+                  catch(Exception e) { appendLog("discoverServices exception: "+safeError(e)); }
+                  if (!ok) {
+                      retryTerraDiscovery(gg,"discoverServices returned false");
+                      return;
+                  }
+                  main.postDelayed(() -> {
+                      if (gatt==gg && bleSetupPhase==1 && bleDiscoveryAttempt==attempt)
+                          retryTerraDiscovery(gg,"service-discovery callback timeout");
+                  },7000);
+              }
+
+              private void retryTerraDiscovery(BluetoothGatt gg,String reason) {
+                  if (gatt!=gg || transportReady || bleSetupPhase!=1) return;
+                  appendLog("BLE DISCOVERY warning: "+reason+"; attempt="+bleDiscoveryAttempt+"/3");
+                  if (bleDiscoveryAttempt>=3) {
+                      if (autoReconnectDeviceNumber!=null && !autoReconnectDeviceNumber.isEmpty()) {
+                          String target=autoReconnectDeviceNumber;
+                          autoReconnectEnabled=true;
+                          setStatus("CHARGER STILL BOOTING","Terra service not ready; scanning again for "+target);
+                          disconnectGattOnly();
+                          clearSession();
+                          main.postDelayed(() -> startScan(),5000);
+                      } else {
+                          failStatus("Terra BLE service unavailable",reason+". Try DISCONNECT and SCAN again.");
+                      }
+                      updateButtons();
+                      return;
+                  }
+                  // Invalidate the previous discovery timeout before scheduling a retry.
+                  bleSetupPhase=0;
+                  main.postDelayed(() -> discoverTerraServices(gg),1200);
+              }
+
+              private void subscribeTerraNotifications(BluetoothGatt gg) {
+                  if (gatt!=gg || bleSetupPhase!=2 || rx==null) return;
+                  if (bleNotifyAttempt>=3) {
+                      failStatus("Terra notification setup failed","FFF4 CCCD did not complete; disconnect and retry.");
+                      updateButtons();
+                      return;
+                  }
+                  final int attempt=++bleNotifyAttempt;
+                  setStatus("Bluetooth connected","Enabling charger FFF4 notifications (attempt "+attempt+"/3)...");
+                  try {
+                      boolean notify=gg.setCharacteristicNotification(rx,true);
+                      appendLog("FFF4 local notify="+notify+" attempt="+attempt);
+                      if (!notify) { retryTerraNotify(gg,"setCharacteristicNotification=false"); return; }
+                      BluetoothGattDescriptor d=rx.getDescriptor(CCCD);
+                      if (d==null) { failStatus("Notification unavailable","FFF4 CCCD descriptor missing"); return; }
+                      int props=rx.getProperties();
+                      byte[] value=(props&BluetoothGattCharacteristic.PROPERTY_NOTIFY)!=0
+                              ?BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                              :BluetoothGattDescriptor.ENABLE_INDICATION_VALUE;
+                      boolean accepted;
+                      if (Build.VERSION.SDK_INT>=33) {
+                          int result=gg.writeDescriptor(d,value);
+                          accepted=result==BluetoothStatusCodes.SUCCESS;
+                          appendLog("CCCD write request result="+result);
+                      } else {
+                          d.setValue(value);
+                          accepted=gg.writeDescriptor(d);
+                          appendLog("CCCD write request="+accepted);
+                      }
+                      if (!accepted) { retryTerraNotify(gg,"writeDescriptor rejected immediately"); return; }
+                  } catch(Exception e) {
+                      retryTerraNotify(gg,"writeDescriptor exception: "+safeError(e));
+                      return;
+                  }
+                  main.postDelayed(() -> {
+                      if (gatt==gg && bleSetupPhase==2 && bleNotifyAttempt==attempt)
+                          retryTerraNotify(gg,"CCCD write callback timeout");
+                  },7000);
+              }
+
+              private void retryTerraNotify(BluetoothGatt gg,String reason) {
+                  if (gatt!=gg || bleSetupPhase!=2 || transportReady) return;
+                  appendLog("BLE CCCD warning: "+reason+"; attempt="+bleNotifyAttempt+"/3");
+                  if (bleNotifyAttempt>=3) {
+                      failStatus("Terra BLE notification failed",reason+". Disconnect and scan again.");
+                      updateButtons();
+                      return;
+                  }
+                  // No other GATT command is queued during a CCCD retry.
+                  bleSetupPhase=2;
+                  main.postDelayed(() -> subscribeTerraNotifications(gg),1200);
+              }
+
+              private boolean useConservativeBleMtu() {
+                  String maker=Build.MANUFACTURER==null?"":Build.MANUFACTURER.toLowerCase(Locale.US);
+                  return Build.VERSION.SDK_INT<=28 || maker.contains("tecno")
+                          || maker.contains("itel") || maker.contains("infinix");
+              }
+
+              private void completeTerraTransport(BluetoothGatt gg) {
+                  if (gatt!=gg || transportReady || bleSetupPhase!=3) return;
+                  bleSetupPhase=4;
+                  bleMtuWaiting=false;
+                  transportReady=true;
+                  progress("Bluetooth",true,"FFF3/FFF4 ready • ATT MTU "+mtu);
+                  setStatus("Charger connected",deviceNumber
+                          +(firmwareVersion.isEmpty()?"":" • FW "+firmwareVersion)+" • enter PIN");
+                  appendLog("BLE SETUP READY. FFF4 CCCD accepted; ATT MTU="+mtu);
+                  updateButtons();
+                  if (chargerPin!=null && chargerPin.getText().toString().trim().length()==8
+                          && hasSavedAuthorization() && !authenticated && !authInProgress)
+                      main.postDelayed(() -> {
+                          if (gatt==gg && transportReady && !authenticated && !authInProgress)
+                              authenticateCharger();
+                      },450);
+              }
 
               @Override protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
@@ -654,12 +782,18 @@ jobs:
                   // launch always asks for login again. Charger profiles remain saved.
                   if (appSessionAuthorized && hasSavedAuthorization()) {
                       buildUi();
-                      appendLog("EMOS 5.9 started");
+                      appendLog("EMOS " + appVersionName() + " started");
                       appendLog("Installer session active for this app session.");
                   } else {
                       clearAuthorizationTokensOnly();
                       showLoginScreen();
                   }
+              }
+
+              // Match debug banner to the installed APK package version; no stale hardcoded version.
+              private String appVersionName() {
+                  try { return getPackageManager().getPackageInfo(getPackageName(),0).versionName; }
+                  catch(Exception ignored) { return "5.8.4-universal-ble-583-base"; }
               }
 
               private void buildUi() {
@@ -805,32 +939,6 @@ jobs:
 
                   root.addView(internet, cardLp());
 
-                  LinearLayout freeVendingCard = card(CARD);
-                  freeVendingCard.addView(section("FREE VENDING • STAGED", ACCENT));
-
-                  TextView freeVendInfo = text(
-                          "Free Vending memungkinkan charger memulai charging tanpa RFID/authorization. "
-                          +"EMOS membaca konfigurasi ABB terlebih dahulu, mengubah hanya bit Free Vending, "
-                          +"lalu membaca ulang untuk verifikasi.",
-                          11,false,MUTED);
-                  freeVendInfo.setPadding(0,0,0,dp(8));
-                  freeVendingCard.addView(freeVendInfo);
-
-                  freeVendingCheck = new CheckBox(this);
-                  freeVendingCheck.setText("Enable Free Vending");
-                  freeVendingCheck.setTextColor(WHITE);
-                  freeVendingCheck.setChecked(false);
-                  freeVendingCheck.setEnabled(false);
-                  freeVendingCard.addView(freeVendingCheck);
-
-                  freeVendingStatus = text(
-                          "Belum dibaca dari charger. Authenticate lalu READ ALL.",
-                          11,true,MUTED);
-                  freeVendingStatus.setPadding(0,dp(5),0,0);
-                  freeVendingCard.addView(freeVendingStatus);
-
-                  root.addView(freeVendingCard, cardLp());
-
                   ocppCard = card(CARD);
                   ocppCard.addView(section("CUSTOM OCPP SERVER • STAGED", ACCENT));
                   chargePointId = input("ABB-V2-NEW", WHITE, MUTED);
@@ -847,7 +955,7 @@ jobs:
                           android.R.layout.simple_spinner_dropdown_item,
                           new String[]{
                                   OCPP_LOCAL,
-                                  OCPP_PUBLIC_7979,
+                                  OCPP_LOCAL_9221,
                                   OCPP_PLN,
                                   OCPP_MANUAL
                           });
@@ -858,7 +966,7 @@ jobs:
                           switch(position) {
                               case 1:
                                   manualOcppUrlBox.setVisibility(View.GONE);
-                                  serverUrl.setText(OCPP_PUBLIC_7979);
+                                  serverUrl.setText(OCPP_LOCAL_9221);
                                   break;
                               case 2:
                                   manualOcppUrlBox.setVisibility(View.GONE);
@@ -868,7 +976,7 @@ jobs:
                                   manualOcppUrlBox.setVisibility(View.VISIBLE);
                                   String current=serverUrl.getText().toString().trim();
                                   if (OCPP_LOCAL.equals(current)
-                                          || OCPP_PUBLIC_7979.equals(current)
+                                          || OCPP_LOCAL_9221.equals(current)
                                           || OCPP_PLN.equals(current)) {
                                       serverUrl.setText("");
                                   }
@@ -914,22 +1022,6 @@ jobs:
                           11,false,MUTED);
                   hint.setPadding(0,dp(4),0,dp(8));
                   ocppCard.addView(hint);
-
-                  applyProgressRow = new LinearLayout(this);
-                  applyProgressRow.setOrientation(LinearLayout.HORIZONTAL);
-                  applyProgressRow.setGravity(Gravity.CENTER_VERTICAL);
-                  applyProgressRow.setPadding(0,dp(8),0,dp(8));
-                  applyProgressRow.setVisibility(View.GONE);
-
-                  applyProgress = new ProgressBar(this);
-                  applyProgress.setIndeterminate(true);
-                  LinearLayout.LayoutParams aplp = new LinearLayout.LayoutParams(dp(34),dp(34));
-                  aplp.setMargins(0,0,dp(10),0);
-                  applyProgressRow.addView(applyProgress,aplp);
-
-                  applyStatus = text("Ready to apply.",12,true,MUTED);
-                  applyProgressRow.addView(applyStatus,new LinearLayout.LayoutParams(0,-2,1));
-                  ocppCard.addView(applyProgressRow);
 
                   saveBtn = button("APPLY ALL CHANGES", ACCENT, Color.rgb(4,35,38));
                   saveBtn.setEnabled(false);
@@ -1022,7 +1114,6 @@ jobs:
                   progress("Secure session", false, "Waiting");
                   progress("Authentication", false, "Waiting");
                   progress("Current configuration", false, "Waiting for authenticated read");
-                  progress("Free Vending", false, "Waiting for READ ALL");
                   progress("Internet connection", false, "Staged / not yet applied");
                   progress("OCPP configuration", false, "Staged / not yet applied");
                   progress("Verification", false, "Waiting");
@@ -1169,7 +1260,7 @@ jobs:
                               adminPassword.setText("");
                               appSessionAuthorized=true;
                               buildUi();
-                              appendLog("EMOS 5.8.1 started");
+                              appendLog("EMOS " + appVersionName() + " started");
                               appendLog("LOGIN SUCCESS. Authorization is valid for this app session only; password not stored.");
                               progress("Authorization",true,"Saved authorization ready");
                               toast("Login berhasil. Lanjut scan charger dan masukkan PIN.");
@@ -1670,8 +1761,6 @@ jobs:
 
                           if (saveBtn!=null)
                               saveBtn.setEnabled(true);
-                          if (applyInProgress)
-                              finishApplyUi(false,"✕ APPLY FAILED • "+safeError(e));
                       }
                   });
               }
@@ -1771,82 +1860,8 @@ jobs:
                   if (authKey!=null) authKey.setEnabled(enabled);
                   if (showAuthKey!=null) showAuthKey.setEnabled(enabled);
                   if (requiresPassword!=null) requiresPassword.setEnabled(enabled);
-                  if (saveBtn!=null) saveBtn.setEnabled(enabled && authenticated && !applyInProgress);
-                  if (freeVendingCheck!=null)
-                      freeVendingCheck.setEnabled(authenticated && !applyInProgress);
+                  if (saveBtn!=null) saveBtn.setEnabled(enabled && authenticated);
                   if (ocppCard!=null) ocppCard.setAlpha(enabled?1.0f:0.48f);
-              }
-
-              private void beginApplyUi() {
-                  applyInProgress=true;
-                  applyHadWarning=false;
-
-                  if (applyProgressRow!=null) applyProgressRow.setVisibility(View.VISIBLE);
-                  if (applyProgress!=null) applyProgress.setVisibility(View.VISIBLE);
-                  if (applyStatus!=null) {
-                      applyStatus.setText("Applying configuration... jangan putuskan BLE.");
-                      applyStatus.setTextColor(Color.rgb(44,220,199));
-                  }
-                  if (saveBtn!=null) {
-                      saveBtn.setEnabled(false);
-                      saveBtn.setText("APPLYING...");
-                  }
-                  if (freeVendingCheck!=null) freeVendingCheck.setEnabled(false);
-
-                  if (applyWatchdog!=null) main.removeCallbacks(applyWatchdog);
-                  applyWatchdog=() -> {
-                      if (!applyInProgress) return;
-                      applyInProgress=false;
-                      applyHadWarning=true;
-                      if (applyProgress!=null) applyProgress.setVisibility(View.GONE);
-                      if (applyProgressRow!=null) applyProgressRow.setVisibility(View.VISIBLE);
-                      if (applyStatus!=null) {
-                          applyStatus.setText("⚠ APPLY TIMEOUT • tekan READ ALL untuk verifikasi kondisi charger.");
-                          applyStatus.setTextColor(Color.rgb(255,190,100));
-                      }
-                      if (saveBtn!=null) {
-                          saveBtn.setText("APPLY ALL CHANGES");
-                          saveBtn.setEnabled(authenticated);
-                      }
-                      if (freeVendingCheck!=null) freeVendingCheck.setEnabled(authenticated);
-                      appendLog("APPLY WATCHDOG TIMEOUT after 180s.");
-                  };
-                  main.postDelayed(applyWatchdog,180000);
-              }
-
-              private void updateApplyUi(String message) {
-                  if (!applyInProgress) return;
-                  if (applyProgressRow!=null) applyProgressRow.setVisibility(View.VISIBLE);
-                  if (applyProgress!=null) applyProgress.setVisibility(View.VISIBLE);
-                  if (applyStatus!=null) {
-                      applyStatus.setText(message);
-                      applyStatus.setTextColor(Color.rgb(44,220,199));
-                  }
-              }
-
-              private void markApplyWarning(String message) {
-                  applyHadWarning=true;
-                  appendLog("APPLY WARNING: "+message);
-              }
-
-              private void finishApplyUi(boolean success,String message) {
-                  if (applyWatchdog!=null) main.removeCallbacks(applyWatchdog);
-                  applyWatchdog=null;
-                  applyInProgress=false;
-
-                  if (applyProgressRow!=null) applyProgressRow.setVisibility(View.VISIBLE);
-                  if (applyProgress!=null) applyProgress.setVisibility(View.GONE);
-                  if (applyStatus!=null) {
-                      applyStatus.setText(message);
-                      applyStatus.setTextColor(success
-                              ?Color.rgb(44,220,199)
-                              :Color.rgb(255,160,160));
-                  }
-                  if (saveBtn!=null) {
-                      saveBtn.setText("APPLY ALL CHANGES");
-                      saveBtn.setEnabled(authenticated);
-                  }
-                  if (freeVendingCheck!=null) freeVendingCheck.setEnabled(authenticated);
               }
 
               private void applyAllChanges() {
@@ -1861,7 +1876,6 @@ jobs:
                   final int connectionPosition=connectionType.getSelectedItemPosition();
                   final String ssid=wifiSsid.getText().toString();
                   final String wifiPass=wifiPassword.getText().toString();
-                  final boolean freeVendDesired=freeVendingCheck!=null && freeVendingCheck.isChecked();
 
                   if (cp.isEmpty()) { toast("Charger ID is required."); return; }
                   if (!(url.startsWith("ws://") || url.startsWith("wss://"))) {
@@ -1916,8 +1930,7 @@ jobs:
                       }
                   }
 
-                  beginApplyUi();
-                  updateApplyUi("Step 1/3 • Applying Free Vending...");
+                  saveBtn.setEnabled(false);
                   lastOcppApplyOk=false;
                   lastOcppApplyMessage="Not applied";
 
@@ -1940,133 +1953,8 @@ jobs:
                           +(d6Key.isEmpty()?"OFF":"ON")+" keyLen="+d6KeyBytes
                           +"; value is plain UTF-8 and secret is not logged.");
 
-                  applyFreeVendingThen(freeVendDesired,() -> {
-                      updateApplyUi("Step 2/3 • Applying OCPP server configuration...");
-                      tryOcppVariant(url,cp,d6Key,
-                              connectionPosition,ssid,wifiPass,0);
-                  });
-              }
-
-              private void applyFreeVendingThen(boolean enable,Runnable next) {
-                  appendLog("FREE VENDING APPLY desired="+enable+"; querying DD before write.");
-                  progress("Free Vending",false,"Reading current ABB device config...");
-
-                  sendEncrypted(CMD_QUERY_DEVICE_CONFIG_CAPACITATE,new byte[0],p -> {
-                      try {
-                          requirePacketOk(p,"Query Free Vending / DD");
-                          if (p.payload==null || p.payload.length<1)
-                              throw new Exception("DD payload too short: "+hex(p.payload));
-
-                          int currentConfig=p.payload[0]&0xff;
-                          boolean current=(currentConfig&FREE_VENDING_MASK)!=0;
-                          int desiredConfig=enable
-                                  ?(currentConfig|FREE_VENDING_MASK)
-                                  :(currentConfig&~FREE_VENDING_MASK);
-
-                          appendLog("FREE VENDING DD currentConfig=0x"
-                                  +String.format(Locale.US,"%02X",currentConfig)
-                                  +" current="+current
-                                  +" desired="+enable);
-
-                          if (desiredConfig==currentConfig) {
-                              freeVendingKnown=true;
-                              freeVendingReadEnabled=current;
-                              if (freeVendingStatus!=null)
-                                  freeVendingStatus.setText("✓ Free Vending already "
-                                          +(current?"ENABLED":"DISABLED"));
-                              progress("Free Vending",true,current?"Enabled":"Disabled");
-                              if (next!=null) main.postDelayed(next,150);
-                              return;
-                          }
-
-                          // Official TerraConfig setDeviceConfigCapacitateRequestBody():
-                          // payload[0] = complete config byte; payload[1] = expand (0).
-                          byte[] body=new byte[]{
-                                  (byte)(desiredConfig&0xff),
-                                  0x00
-                          };
-                          appendLog("FREE VENDING TX DC config=0x"
-                                  +String.format(Locale.US,"%02X",desiredConfig)
-                                  +" payload="+hex(body));
-
-                          sendEncrypted(CMD_SET_DEVICE_CONFIG_CAPACITATE,body,setResp -> {
-                              try {
-                                  requirePacketOk(setResp,"Set Free Vending / DC");
-                                  int code=(setResp.payload!=null && setResp.payload.length>0)
-                                          ?(setResp.payload[0]&0xff):0;
-                                  appendLog("FREE VENDING RX DC payload="+hex(setResp.payload)
-                                          +" code="+code);
-                                  if (code!=0)
-                                      throw new Exception("DC Free Vending rejected, code="+code);
-
-                                  main.postDelayed(() ->
-                                          verifyFreeVendingAfterWrite(enable,next),300);
-
-                              } catch(Exception e) {
-                                  String err=safeError(e);
-                                  markApplyWarning("Free Vending write failed: "+err);
-                                  progress("Free Vending",false,err);
-                                  if (freeVendingStatus!=null)
-                                      freeVendingStatus.setText("✕ Free Vending write failed: "+err);
-                                  if (next!=null) main.postDelayed(next,150);
-                              }
-                          });
-
-                      } catch(Exception e) {
-                          String err=safeError(e);
-                          markApplyWarning("Free Vending read unsupported/failed: "+err);
-                          progress("Free Vending",false,err);
-                          if (freeVendingStatus!=null)
-                              freeVendingStatus.setText("⚠ Free Vending not changed: "+err);
-                          // Do not block OCPP/Wi-Fi commissioning on firmware where DD/DC
-                          // is unavailable. The warning remains visible in final APPLY status.
-                          if (next!=null) main.postDelayed(next,150);
-                      }
-                  });
-              }
-
-              private void verifyFreeVendingAfterWrite(boolean expected,Runnable next) {
-                  sendEncrypted(CMD_QUERY_DEVICE_CONFIG_CAPACITATE,new byte[0],p -> {
-                      try {
-                          requirePacketOk(p,"Verify Free Vending / DD");
-                          if (p.payload==null || p.payload.length<1)
-                              throw new Exception("DD verify payload too short: "+hex(p.payload));
-
-                          int config=p.payload[0]&0xff;
-                          boolean actual=(config&FREE_VENDING_MASK)!=0;
-                          freeVendingKnown=true;
-                          freeVendingReadEnabled=actual;
-
-                          appendLog("FREE VENDING VERIFY expected="+expected
-                                  +" actual="+actual
-                                  +" config=0x"+String.format(Locale.US,"%02X",config));
-
-                          if (freeVendingCheck!=null) freeVendingCheck.setChecked(actual);
-
-                          if (actual!=expected) {
-                              markApplyWarning("Free Vending verify mismatch");
-                              progress("Free Vending",false,
-                                      "Verify mismatch: expected "+expected+" actual "+actual);
-                              if (freeVendingStatus!=null)
-                                  freeVendingStatus.setText("✕ VERIFY FAILED • actual="
-                                          +(actual?"ENABLED":"DISABLED"));
-                          } else {
-                              progress("Free Vending",true,actual?"Enabled":"Disabled");
-                              if (freeVendingStatus!=null)
-                                  freeVendingStatus.setText("✓ VERIFIED • Free Vending "
-                                          +(actual?"ENABLED":"DISABLED"));
-                          }
-
-                      } catch(Exception e) {
-                          String err=safeError(e);
-                          markApplyWarning("Free Vending verify failed: "+err);
-                          progress("Free Vending",false,err);
-                          if (freeVendingStatus!=null)
-                              freeVendingStatus.setText("⚠ Free Vending verify failed: "+err);
-                      }
-
-                      if (next!=null) main.postDelayed(next,150);
-                  });
+                  tryOcppVariant(url,cp,d6Key,
+                          connectionPosition,ssid,wifiPass,0);
               }
 
               private void tryOcppVariant(String url,String cp,String key,
@@ -2132,7 +2020,6 @@ jobs:
               }
 
               private void continueWithNetwork(int connectionPosition,String ssid,String wifiPass) {
-                  updateApplyUi("Step 3/3 • Applying network/Wi-Fi and waiting for read-back...");
                   if (connectionPosition==0)
                       applyWifiLast(ssid,wifiPass);
                   else
@@ -2354,8 +2241,6 @@ jobs:
                               progress("Internet connection",false,err);
                               failStatus("Wi-Fi write failed",err);
                               saveBtn.setEnabled(true);
-                              if (applyInProgress)
-                                  finishApplyUi(false,"✕ APPLY FAILED • Wi-Fi: "+err);
                           }
                       }
                   });
@@ -2407,8 +2292,8 @@ jobs:
                   loadLocalProfile();
                   progress("Current configuration",false,"READ ALL in progress...");
                   setStatus("READING ALL CONFIGURATION",
-                          "E4/C7/AA/D3/DB/C5/DD • Wi-Fi, Free Vending, DHCP/static and OCPP");
-                  appendLog("READ ALL START: E4 -> C7 -> AA -> D3 -> DB -> C5 -> DD");
+                          "E4/C7/AA/D3/DB/C5 • Wi-Fi, DHCP/static and OCPP");
+                  appendLog("READ ALL START: E4 -> C7 -> AA -> D3 -> DB -> C5");
 
                   queryWifiInfo(() ->
                           queryWifiNetworkConfigForRead(() ->
@@ -2753,78 +2638,27 @@ jobs:
                       String cachedAuth=readProfile("auth_key");
                       if (!cachedAuth.isEmpty()) authKey.setText(cachedAuth);
 
-                      queryFreeVendingForRead(() -> {
-                          progress("Current configuration",true,"READ ALL complete");
-                          if (!statusTitle.getText().toString().equals("WI-FI NOT SAVED")) {
-                              setStatus("CONFIGURATION LOADED",
-                                      "Wi-Fi + Free Vending + DHCP/static + OCPP read complete.");
-                          }
-                          appendLog("READ ALL COMPLETE");
-                          readInProgress=false;
-                          if (saveBtn!=null)
-                              saveBtn.setEnabled(authenticated && !applyInProgress);
-
-                          if (applyInProgress) {
-                              boolean ok=!applyHadWarning;
-                              finishApplyUi(ok,ok
-                                      ?"✓ APPLY COMPLETE • configuration verified from charger."
-                                      :"⚠ APPLY COMPLETE WITH WARNING • check status/log above.");
-                              setStatus(ok?"APPLY COMPLETE":"APPLY COMPLETE WITH WARNING",
-                                      ok
-                                          ?"Charger configuration has been applied and read back."
-                                          :"Configuration applied, but at least one step needs attention.");
-                          }
-
-                          // After the post-APPLY reboot/read-back, provision Basic Auth via the
-                          // user's existing Node OCPP gateway.
-                          if (pendingGatewayBasicAuth
-                                  && pendingGatewayAuthKey!=null && !pendingGatewayAuthKey.isEmpty()
-                                  && pendingGatewayClientId!=null && !pendingGatewayClientId.isEmpty()) {
-                              final int generation=gatewayAuthGeneration;
-                              main.postDelayed(() -> {
-                                  if (generation==gatewayAuthGeneration && pendingGatewayBasicAuth)
-                                      startGatewayBasicAuthProvision(generation);
-                              },1500);
-                          }
-                      });
-                  });
-              }
-
-              private void queryFreeVendingForRead(Runnable next) {
-                  sendEncrypted(CMD_QUERY_DEVICE_CONFIG_CAPACITATE,new byte[0],p -> {
-                      try {
-                          requirePacketOk(p,"Read Free Vending / DD");
-                          if (p.payload==null || p.payload.length<1)
-                              throw new Exception("DD payload too short: "+hex(p.payload));
-
-                          int config=p.payload[0]&0xff;
-                          boolean enabled=(config&FREE_VENDING_MASK)!=0;
-                          freeVendingKnown=true;
-                          freeVendingReadEnabled=enabled;
-
-                          if (freeVendingCheck!=null) freeVendingCheck.setChecked(enabled);
-                          if (freeVendingStatus!=null)
-                              freeVendingStatus.setText("Current charger: Free Vending "
-                                      +(enabled?"ENABLED":"DISABLED")
-                                      +" • config=0x"
-                                      +String.format(Locale.US,"%02X",config));
-
-                          progress("Free Vending",true,enabled?"Enabled":"Disabled");
-                          appendLog("READ DD FREE_VENDING config=0x"
-                                  +String.format(Locale.US,"%02X",config)
-                                  +" enabled="+enabled
-                                  +" payload="+hex(p.payload));
-
-                      } catch(Exception e) {
-                          freeVendingKnown=false;
-                          String err=safeError(e);
-                          progress("Free Vending",false,err);
-                          if (freeVendingStatus!=null)
-                              freeVendingStatus.setText("Free Vending read unavailable: "+err);
-                          appendLog("DD Free Vending read warning: "+err);
+                      progress("Current configuration",true,"READ ALL complete");
+                      if (!statusTitle.getText().toString().equals("WI-FI NOT SAVED")) {
+                          setStatus("CONFIGURATION LOADED",
+                                  "Wi-Fi + DHCP/static + D3 status + OCPP read complete. Values shown are read from charger.");
                       }
+                      appendLog("READ ALL COMPLETE");
+                      readInProgress=false;
+                      saveBtn.setEnabled(authenticated);
 
-                      if (next!=null) next.run();
+                      // After the post-APPLY reboot/read-back, provision Basic Auth via the
+                      // user's existing Node OCPP gateway. This reproduces the exact OCPP
+                      // ChangeConfiguration path that the charger has already accepted.
+                      if (pendingGatewayBasicAuth
+                              && pendingGatewayAuthKey!=null && !pendingGatewayAuthKey.isEmpty()
+                              && pendingGatewayClientId!=null && !pendingGatewayClientId.isEmpty()) {
+                          final int generation=gatewayAuthGeneration;
+                          main.postDelayed(() -> {
+                              if (generation==gatewayAuthGeneration && pendingGatewayBasicAuth)
+                                  startGatewayBasicAuthProvision(generation);
+                          },1500);
+                      }
                   });
               }
 
@@ -3860,9 +3694,6 @@ jobs:
                               authKey.getText().toString());
                       writeSecure(profileKey("requires_password"),
                               requiresPassword.isChecked()?"1":"0");
-                      if (freeVendingCheck!=null)
-                          writeSecure(profileKey("free_vending"),
-                                  freeVendingCheck.isChecked()?"1":"0");
 
                       appendLog("Encrypted local profile saved for "+deviceNumber
                               +" (secrets not logged).");
@@ -3891,7 +3722,6 @@ jobs:
                   String url=readProfile("ocpp_url");
                   String key=readProfile("auth_key");
                   String req=readProfile("requires_password");
-                  String freeVend=readProfile("free_vending");
 
                   try {
                       if (!conn.isEmpty()) {
@@ -3906,8 +3736,6 @@ jobs:
                   if (!url.isEmpty()) setServerUrlValue(url);
                   if (!key.isEmpty()) authKey.setText(key);
                   if (!req.isEmpty()) requiresPassword.setChecked("1".equals(req));
-                  if (!freeVend.isEmpty() && freeVendingCheck!=null)
-                      freeVendingCheck.setChecked("1".equals(freeVend));
 
                   appendLog("Encrypted local profile loaded for "+deviceNumber
                           +" (password/AuthKey hidden from log).");
@@ -4368,6 +4196,7 @@ jobs:
                   collapseDeviceList();
                   disconnectGattOnly();
                   clearSession();
+                  mtu=23; bleSetupPhase=0; bleDiscoveryAttempt=0; bleNotifyAttempt=0; bleMtuWaiting=false;
                   setStatus("Connecting",deviceNumber);
                   try {
                       gatt=Build.VERSION.SDK_INT>=23
@@ -4395,6 +4224,7 @@ jobs:
 
               private void clearSession() {
                   transportReady=false;
+                  bleSetupPhase=0; bleDiscoveryAttempt=0; bleNotifyAttempt=0; bleMtuWaiting=false; mtu=23;
                   authenticated=false;
                   authInProgress=false;
                   readInProgress=false;
@@ -4540,8 +4370,6 @@ jobs:
                       if (authDiagStartBtn!=null) authDiagStartBtn.setEnabled(authenticated && !authDiagRunning);
                       if (authDiagRestoreBtn!=null) authDiagRestoreBtn.setEnabled(authenticated);
                       if (authDiagStopBtn!=null) authDiagStopBtn.setEnabled(authDiagRunning);
-                      if (freeVendingCheck!=null)
-                          freeVendingCheck.setEnabled(authenticated && !applyInProgress);
                       setOcppUiEnabled(authenticated);
                   });
               }
@@ -4596,8 +4424,8 @@ jobs:
                   if (v.startsWith("ws://192.168.10.186:9220")) {
                       v=OCPP_LOCAL;
                       idx=0;
-                  } else if (v.startsWith("ws://182.253.7.9:7979")) {
-                      v=OCPP_PUBLIC_7979;
+                  } else if (v.startsWith("ws://182.253.7.9:9221")) {
+                      v=OCPP_LOCAL_9221;
                       idx=1;
                   } else if (v.startsWith("wss://homecharging.pln.co.id")) {
                       v=OCPP_PLN;
@@ -4870,14 +4698,14 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.9-free-vending-apply-progress.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifact/EMOS-5.8.4-universal-ble.apk
           cd artifact
-          sha256sum EMOS-5.9-free-vending-apply-progress.apk | tee EMOS-5.8.1-password-toggle.apk.sha256
+          sha256sum EMOS-5.8.4-universal-ble.apk | tee EMOS-5.8.4-universal-ble.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: EMOS-5.8.1-password-toggle
+          name: EMOS-5.8.4-universal-ble
           path: artifact/*
           if-no-files-found: error
           retention-days: 30
